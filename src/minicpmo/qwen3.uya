@@ -48,6 +48,10 @@ use minicpmo.tokenizer.tokenizer_init;
 use minicpmo.tokenizer.tokenizer_load;
 use minicpmo.tokenizer.tokenizer_piece;
 
+@c_import("qwen3_kernels.c", "-O3 -march=native");
+
+extern fn qwen3_q8_0_matvec_range_c(dst: &f32, matrix_data: &const byte, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) void;
+
 const QWEN3_GGUF_MAGIC: u32 = 0x46554747;
 const QWEN3_GGUF_TYPE_UINT32: u32 = 4;
 const QWEN3_GGUF_TYPE_INT32: u32 = 5;
@@ -534,27 +538,7 @@ fn qwen3_set_thread_count(threads: u32) void {
 }
 
 fn qwen3_q8_0_matvec_range(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) void {
-    const blocks_per_row: usize = in_dim / (32 as usize);
-    var j: usize = out_start;
-    while j < out_end {
-        var sum: f32 = 0.0;
-        var b: usize = 0;
-        while b < blocks_per_row {
-            const block_index: usize = j * blocks_per_row + b;
-            const base: usize = block_index * (34 as usize);
-            const scale: f32 = f16_load_f32(qwen3_read_u16_at(matrix.data, base));
-            const qs: &const i8 = &matrix.data[base + (2 as usize)] as &const i8;
-            const i_base: usize = b * (32 as usize);
-            var k: usize = 0;
-            while k < (32 as usize) {
-                sum = sum + x[i_base + k] * scale * (qs[k] as f32);
-                k = k + 1;
-            }
-            b = b + 1;
-        }
-        dst[j] = sum;
-        j = j + 1;
-    }
+    qwen3_q8_0_matvec_range_c(dst, matrix.data, x, in_dim, out_start, out_end);
 }
 
 fn qwen3_q8_0_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) bool {
