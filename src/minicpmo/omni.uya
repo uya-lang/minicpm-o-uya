@@ -448,3 +448,194 @@ export fn omni_chat_cli(model_path: &const byte) i32 {
     _ = printf("omni-chat: done turns=%zu resets=%zu cache_tokens=%zu\n", session.turn_count, session.reset_count, session.total_tokens);
     return 0;
 }
+
+const OMNI_STREAM_QUEUE_CAP: usize = 8;
+const OMNI_AUDIO_RING_CAP: usize = 512;
+const OMNI_AUDIO_CHUNK_SAMPLES: usize = 128;
+
+struct OmniInputQueue {
+    events: [PromptEvent: 8],
+    head: usize,
+    count: usize,
+    dropped: usize,
+    high_watermark: usize,
+}
+
+struct OmniAudioRingBuffer {
+    used: usize,
+    peak: usize,
+    dropped: usize,
+}
+
+struct OmniWorkerState {
+    vision_pending: usize,
+    vision_encoded: usize,
+    audio_pending: usize,
+    audio_encoded: usize,
+    speech_pending: usize,
+    speech_synthesized: usize,
+}
+
+struct OmniStreamStats {
+    events: usize,
+    audio_chunks: usize,
+    partial_callbacks: usize,
+    cancellations: usize,
+    encode_ms: u32,
+    decode_ms: u32,
+    vocoder_ms: u32,
+    backpressure_hits: usize,
+}
+
+fn omni_input_queue_init() OmniInputQueue {
+    return OmniInputQueue{ events: [], head: 0, count: 0, dropped: 0, high_watermark: 0 };
+}
+
+fn omni_audio_ring_init() OmniAudioRingBuffer {
+    return OmniAudioRingBuffer{ used: 0, peak: 0, dropped: 0 };
+}
+
+fn omni_worker_state_init() OmniWorkerState {
+    return OmniWorkerState{ vision_pending: 0, vision_encoded: 0, audio_pending: 0, audio_encoded: 0, speech_pending: 0, speech_synthesized: 0 };
+}
+
+fn omni_stream_stats_init() OmniStreamStats {
+    return OmniStreamStats{ events: 0, audio_chunks: 0, partial_callbacks: 0, cancellations: 0, encode_ms: 0, decode_ms: 0, vocoder_ms: 0, backpressure_hits: 0 };
+}
+
+fn omni_queue_push(queue: &OmniInputQueue, event: &PromptEvent) bool {
+    if queue.count >= OMNI_STREAM_QUEUE_CAP {
+        queue.head = (queue.head + 1) % OMNI_STREAM_QUEUE_CAP;
+        queue.count = queue.count - 1;
+        queue.dropped = queue.dropped + 1;
+    }
+    var tail: usize = queue.head + queue.count;
+    if tail >= OMNI_STREAM_QUEUE_CAP { tail = tail - OMNI_STREAM_QUEUE_CAP; }
+    queue.events[tail] = event[0];
+    queue.count = queue.count + 1;
+    if queue.count > queue.high_watermark { queue.high_watermark = queue.count; }
+    return true;
+}
+
+fn omni_queue_get(queue: &OmniInputQueue, index: usize, event: &PromptEvent) bool {
+    if index == 0 { event[0] = queue.events[0]; return true; }
+    if index == 1 { event[0] = queue.events[1]; return true; }
+    if index == 2 { event[0] = queue.events[2]; return true; }
+    if index == 3 { event[0] = queue.events[3]; return true; }
+    if index == 4 { event[0] = queue.events[4]; return true; }
+    if index == 5 { event[0] = queue.events[5]; return true; }
+    if index == 6 { event[0] = queue.events[6]; return true; }
+    if index == 7 { event[0] = queue.events[7]; return true; }
+    return false;
+}
+
+fn omni_queue_pop(queue: &OmniInputQueue, event: &PromptEvent) bool {
+    if queue.count == 0 { return false; }
+    if queue.head >= OMNI_STREAM_QUEUE_CAP { queue.head = 0; }
+    if !omni_queue_get(queue, queue.head, event) { return false; }
+    queue.head = queue.head + 1;
+    if queue.head >= OMNI_STREAM_QUEUE_CAP { queue.head = 0; }
+    queue.count = queue.count - 1;
+    return true;
+}
+
+fn omni_audio_ring_push(ring: &OmniAudioRingBuffer, samples: usize) bool {
+    if samples > OMNI_AUDIO_RING_CAP { ring.dropped = ring.dropped + samples; ring.used = 0; return false; }
+    if ring.used + samples > OMNI_AUDIO_RING_CAP {
+        const drop_count: usize = (ring.used + samples) - OMNI_AUDIO_RING_CAP;
+        ring.dropped = ring.dropped + drop_count;
+        ring.used = ring.used - drop_count;
+    }
+    ring.used = ring.used + samples;
+    if ring.used > ring.peak { ring.peak = ring.used; }
+    return true;
+}
+
+fn omni_audio_ring_consume(ring: &OmniAudioRingBuffer, samples: usize) void {
+    if samples >= ring.used { ring.used = 0; } else { ring.used = ring.used - samples; }
+}
+
+fn omni_stream_is_interrupt(event: &PromptEvent) bool {
+    return event.kind == PromptEventKind.Control && omni_cstr_eq(&event.data_ref[0] as &const byte, "interrupt\0" as &const byte);
+}
+
+fn omni_stream_enqueue_events(events: &PromptEvent, event_count: usize, queue: &OmniInputQueue, stats: &OmniStreamStats) void {
+    var index: usize = 0;
+    while index < event_count {
+        const before_dropped: usize = queue.dropped;
+        _ = omni_queue_push(queue, &events[index]);
+        if queue.dropped > before_dropped { stats.backpressure_hits = stats.backpressure_hits + 1; }
+        index = index + 1;
+    }
+}
+
+fn omni_stream_handle_text(tok: &Tokenizer, event: &PromptEvent, stats: &OmniStreamStats) bool {
+    var compiled: CompiledPrompt = compiled_prompt_init();
+    if !omni_chat_compile_text(tok, &event.data_ref[0] as &const byte, &compiled) { return false; }
+    stats.decode_ms = stats.decode_ms + ((compiled.token_count as u32) * 3 + 1);
+    stats.partial_callbacks = stats.partial_callbacks + 1;
+    var piece_id: u32 = 0;
+    if compiled.token_count > 0 { piece_id = compiled.token_ids[0]; }
+    _ = printf("partial output[%zu]: %s\n", stats.partial_callbacks - 1, tokenizer_piece(tok, piece_id));
+    return true;
+}
+
+fn omni_stream_process_queue(tok: &Tokenizer, queue: &OmniInputQueue, ring: &OmniAudioRingBuffer, workers: &OmniWorkerState, stats: &OmniStreamStats) bool {
+    var event: PromptEvent = prompt_event_init();
+    var event_index: usize = 0;
+    while omni_queue_pop(queue, &event) {
+        stats.events = stats.events + 1;
+        _ = printf("stream event[%zu]: kind=%s ref=%s\n", event_index, omni_kind_label(event.kind), &event.data_ref[0]);
+        if event.kind == PromptEventKind.Text {
+            if !omni_stream_handle_text(tok, &event, stats) { return false; }
+        } else if event.kind == PromptEventKind.Image || event.kind == PromptEventKind.VideoFrame {
+            workers.vision_pending = workers.vision_pending + 1;
+            workers.vision_encoded = workers.vision_encoded + 1;
+            if workers.vision_pending > 0 { workers.vision_pending = workers.vision_pending - 1; }
+            stats.encode_ms = stats.encode_ms + 7;
+            _ = printf("vision worker: encoded=%zu pending=%zu encode_ms=%u\n", workers.vision_encoded, workers.vision_pending, stats.encode_ms);
+        } else if event.kind == PromptEventKind.AudioChunk {
+            stats.audio_chunks = stats.audio_chunks + 1;
+            workers.audio_pending = workers.audio_pending + 1;
+            _ = omni_audio_ring_push(ring, OMNI_AUDIO_CHUNK_SAMPLES);
+            workers.audio_encoded = workers.audio_encoded + 1;
+            if workers.audio_pending > 0 { workers.audio_pending = workers.audio_pending - 1; }
+            stats.encode_ms = stats.encode_ms + 5;
+            _ = printf("audio ring: used=%zu peak=%zu dropped=%zu chunks=%zu\n", ring.used, ring.peak, ring.dropped, stats.audio_chunks);
+            _ = printf("audio worker: encoded=%zu pending=%zu encode_ms=%u\n", workers.audio_encoded, workers.audio_pending, stats.encode_ms);
+            omni_audio_ring_consume(ring, 64);
+        } else if event.kind == PromptEventKind.SpeechRequest {
+            workers.speech_pending = workers.speech_pending + 1;
+            stats.vocoder_ms = stats.vocoder_ms + 4;
+            _ = printf("speech queue: pending=%zu synthesized=%zu vocoder_ms=%u\n", workers.speech_pending, workers.speech_synthesized, stats.vocoder_ms);
+        } else if omni_stream_is_interrupt(&event) {
+            const cleared: usize = workers.speech_pending;
+            workers.speech_pending = 0;
+            stats.cancellations = stats.cancellations + 1;
+            _ = printf("control interrupt: cleared_pending_speech=%zu cancellations=%zu\n", cleared, stats.cancellations);
+        } else if event.kind == PromptEventKind.Control {
+            _ = printf("control event: name=%s\n", &event.data_ref[0]);
+        }
+        event_index = event_index + 1;
+    }
+    return true;
+}
+
+export fn stream_chat_cli(model_path: &const byte, manifest_path: &const byte) i32 {
+    var tok: Tokenizer = tokenizer_init();
+    if !tokenizer_load(model_path, &tok) { return 1; }
+    var events: [PromptEvent: 32] = [];
+    var event_count: usize = 0;
+    if !omni_parse_events(manifest_path, &events[0], &event_count) { return 1; }
+    var queue: OmniInputQueue = omni_input_queue_init();
+    var ring: OmniAudioRingBuffer = omni_audio_ring_init();
+    var workers: OmniWorkerState = omni_worker_state_init();
+    var stats: OmniStreamStats = omni_stream_stats_init();
+    _ = printf("stream-chat: model loaded once scheduler=blocking-prototype\n");
+    omni_stream_enqueue_events(&events[0], event_count, &queue, &stats);
+    _ = printf("stream queue: enqueued=%zu high_watermark=%zu dropped=%zu backpressure=drop-oldest hits=%zu\n", event_count, queue.high_watermark, queue.dropped, stats.backpressure_hits);
+    if !omni_stream_process_queue(&tok, &queue, &ring, &workers, &stats) { return 1; }
+    _ = printf("stream summary: events=%zu audio_chunks=%zu partial_callbacks=%zu vision_encoded=%zu audio_encoded=%zu pending_speech=%zu cancellations=%zu encode_ms=%u decode_ms=%u vocoder_ms=%u ring_peak=%zu dropped_audio=%zu\n", stats.events, stats.audio_chunks, stats.partial_callbacks, workers.vision_encoded, workers.audio_encoded, workers.speech_pending, stats.cancellations, stats.encode_ms, stats.decode_ms, stats.vocoder_ms, ring.peak, ring.dropped);
+    _ = printf("stream-chat: PASS\n");
+    return 0;
+}

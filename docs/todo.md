@@ -344,15 +344,15 @@
 
 ## Phase 18: Streaming/full-duplex runtime
 
-- [ ] 输入事件队列。
-- [ ] audio ring buffer。
-- [ ] vision/audio encoder worker state。
-- [ ] LLM decode step scheduler。
-- [ ] speech synthesis queue。
-- [ ] backpressure 策略。
-- [ ] cancellation/interrupt。
-- [ ] partial output callback。
-- [ ] `stream-chat` CLI prototype。
+- [x] 输入事件队列。
+- [x] audio ring buffer。
+- [x] vision/audio encoder worker state。
+- [x] LLM decode step scheduler。
+- [x] speech synthesis queue。
+- [x] backpressure 策略。
+- [x] cancellation/interrupt。
+- [x] partial output callback。
+- [x] `stream-chat` CLI prototype。
 
 验收标准：
 

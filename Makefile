@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture chat-fixture minicpmo-audit clean FORCE
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture stream-chat-fixture chat-fixture minicpmo-audit clean FORCE
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture chat-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture stream-chat-fixture chat-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -180,6 +180,17 @@ omni-chat-fixture: FORCE build fixtures
 	grep -q "assistant text: hello" /tmp/minicpm-o-uya-omni-chat-manifest.out
 	grep -q "speech output: unsupported in blocking omni-chat; queued_requests=1 text output preserved" /tmp/minicpm-o-uya-omni-chat-manifest.out
 	grep -q "turn boundary: turn=0 cache_policy=preserve-until-overflow" /tmp/minicpm-o-uya-omni-chat-manifest.out
+
+stream-chat-fixture: FORCE build fixtures
+	$(OUT) stream-chat tests/fixtures/tiny.gguf tests/fixtures/tiny_stream.json >/tmp/minicpm-o-uya-stream-chat.out
+	grep -q "stream-chat: PASS" /tmp/minicpm-o-uya-stream-chat.out
+	grep -q "stream queue: enqueued=6 high_watermark=6 dropped=0 backpressure=drop-oldest hits=0" /tmp/minicpm-o-uya-stream-chat.out
+	grep -q "audio ring: used=128 peak=128 dropped=0 chunks=1" /tmp/minicpm-o-uya-stream-chat.out
+	grep -q "audio ring: used=192 peak=192 dropped=0 chunks=2" /tmp/minicpm-o-uya-stream-chat.out
+	grep -q "partial output\[0\]: hello" /tmp/minicpm-o-uya-stream-chat.out
+	grep -q "partial output\[1\]: world" /tmp/minicpm-o-uya-stream-chat.out
+	grep -q "control interrupt: cleared_pending_speech=1 cancellations=1" /tmp/minicpm-o-uya-stream-chat.out
+	grep -q "stream summary: events=6 audio_chunks=2 partial_callbacks=2 vision_encoded=0 audio_encoded=2 pending_speech=0 cancellations=1 encode_ms=10 decode_ms=8 vocoder_ms=4 ring_peak=192 dropped_audio=0" /tmp/minicpm-o-uya-stream-chat.out
 
 chat-fixture: FORCE build fixtures
 	printf "hello\n" | $(OUT) chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-chat-repl.out

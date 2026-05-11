@@ -1,0 +1,10 @@
+{
+  "events": [
+    {"kind": "text", "text": "hello"},
+    {"kind": "audio_chunk", "path": "tiny_audio_000.raw"},
+    {"kind": "audio_chunk", "path": "tiny_audio_001.raw"},
+    {"kind": "speech_request", "voice": "tiny"},
+    {"kind": "control", "name": "interrupt"},
+    {"kind": "text", "text": "world"}
+  ]
+}

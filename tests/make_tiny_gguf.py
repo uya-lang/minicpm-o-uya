@@ -392,6 +392,18 @@ def main() -> None:
 }
 """
     (out_dir / "tiny_omni.json").write_text(tiny_omni)
+    tiny_stream = """{
+  "events": [
+    {"kind": "text", "text": "hello"},
+    {"kind": "audio_chunk", "path": "tiny_audio_000.raw"},
+    {"kind": "audio_chunk", "path": "tiny_audio_001.raw"},
+    {"kind": "speech_request", "voice": "tiny"},
+    {"kind": "control", "name": "interrupt"},
+    {"kind": "text", "text": "world"}
+  ]
+}
+"""
+    (out_dir / "tiny_stream.json").write_text(tiny_stream)
 
     bad_tensor = tensor_info("mystery.branch.weight", [4], 63, 0)
     bad_directory = struct.pack("<IIQQ", 0x46554747, 3, 1, 0) + bad_tensor
