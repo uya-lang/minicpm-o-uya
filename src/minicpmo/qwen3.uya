@@ -1,11 +1,13 @@
 use libc.calloc;
 use libc.cosf;
 use libc.fgets;
+use libc.fflush;
 use libc.free;
 use libc.powf;
 use libc.printf;
 use libc.sinf;
 use libc.stdin;
+use libc.stdout;
 use libc.strtod;
 use libc.sqrtf;
 use libc.strcmp;
@@ -79,6 +81,7 @@ export struct Qwen3SamplerConfig {
     seed: u32,
     stop_token: u32,
     stop_on_eos: bool,
+    verbose: bool,
 }
 
 struct Qwen3Runtime {
@@ -751,7 +754,7 @@ export fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, toke
 
 
 fn qwen3_sampler_init() Qwen3SamplerConfig {
-    return Qwen3SamplerConfig{ max_new_tokens: 8, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true };
+    return Qwen3SamplerConfig{ max_new_tokens: 128, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true, verbose: false };
 }
 
 fn qwen3_sampler_f32(bits: u32) f32 {
@@ -916,6 +919,10 @@ fn qwen3_parse_sampler_args(argc: i32, argv: & &byte, start_index: i32, sampler:
             sampler.stop_on_eos = false;
             i = i + 2; continue;
         }
+        if strcmp(argv[i] as *const byte, "--verbose\0" as *const byte) == 0 {
+            sampler.verbose = true;
+            i = i + 1; continue;
+        }
         return false;
     }
     return true;
@@ -983,27 +990,33 @@ fn qwen3_append_prompt_text(config: &Qwen3Config, weights: &Qwen3Weights, tok: &
 
 fn qwen3_generate_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, sampler: &Qwen3SamplerConfig, tok: &Tokenizer, logits: &f32, text_label: &const byte) i32 {
     var generated: usize = 0;
-    var generated_text: [byte: QWEN3_GENERATED_TEXT_CAP] = [];
-    var generated_text_pos: usize = 0;
+    _ = printf("%s: ", text_label);
+    _ = fflush(stdout);
     while generated < sampler.max_new_tokens as usize {
         if runtime.total_tokens >= config.context_length as usize || runtime.total_tokens >= runtime.context_capacity { _ = printf("error: context overflow total_tokens=%zu context=%u\n", runtime.total_tokens, config.context_length); return 1; }
         const next_id: u32 = qwen3_sample(logits, config.vocab_size as usize, runtime.prompt_ids, runtime.total_tokens, sampler, &runtime.seed);
-        _ = printf("sampled token[%zu]: %u piece=%s\n", generated, next_id, tokenizer_piece(tok, next_id));
+        if sampler.verbose {
+            _ = printf("sampled token[%zu]: %u piece=%s\n", generated, next_id, tokenizer_piece(tok, next_id));
+        }
         if next_id == sampler.stop_token {
+            _ = printf("\n");
             _ = printf("stop: token=%u\n", next_id);
-            _ = printf("%s: %s\n", text_label, &generated_text[0]);
             return 0;
         }
-        if !tokenizer_append_piece_text(tok, next_id, &generated_text[0], QWEN3_GENERATED_TEXT_CAP, &generated_text_pos) {
+        var piece_text: [byte: QWEN3_GENERATED_TEXT_CAP] = [];
+        var piece_text_pos: usize = 0;
+        if !tokenizer_append_piece_text(tok, next_id, &piece_text[0], QWEN3_GENERATED_TEXT_CAP, &piece_text_pos) {
             _ = printf("error: generated text exceeds buffer cap=%zu\n", QWEN3_GENERATED_TEXT_CAP);
             return 1;
         }
+        _ = printf("%s", &piece_text[0]);
+        _ = fflush(stdout);
         runtime.prompt_ids[runtime.total_tokens] = next_id;
         runtime.total_tokens = runtime.total_tokens + 1;
         if !qwen3_forward_token(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits) { return 1; }
         generated = generated + 1;
     }
-    _ = printf("%s: %s\n", text_label, &generated_text[0]);
+    _ = printf("\n");
     return 0;
 }
 
@@ -1067,7 +1080,7 @@ export fn qwen3_generate_cli(path: &const byte, prompt: &const byte) i32 {
 }
 
 export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
-    if argc < 4 { _ = printf("usage: minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID]\n"); return 1; }
+    if argc < 4 { _ = printf("usage: minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--verbose]\n"); return 1; }
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
     var weights: Qwen3Weights = qwen3_weights_init();
@@ -1089,7 +1102,7 @@ export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
 }
 
 export fn qwen3_chat_cli(argc: i32, argv: & &byte) i32 {
-    if argc < 3 { _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID]\n"); return 1; }
+    if argc < 3 { _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--verbose]\n"); return 1; }
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
     var weights: Qwen3Weights = qwen3_weights_init();

@@ -96,11 +96,11 @@ qwen3-fixture: build fixtures
 
 
 generate-fixture: FORCE build fixtures
-	$(OUT) generate tests/fixtures/tiny.gguf hello >/tmp/minicpm-o-uya-generate.out
+	$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 1 --verbose >/tmp/minicpm-o-uya-generate.out
 	grep -q "generate prompt_tokens: 4" /tmp/minicpm-o-uya-generate.out
 	grep -q "sampled token\[0\]: 4 piece=hello" /tmp/minicpm-o-uya-generate.out
-	$(OUT) generate tests/fixtures/tiny.gguf hello --temperature 1.0 --top-k 2 --seed 7 >/tmp/minicpm-o-uya-generate-seed-a.out
-	$(OUT) generate tests/fixtures/tiny.gguf hello --temperature 1.0 --top-k 2 --seed 7 >/tmp/minicpm-o-uya-generate-seed-b.out
+	$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 1 --temperature 1.0 --top-k 2 --seed 7 >/tmp/minicpm-o-uya-generate-seed-a.out
+	$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 1 --temperature 1.0 --top-k 2 --seed 7 >/tmp/minicpm-o-uya-generate-seed-b.out
 	cmp -s /tmp/minicpm-o-uya-generate-seed-a.out /tmp/minicpm-o-uya-generate-seed-b.out
 	$(OUT) generate tests/fixtures/tiny.gguf hello --stop-token 4 >/tmp/minicpm-o-uya-generate-stop.out
 	grep -q "stop: token=4" /tmp/minicpm-o-uya-generate-stop.out
@@ -215,7 +215,7 @@ bench-fixture: FORCE build fixtures
 	grep -q "omni-smoke: PASS" /tmp/minicpm-o-uya-bench.out
 
 chat-fixture: FORCE build fixtures
-	printf "hello\n" | $(OUT) chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-chat-repl.out
+	printf "hello\n" | $(OUT) chat tests/fixtures/tiny.gguf --max-new-tokens 1 --verbose >/tmp/minicpm-o-uya-chat-repl.out
 	grep -q "chat>" /tmp/minicpm-o-uya-chat-repl.out
 	grep -q "sampled token\[0\]: 6 piece=world" /tmp/minicpm-o-uya-chat-repl.out
 	@if printf "hello\nhello\nhello\n" | $(OUT) chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-chat-overflow.out 2>&1; then \
