@@ -135,11 +135,15 @@ audio-fixture: FORCE build fixtures
 	fi
 
 speech-fixture: FORCE build fixtures
-	$(OUT) speech-smoke tests/fixtures/tiny.gguf "hello world" >/tmp/minicpm-o-uya-speech.out
+	$(OUT) speech-smoke tests/fixtures/tiny.gguf "hello world" /tmp/minicpm-o-uya-speech.wav >/tmp/minicpm-o-uya-speech.out
 	grep -q "speech-smoke: PASS" /tmp/minicpm-o-uya-speech.out
 	grep -q "speech schema: kind=cosyvoice2-codec hidden=4 codec_vocab=4 acoustic_vocab=4" /tmp/minicpm-o-uya-speech.out
+	grep -q "vocoder schema: kind=vocos-like sample_rate=24000 samples_per_token=16 tensor=vocoder.proj.weight" /tmp/minicpm-o-uya-speech.out
 	grep -q "speech tokens: 0 0 0 0 checksum=0x4b95f515" /tmp/minicpm-o-uya-speech.out
 	grep -q "speech intermediate checksum: 0x4b95f515" /tmp/minicpm-o-uya-speech.out
+	grep -q "speech waveform: samples=64 sample_rate=24000 rms=0.320025 peak=0.377256 range=\[0.203898,0.377256\] checksum=0x9f956c35" /tmp/minicpm-o-uya-speech.out
+	grep -q "speech wav: path=/tmp/minicpm-o-uya-speech.wav bytes=172" /tmp/minicpm-o-uya-speech.out
+	python3 -c 'from pathlib import Path; b=Path("/tmp/minicpm-o-uya-speech.wav").read_bytes(); assert len(b)==172 and b[:4]==b"RIFF" and b[8:12]==b"WAVE" and int.from_bytes(b[24:28],"little")==24000 and int.from_bytes(b[40:44],"little")==128'
 
 minicpmo-audit: build
 	@if [ -z "$(MINICPM_O_GGUF)" ]; then \

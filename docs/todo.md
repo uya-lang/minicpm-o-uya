@@ -292,12 +292,12 @@
 
 ## Phase 15: Vocoder/WAV 输出
 
-- [ ] 识别 vocoder/Vocos-like tensor schema。
-- [ ] 实现必要 conv/upsample/norm/activation kernel。
-- [ ] 实现 fixed speech token -> waveform。
-- [ ] 实现 WAV writer。
-- [ ] 实现 `speech-smoke` 输出 wav。
-- [ ] 增加 RMS/peak/range 验证。
+- [x] 识别 vocoder/Vocos-like tensor schema。
+- [x] 实现必要 conv/upsample/norm/activation kernel。
+- [x] 实现 fixed speech token -> waveform。
+- [x] 实现 WAV writer。
+- [x] 实现 `speech-smoke` 输出 wav。
+- [x] 增加 RMS/peak/range 验证。
 
 验收标准：
 
