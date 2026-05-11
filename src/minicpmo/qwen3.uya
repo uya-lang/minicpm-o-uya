@@ -104,8 +104,11 @@ struct Qwen3MatvecTask {
 struct Qwen3Runtime {
     k_cache: &f32,
     v_cache: &f32,
+    rope_cos: &f32,
+    rope_sin: &f32,
     prompt_ids: &u32,
     context_capacity: usize,
+    rope_half_dim: usize,
     prompt_count: usize,
     total_tokens: usize,
     seed: u32,
@@ -650,16 +653,24 @@ fn qwen3_config_rope_freq_base(config: &Qwen3Config) f32 {
     return QWEN3_DEFAULT_ROPE_FREQ_BASE;
 }
 
-fn qwen3_apply_rope(vec: &f32, head_count: usize, head_dim: usize, pos: usize, freq_base: f32) void {
+fn qwen3_apply_rope(vec: &f32, head_count: usize, head_dim: usize, pos: usize, freq_base: f32, rope_cos: &const f32, rope_sin: &const f32) void {
     const half_dim: usize = head_dim / (2 as usize);
     var h: usize = 0;
     while h < head_count {
         const base: usize = h * head_dim;
         var d: usize = 0;
         while d < half_dim {
-            const theta: f32 = (pos as f32) / powf(freq_base, (((2 as usize) * d) as f32) / (head_dim as f32));
-            const c: f32 = cosf(theta);
-            const s: f32 = sinf(theta);
+            var c: f32 = 0.0;
+            var s: f32 = 0.0;
+            if rope_cos != null && rope_sin != null {
+                const rope_index: usize = pos * half_dim + d;
+                c = rope_cos[rope_index];
+                s = rope_sin[rope_index];
+            } else {
+                const theta: f32 = (pos as f32) / powf(freq_base, (((2 as usize) * d) as f32) / (head_dim as f32));
+                c = cosf(theta);
+                s = sinf(theta);
+            }
             const x0: f32 = vec[base + d];
             const x1: f32 = vec[base + half_dim + d];
             vec[base + d] = x0 * c - x1 * s;
@@ -668,6 +679,36 @@ fn qwen3_apply_rope(vec: &f32, head_count: usize, head_dim: usize, pos: usize, f
         }
         h = h + 1;
     }
+}
+
+fn qwen3_precompute_rope(config: &Qwen3Config, runtime: &Qwen3Runtime) bool {
+    const half_dim: usize = (config.head_dim as usize) / (2 as usize);
+    const rope_count: usize = runtime.context_capacity * half_dim;
+    if half_dim == 0 { return false; }
+    runtime.rope_cos = calloc(rope_count, 4) as &f32;
+    runtime.rope_sin = calloc(rope_count, 4) as &f32;
+    if runtime.rope_cos == null || runtime.rope_sin == null {
+        _ = printf("error: qwen3 rope cache allocation failed count=%zu\n", rope_count);
+        free(runtime.rope_cos as &void); free(runtime.rope_sin as &void);
+        runtime.rope_cos = null;
+        runtime.rope_sin = null;
+        return false;
+    }
+    runtime.rope_half_dim = half_dim;
+    const freq_base: f32 = qwen3_config_rope_freq_base(config);
+    var pos: usize = 0;
+    while pos < runtime.context_capacity {
+        var d: usize = 0;
+        while d < half_dim {
+            const theta: f32 = (pos as f32) / powf(freq_base, (((2 as usize) * d) as f32) / (config.head_dim as f32));
+            const idx: usize = pos * half_dim + d;
+            runtime.rope_cos[idx] = cosf(theta);
+            runtime.rope_sin[idx] = sinf(theta);
+            d = d + 1;
+        }
+        pos = pos + 1;
+    }
+    return true;
 }
 
 fn qwen3_cache_index(layer: usize, pos: usize, dim: usize, kv_dim: usize) usize {
@@ -760,7 +801,7 @@ fn qwen3_argmax_penalized(values: &const f32, n: usize, seen: &const u32, seen_c
     return best as u32;
 }
 
-export fn qwen3_forward_embedding(config: &Qwen3Config, weights: &Qwen3Weights, embedding: &const f32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool) bool {
+fn qwen3_forward_embedding_with_rope(config: &Qwen3Config, weights: &Qwen3Weights, embedding: &const f32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool, rope_cos: &const f32, rope_sin: &const f32) bool {
     const hidden_n: usize = config.hidden_size as usize;
     const vocab_n: usize = config.vocab_size as usize;
     const ffn_n: usize = config.intermediate_size as usize;
@@ -797,8 +838,8 @@ export fn qwen3_forward_embedding(config: &Qwen3Config, weights: &Qwen3Weights, 
         qwen3_matvec_view(v, lw.v_proj, normed, hidden_n, kv_dim);
         if lw.q_norm != null { qwen3_apply_head_norm(q, lw.q_norm, head_count, head_dim); }
         if lw.k_norm != null { qwen3_apply_head_norm(k, lw.k_norm, kv_head_count, head_dim); }
-        qwen3_apply_rope(q, head_count, head_dim, pos, rope_freq_base);
-        qwen3_apply_rope(k, kv_head_count, head_dim, pos, rope_freq_base);
+        qwen3_apply_rope(q, head_count, head_dim, pos, rope_freq_base, rope_cos, rope_sin);
+        qwen3_apply_rope(k, kv_head_count, head_dim, pos, rope_freq_base, rope_cos, rope_sin);
         qwen3_write_kv_cache(k_cache, v_cache, layer, pos, k, v, kv_dim);
         qwen3_attention(attn_ctx, q, k_cache, v_cache, layer, pos, head_count, kv_head_count, head_dim);
         qwen3_matvec_view(attn_out, lw.o_proj, attn_ctx, q_dim, hidden_n);
@@ -822,13 +863,21 @@ export fn qwen3_forward_embedding(config: &Qwen3Config, weights: &Qwen3Weights, 
     return true;
 }
 
-export fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool) bool {
+export fn qwen3_forward_embedding(config: &Qwen3Config, weights: &Qwen3Weights, embedding: &const f32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool) bool {
+    return qwen3_forward_embedding_with_rope(config, weights, embedding, pos, k_cache, v_cache, logits, compute_logits, null as &const f32, null as &const f32);
+}
+
+fn qwen3_forward_token_with_rope(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool, rope_cos: &const f32, rope_sin: &const f32) bool {
     var embedding: &f32 = calloc(config.hidden_size as usize, 4) as &f32;
     if embedding == null { _ = printf("error: qwen3 embedding allocation failed\n"); return false; }
     qwen3_copy_embedding(embedding, weights.token_embedding, token_id, config.hidden_size as usize, config.vocab_size as usize);
-    const ok: bool = qwen3_forward_embedding(config, weights, embedding, pos, k_cache, v_cache, logits, compute_logits);
+    const ok: bool = qwen3_forward_embedding_with_rope(config, weights, embedding, pos, k_cache, v_cache, logits, compute_logits, rope_cos, rope_sin);
     free(embedding as &void);
     return ok;
+}
+
+export fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool) bool {
+    return qwen3_forward_token_with_rope(config, weights, token_id, pos, k_cache, v_cache, logits, compute_logits, null as &const f32, null as &const f32);
 }
 
 
@@ -1012,7 +1061,7 @@ fn qwen3_parse_sampler_args(argc: i32, argv: & &byte, start_index: i32, sampler:
 }
 
 fn qwen3_runtime_init() Qwen3Runtime {
-    return Qwen3Runtime{ k_cache: null, v_cache: null, prompt_ids: null, context_capacity: 0, prompt_count: 0, total_tokens: 0, seed: QWEN3_SAMPLER_DEFAULT_SEED };
+    return Qwen3Runtime{ k_cache: null, v_cache: null, rope_cos: null, rope_sin: null, prompt_ids: null, context_capacity: 0, rope_half_dim: 0, prompt_count: 0, total_tokens: 0, seed: QWEN3_SAMPLER_DEFAULT_SEED };
 }
 
 fn qwen3_runtime_alloc(config: &Qwen3Config, runtime: &Qwen3Runtime) bool {
@@ -1028,6 +1077,11 @@ fn qwen3_runtime_alloc(config: &Qwen3Config, runtime: &Qwen3Runtime) bool {
         return false;
     }
     runtime.context_capacity = QWEN3_FORWARD_MAX_CONTEXT;
+    if !qwen3_precompute_rope(config, runtime) {
+        free(runtime.k_cache as &void); free(runtime.v_cache as &void); free(runtime.prompt_ids as &void);
+        runtime[0] = qwen3_runtime_init();
+        return false;
+    }
     runtime.prompt_count = 0;
     runtime.total_tokens = 0;
     runtime.seed = QWEN3_SAMPLER_DEFAULT_SEED;
@@ -1037,6 +1091,8 @@ fn qwen3_runtime_alloc(config: &Qwen3Config, runtime: &Qwen3Runtime) bool {
 fn qwen3_runtime_free(runtime: &Qwen3Runtime) void {
     if runtime.k_cache != null { free(runtime.k_cache as &void); }
     if runtime.v_cache != null { free(runtime.v_cache as &void); }
+    if runtime.rope_cos != null { free(runtime.rope_cos as &void); }
+    if runtime.rope_sin != null { free(runtime.rope_sin as &void); }
     if runtime.prompt_ids != null { free(runtime.prompt_ids as &void); }
     runtime[0] = qwen3_runtime_init();
 }
@@ -1055,7 +1111,7 @@ fn qwen3_append_prompt_ids(config: &Qwen3Config, weights: &Qwen3Weights, runtime
         const pos: usize = runtime.total_tokens;
         runtime.prompt_ids[pos] = ids[i];
         const compute_logits: bool = (i + (1 as usize)) == id_count;
-        if !qwen3_forward_token(config, weights, ids[i], pos, runtime.k_cache, runtime.v_cache, logits, compute_logits) { return false; }
+        if !qwen3_forward_token_with_rope(config, weights, ids[i], pos, runtime.k_cache, runtime.v_cache, logits, compute_logits, runtime.rope_cos, runtime.rope_sin) { return false; }
         runtime.total_tokens = runtime.total_tokens + 1;
         i = i + 1;
     }
@@ -1107,7 +1163,7 @@ fn qwen3_generate_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: 
         const will_stop_after_token: bool = sampler.max_new_tokens != 0 && (generated + (1 as usize)) >= sampler.max_new_tokens as usize;
         if preserve_final_cache || !will_stop_after_token {
             const compute_next_logits: bool = !will_stop_after_token;
-            if !qwen3_forward_token(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, compute_next_logits) { return 1; }
+            if !qwen3_forward_token_with_rope(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, compute_next_logits, runtime.rope_cos, runtime.rope_sin) { return 1; }
         }
         generated = generated + 1;
     }
