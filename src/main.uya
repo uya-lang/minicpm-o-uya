@@ -1,0 +1,22 @@
+use libc.printf;
+use libc.strcmp;
+
+fn print_help() void {
+    _ = printf("minicpm-o-uya - pure Uya MiniCPM-o runtime scaffold\n");
+    _ = printf("\n");
+    _ = printf("Usage:\n");
+    _ = printf("  minicpm-o-uya --help\n");
+    _ = printf("  minicpm-o-uya inspect <model.gguf>\n");
+    _ = printf("  minicpm-o-uya audit <model.gguf>\n");
+    _ = printf("\n");
+    _ = printf("Status: planning scaffold only; inference is not implemented yet.\n");
+}
+
+export extern fn main(argc: i32, argv: & &byte) i32 {
+    if argc <= 1 || strcmp(argv[1] as *const byte, "--help\0" as *const byte) == 0 || strcmp(argv[1] as *const byte, "-h\0" as *const byte) == 0 {
+        print_help();
+        return 0;
+    }
+    _ = printf("minicpm-o-uya: command not implemented yet: %s\n", argv[1]);
+    return 1;
+}

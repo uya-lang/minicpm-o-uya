@@ -1,0 +1,43 @@
+# build outputs
+build/
+.uyacache/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# logs and temporary files
+*.log
+*.tmp
+*.cache
+/tmp/
+
+# large model and media artifacts
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.raw
+*.wav
+*.mp3
+*.mp4
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# local external-model manifests
+local/
+fixtures/external/
