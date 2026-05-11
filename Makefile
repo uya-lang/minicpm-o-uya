@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture chat-fixture minicpmo-audit clean FORCE
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture chat-fixture minicpmo-audit clean FORCE
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture chat-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture chat-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -133,6 +133,13 @@ audio-fixture: FORCE build fixtures
 	else \
 		grep -q "missing tensor audio.conv1.weight" /tmp/minicpm-o-uya-audio-missing.out; \
 	fi
+
+speech-fixture: FORCE build fixtures
+	$(OUT) speech-smoke tests/fixtures/tiny.gguf "hello world" >/tmp/minicpm-o-uya-speech.out
+	grep -q "speech-smoke: PASS" /tmp/minicpm-o-uya-speech.out
+	grep -q "speech schema: kind=cosyvoice2-codec hidden=4 codec_vocab=4 acoustic_vocab=4" /tmp/minicpm-o-uya-speech.out
+	grep -q "speech tokens: 0 0 0 0 checksum=0x4b95f515" /tmp/minicpm-o-uya-speech.out
+	grep -q "speech intermediate checksum: 0x4b95f515" /tmp/minicpm-o-uya-speech.out
 
 minicpmo-audit: build
 	@if [ -z "$(MINICPM_O_GGUF)" ]; then \

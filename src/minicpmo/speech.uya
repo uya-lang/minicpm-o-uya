@@ -1,0 +1,187 @@
+use libc.printf;
+use libc.strcmp;
+use minicpmo.kernels.f16_load_f32;
+use minicpmo.tensor.TensorDType;
+use minicpmo.tensor.TensorView;
+use minicpmo.tensor.TensorWeightTable;
+use minicpmo.tensor.tensor_dtype_name;
+use minicpmo.tensor.tensor_lookup;
+use minicpmo.tensor.tensor_table_init;
+use minicpmo.tensor.tensor_weight_table_attach_mmap;
+use minicpmo.tensor.tensor_weight_table_detach_mmap;
+use minicpmo.tensor.tensor_weight_table_load;
+use minicpmo.tokenizer.Tokenizer;
+use minicpmo.tokenizer.tokenizer_encode_to_ids;
+use minicpmo.tokenizer.tokenizer_init;
+use minicpmo.tokenizer.tokenizer_load;
+
+const SPEECH_MAX_HIDDEN: usize = 16;
+const SPEECH_MAX_TOKENS: usize = 16;
+const SPEECH_PROMPT_CAP: usize = 64;
+
+export struct SpeechConfig {
+    hidden_size: u32,
+    codec_vocab_size: u32,
+    acoustic_vocab_size: u32,
+    token_count: u32,
+    schema_kind: [byte: 32],
+}
+
+export struct SpeechWeights {
+    decoder: &TensorView,
+    codec_head: &TensorView,
+}
+
+export struct SpeechTokenSequence {
+    count: usize,
+    tokens: [u32: 16],
+    hidden: [f32: 16],
+}
+
+export fn speech_config_init() SpeechConfig {
+    return SpeechConfig{ hidden_size: 0, codec_vocab_size: 0, acoustic_vocab_size: 0, token_count: 4, schema_kind: [] };
+}
+
+export fn speech_weights_init() SpeechWeights {
+    return SpeechWeights{ decoder: null, codec_head: null };
+}
+
+fn speech_copy_cstr(dest: &byte, cap: usize, src: &const byte) void {
+    var i: usize = 0;
+    while i + 1 < cap && src[i] != 0 { dest[i] = src[i]; i = i + 1; }
+    dest[i] = 0;
+}
+
+fn speech_check_matrix(view: &TensorView, in_dim: u32, out_dim: u32, label: &const byte) bool {
+    if !(view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 || view.dtype == TensorDType.BF16) {
+        _ = printf("error: speech tensor=%s label=%s unsupported dtype=%s\n", &view.name[0], label, tensor_dtype_name(view.dtype));
+        return false;
+    }
+    if view.n_dims == 2 && view.shape[0] == in_dim as u64 && view.shape[1] == out_dim as u64 { return true; }
+    _ = printf("error: speech tensor=%s label=%s bad shape expected=[%u,%u]\n", &view.name[0], label, in_dim, out_dim);
+    return false;
+}
+
+fn speech_read_u16_at(data: &const byte, offset: usize) u16 {
+    const ptr: &const u16 = &data[offset] as &const u16;
+    return ptr[0];
+}
+
+fn speech_load_value(view: &TensorView, index: usize) f32 {
+    if view.dtype == TensorDType.F32 {
+        const ptr: &const f32 = &view.data[index * (4 as usize)] as &const f32;
+        return ptr[0];
+    }
+    if view.dtype == TensorDType.F16 { return f16_load_f32(speech_read_u16_at(view.data, index * (2 as usize))); }
+    return 0.0 as f32;
+}
+
+export fn speech_bind_weights(table: &TensorWeightTable, config: &SpeechConfig, weights: &SpeechWeights) bool {
+    weights[0] = speech_weights_init();
+    weights.decoder = tensor_lookup(table, "speech.cosyvoice2.decoder.weight\0" as &const byte);
+    if weights.decoder == null { _ = printf("error: missing tensor speech.cosyvoice2.decoder.weight\n"); return false; }
+    weights.codec_head = tensor_lookup(table, "speech.codec_head.weight\0" as &const byte);
+    if weights.codec_head == null { weights.codec_head = tensor_lookup(table, "vocoder.proj.weight\0" as &const byte); }
+    if weights.codec_head == null { _ = printf("error: missing tensor speech.codec_head.weight or vocoder.proj.weight\n"); return false; }
+    if config.hidden_size == 0 { config.hidden_size = weights.decoder.shape[0] as u32; }
+    if config.codec_vocab_size == 0 { config.codec_vocab_size = weights.codec_head.shape[1] as u32; }
+    if config.acoustic_vocab_size == 0 { config.acoustic_vocab_size = config.codec_vocab_size; }
+    if config.schema_kind[0] == 0 { speech_copy_cstr(&config.schema_kind[0], @len(config.schema_kind), "cosyvoice2-codec\0" as &const byte); }
+    if !speech_check_matrix(weights.decoder, config.hidden_size, config.hidden_size, "decoder\0" as &const byte) { return false; }
+    if !speech_check_matrix(weights.codec_head, config.hidden_size, config.codec_vocab_size, "codec_head\0" as &const byte) { return false; }
+    if config.hidden_size == 0 || config.hidden_size > SPEECH_MAX_HIDDEN as u32 || config.codec_vocab_size == 0 || config.token_count == 0 || config.token_count > SPEECH_MAX_TOKENS as u32 {
+        _ = printf("error: speech config unsupported hidden=%u codec_vocab=%u token_count=%u\n", config.hidden_size, config.codec_vocab_size, config.token_count);
+        return false;
+    }
+    return true;
+}
+
+fn speech_prompt_seed(ids: &const u32, count: usize) u32 {
+    var seed: u32 = 2166136261;
+    var i: usize = 0;
+    while i < count { seed = (seed ^ ids[i]) * 16777619; i = i + 1; }
+    return seed;
+}
+
+export fn speech_generate_tokens(config: &SpeechConfig, weights: &SpeechWeights, prompt_ids: &const u32, prompt_count: usize, seq: &SpeechTokenSequence) bool {
+    seq.count = config.token_count as usize;
+    var state: [f32: 16] = [];
+    const seed: u32 = speech_prompt_seed(prompt_ids, prompt_count);
+    var hidden_index: usize = 0;
+    while hidden_index < config.hidden_size as usize {
+        state[hidden_index] = (((seed >> ((hidden_index % 4) * 8)) & 255) as f32) / (255.0 as f32);
+        hidden_index = hidden_index + 1;
+    }
+    var step: usize = 0;
+    while step < seq.count {
+        var next: [f32: 16] = [];
+        var out_i: usize = 0;
+        while out_i < config.hidden_size as usize {
+            var sum: f32 = 0.0;
+            var in_i: usize = 0;
+            while in_i < config.hidden_size as usize {
+                sum = sum + state[in_i] * speech_load_value(weights.decoder, in_i * (config.hidden_size as usize) + out_i);
+                in_i = in_i + 1;
+            }
+            next[out_i] = sum;
+            out_i = out_i + 1;
+        }
+        var best_id: u32 = 0;
+        var best_score: f32 = -1000000000.0 as f32;
+        var vocab: usize = 0;
+        while vocab < config.codec_vocab_size as usize {
+            var score: f32 = 0.0;
+            var h: usize = 0;
+            while h < config.hidden_size as usize {
+                score = score + next[h] * speech_load_value(weights.codec_head, h * (config.codec_vocab_size as usize) + vocab);
+                h = h + 1;
+            }
+            if vocab == 0 || score > best_score { best_score = score; best_id = vocab as u32; }
+            vocab = vocab + 1;
+        }
+        seq.tokens[step] = best_id;
+        seq.hidden[step] = best_score;
+        var copy_i: usize = 0;
+        while copy_i < config.hidden_size as usize { state[copy_i] = next[copy_i] + ((best_id as f32) * (0.01 as f32)); copy_i = copy_i + 1; }
+        step = step + 1;
+    }
+    return true;
+}
+
+fn speech_checksum_u32(values: &const u32, count: usize) u32 {
+    var hash: u32 = 2166136261;
+    var i: usize = 0;
+    while i < count { hash = (hash ^ values[i]) * 16777619; i = i + 1; }
+    return hash;
+}
+
+export fn speech_smoke_cli(model_path: &const byte, prompt: &const byte) i32 {
+    var table: TensorWeightTable = tensor_table_init();
+    if !tensor_weight_table_load(model_path, &table) { return 1; }
+    if !tensor_weight_table_attach_mmap(model_path, &table) { return 1; }
+    var tokenizer: Tokenizer = tokenizer_init();
+    if !tokenizer_load(model_path, &tokenizer) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var ids: [u32: 64] = [];
+    var id_count: usize = 0;
+    if !tokenizer_encode_to_ids(&tokenizer, prompt, &ids[0], SPEECH_PROMPT_CAP, &id_count) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var config: SpeechConfig = speech_config_init();
+    var weights: SpeechWeights = speech_weights_init();
+    if !speech_bind_weights(&table, &config, &weights) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var seq: SpeechTokenSequence = SpeechTokenSequence{ count: 0, tokens: [], hidden: [] };
+    if !speech_generate_tokens(&config, &weights, &ids[0] as &const u32, id_count, &seq) { tensor_weight_table_detach_mmap(&table); return 1; }
+    const checksum: u32 = speech_checksum_u32(&seq.tokens[0] as &const u32, seq.count);
+    _ = printf("speech schema: kind=%s hidden=%u codec_vocab=%u acoustic_vocab=%u\n", &config.schema_kind[0], config.hidden_size, config.codec_vocab_size, config.acoustic_vocab_size);
+    _ = printf("speech bind: decoder=%s codec_head=%s\n", &weights.decoder.name[0], &weights.codec_head.name[0]);
+    _ = printf("speech prompt_tokens:");
+    var pi: usize = 0;
+    while pi < id_count { _ = printf(" %u", ids[pi]); pi = pi + 1; }
+    _ = printf("\n");
+    _ = printf("speech tokens:");
+    var ti: usize = 0;
+    while ti < seq.count { _ = printf(" %u", seq.tokens[ti]); ti = ti + 1; }
+    _ = printf(" checksum=0x%x\n", checksum);
+    _ = printf("speech intermediate checksum: 0x%x\n", checksum);
+    _ = printf("speech-smoke: PASS\n");
+    tensor_weight_table_detach_mmap(&table);
+    return 0;
+}

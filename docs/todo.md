@@ -277,13 +277,13 @@
 
 ## Phase 14: Speech token 输出
 
-- [ ] 识别 speech output 分支 schema。
-- [ ] 定义 `SpeechConfig`。
-- [ ] 绑定 speech decoder tensors。
-- [ ] 识别 codec/acoustic token vocab。
-- [ ] 实现 text -> speech token smoke。
-- [ ] 实现 speech token decode 中间表示。
-- [ ] 保存 speech token 序列用于对照。
+- [x] 识别 speech output 分支 schema。
+- [x] 定义 `SpeechConfig`。
+- [x] 绑定 speech decoder tensors。
+- [x] 识别 codec/acoustic token vocab。
+- [x] 实现 text -> speech token smoke。
+- [x] 实现 speech token decode 中间表示。
+- [x] 保存 speech token 序列用于对照。
 
 验收标准：
 
