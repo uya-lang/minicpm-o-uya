@@ -1,0 +1,351 @@
+use libc.printf;
+use libc.strcmp;
+use minicpmo.binary.BinaryReader;
+use minicpmo.binary.binary_close;
+use minicpmo.binary.binary_open;
+use minicpmo.binary.binary_read_exact;
+use minicpmo.binary.binary_reader_init;
+use minicpmo.tokenizer.Tokenizer;
+use minicpmo.tokenizer.tokenizer_encode_to_ids;
+use minicpmo.tokenizer.tokenizer_init;
+use minicpmo.tokenizer.tokenizer_load;
+
+const OMNI_MAX_MANIFEST_BYTES: usize = 4096;
+const OMNI_MAX_EVENTS: usize = 32;
+const OMNI_MAX_TOKENS: usize = 256;
+const OMNI_MAX_SPANS: usize = 32;
+const OMNI_DATA_REF_CAP: usize = 128;
+const OMNI_EVENT_TEXT_CAP: usize = 128;
+const OMNI_ATTENTION_CAUSAL_MEDIA: u32 = 1;
+
+export enum PromptEventKind {
+    Text,
+    Image,
+    VideoFrame,
+    AudioChunk,
+    SpeechRequest,
+    Control,
+    Unknown,
+}
+
+export struct PromptEvent {
+    kind: PromptEventKind,
+    data_ref: [byte: 128],
+    timestamp_ms: u64,
+    flags: u32,
+}
+
+export struct EmbeddingSpan {
+    kind: PromptEventKind,
+    token_start: u32,
+    token_count: u32,
+    embed_start: u32,
+    embed_count: u32,
+}
+
+export struct CompiledPrompt {
+    token_ids: [u32: 256],
+    position_ids: [u32: 256],
+    token_count: usize,
+    spans: [EmbeddingSpan: 32],
+    span_count: usize,
+    event_count: usize,
+    text_event_count: usize,
+    image_event_count: usize,
+    video_frame_event_count: usize,
+    audio_chunk_event_count: usize,
+    speech_request_count: usize,
+    control_count: usize,
+    text_token_count: usize,
+    media_embedding_count: usize,
+    attention_mask_policy: u32,
+}
+
+struct OmniManifestBuffer {
+    bytes: [byte: 4096],
+    len: usize,
+}
+
+export fn prompt_event_init() PromptEvent {
+    return PromptEvent{ kind: PromptEventKind.Unknown, data_ref: [], timestamp_ms: 0, flags: 0 };
+}
+
+export fn compiled_prompt_init() CompiledPrompt {
+    return CompiledPrompt{ token_ids: [], position_ids: [], token_count: 0, spans: [], span_count: 0, event_count: 0, text_event_count: 0, image_event_count: 0, video_frame_event_count: 0, audio_chunk_event_count: 0, speech_request_count: 0, control_count: 0, text_token_count: 0, media_embedding_count: 0, attention_mask_policy: OMNI_ATTENTION_CAUSAL_MEDIA };
+}
+
+fn omni_cstr_eq(a: &const byte, b: &const byte) bool {
+    return strcmp(a as *const byte, b as *const byte) == 0;
+}
+
+fn omni_cstr_len(value: &const byte) usize {
+    var len: usize = 0;
+    while value[len] != 0 { len = len + 1; }
+    return len;
+}
+
+fn omni_copy_cstr(dest: &byte, cap: usize, src: &const byte) bool {
+    if cap == 0 { return false; }
+    var index: usize = 0;
+    while src[index] != 0 {
+        if index + 1 >= cap { dest[cap - 1] = 0; return false; }
+        dest[index] = src[index];
+        index = index + 1;
+    }
+    dest[index] = 0;
+    return true;
+}
+
+fn omni_kind_from_cstr(value: &const byte) PromptEventKind {
+    if omni_cstr_eq(value, "text\0" as &const byte) { return PromptEventKind.Text; }
+    if omni_cstr_eq(value, "image\0" as &const byte) { return PromptEventKind.Image; }
+    if omni_cstr_eq(value, "video_frame\0" as &const byte) { return PromptEventKind.VideoFrame; }
+    if omni_cstr_eq(value, "audio_chunk\0" as &const byte) { return PromptEventKind.AudioChunk; }
+    if omni_cstr_eq(value, "speech_request\0" as &const byte) { return PromptEventKind.SpeechRequest; }
+    if omni_cstr_eq(value, "control\0" as &const byte) { return PromptEventKind.Control; }
+    return PromptEventKind.Unknown;
+}
+
+fn omni_kind_label(kind: PromptEventKind) &const byte {
+    if kind == PromptEventKind.Text { return "text\0" as &const byte; }
+    if kind == PromptEventKind.Image { return "image\0" as &const byte; }
+    if kind == PromptEventKind.VideoFrame { return "video_frame\0" as &const byte; }
+    if kind == PromptEventKind.AudioChunk { return "audio_chunk\0" as &const byte; }
+    if kind == PromptEventKind.SpeechRequest { return "speech_request\0" as &const byte; }
+    if kind == PromptEventKind.Control { return "control\0" as &const byte; }
+    return "unknown\0" as &const byte;
+}
+
+fn omni_is_ws(ch: byte) bool {
+    return ch == 32 || ch == 9 || ch == 10 || ch == 13;
+}
+
+fn omni_match_at(buf: &const byte, len: usize, pos: usize, pattern: &const byte) bool {
+    var index: usize = 0;
+    while pattern[index] != 0 {
+        if pos + index >= len { return false; }
+        if buf[pos + index] != pattern[index] { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+fn omni_find_pattern(buf: &const byte, len: usize, start: usize, end: usize, pattern: &const byte, out_pos: &usize) bool {
+    var pos: usize = start;
+    var capped_end: usize = end;
+    if capped_end > len { capped_end = len; }
+    while pos < capped_end {
+        if omni_match_at(buf, len, pos, pattern) { out_pos[0] = pos; return true; }
+        pos = pos + 1;
+    }
+    return false;
+}
+
+fn omni_find_byte(buf: &const byte, len: usize, start: usize, end: usize, wanted: byte, out_pos: &usize) bool {
+    var pos: usize = start;
+    var capped_end: usize = end;
+    if capped_end > len { capped_end = len; }
+    while pos < capped_end {
+        if buf[pos] == wanted { out_pos[0] = pos; return true; }
+        pos = pos + 1;
+    }
+    return false;
+}
+
+fn omni_find_json_string_value(buf: &const byte, len: usize, start: usize, end: usize, key: &const byte, dest: &byte, cap: usize, key_pos: &usize) bool {
+    if !omni_find_pattern(buf, len, start, end, key, key_pos) { return false; }
+    var colon: usize = 0;
+    if !omni_find_byte(buf, len, key_pos[0] + omni_cstr_len(key), end, 58, &colon) { return false; }
+    var value_start: usize = colon + 1;
+    while value_start < len && value_start < end && omni_is_ws(buf[value_start]) { value_start = value_start + 1; }
+    if value_start >= len || value_start >= end || buf[value_start] != 34 { return false; }
+    var src: usize = value_start + 1;
+    var dst: usize = 0;
+    while src < len && src < end && buf[src] != 34 {
+        if dst + 1 >= cap { dest[cap - 1] = 0; return false; }
+        if buf[src] == 92 && src + 1 < len && src + 1 < end {
+            src = src + 1;
+            if buf[src] == 110 { dest[dst] = 10; }
+            else { dest[dst] = buf[src]; }
+        } else {
+            dest[dst] = buf[src];
+        }
+        dst = dst + 1;
+        src = src + 1;
+    }
+    if src >= len || src >= end { return false; }
+    dest[dst] = 0;
+    return true;
+}
+
+fn omni_manifest_load(path: &const byte, manifest: &OmniManifestBuffer) bool {
+    manifest.len = 0;
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    if reader.size == 0 || reader.size >= OMNI_MAX_MANIFEST_BYTES as u64 { _ = printf("error: omni manifest size=%llu exceeds cap=%zu\n", reader.size, OMNI_MAX_MANIFEST_BYTES); binary_close(&reader); return false; }
+    manifest.len = reader.size as usize;
+    if !binary_read_exact(&reader, &manifest.bytes[0], manifest.len, "omni manifest\0" as &const byte) { binary_close(&reader); return false; }
+    manifest.bytes[manifest.len] = 0;
+    binary_close(&reader);
+    return true;
+}
+
+fn omni_parse_events(path: &const byte, events: &PromptEvent, event_count: &usize) bool {
+    event_count[0] = 0;
+    var manifest: OmniManifestBuffer = OmniManifestBuffer{ bytes: [], len: 0 };
+    if !omni_manifest_load(path, &manifest) { return false; }
+    var pos: usize = 0;
+    while pos < manifest.len {
+        var kind_value: [byte: 64] = [];
+        var kind_pos: usize = 0;
+        if !omni_find_json_string_value(&manifest.bytes[0] as &const byte, manifest.len, pos, manifest.len, "kind\0" as &const byte, &kind_value[0], @len(kind_value), &kind_pos) { break; }
+        var event_end: usize = manifest.len;
+        _ = omni_find_byte(&manifest.bytes[0] as &const byte, manifest.len, kind_pos, manifest.len, 125, &event_end);
+        if event_count[0] >= OMNI_MAX_EVENTS { _ = printf("error: omni manifest exceeds event cap=%zu\n", OMNI_MAX_EVENTS); return false; }
+        events[event_count[0]] = prompt_event_init();
+        events[event_count[0]].kind = omni_kind_from_cstr(&kind_value[0] as &const byte);
+        if events[event_count[0]].kind == PromptEventKind.Unknown { _ = printf("error: omni manifest unknown event kind=%s\n", &kind_value[0]); return false; }
+        var tmp_key_pos: usize = 0;
+        if events[event_count[0]].kind == PromptEventKind.Text {
+            if !omni_find_json_string_value(&manifest.bytes[0] as &const byte, manifest.len, kind_pos, event_end, "text\0" as &const byte, &events[event_count[0]].data_ref[0], @len(events[event_count[0]].data_ref), &tmp_key_pos) { _ = printf("error: omni text event missing text\n"); return false; }
+        } else {
+            if !omni_find_json_string_value(&manifest.bytes[0] as &const byte, manifest.len, kind_pos, event_end, "path\0" as &const byte, &events[event_count[0]].data_ref[0], @len(events[event_count[0]].data_ref), &tmp_key_pos) {
+                if !omni_find_json_string_value(&manifest.bytes[0] as &const byte, manifest.len, kind_pos, event_end, "name\0" as &const byte, &events[event_count[0]].data_ref[0], @len(events[event_count[0]].data_ref), &tmp_key_pos) {
+                    if !omni_find_json_string_value(&manifest.bytes[0] as &const byte, manifest.len, kind_pos, event_end, "voice\0" as &const byte, &events[event_count[0]].data_ref[0], @len(events[event_count[0]].data_ref), &tmp_key_pos) {
+                        events[event_count[0]].data_ref[0] = 0;
+                    }
+                }
+            }
+        }
+        event_count[0] = event_count[0] + 1;
+        pos = event_end + 1;
+    }
+    if event_count[0] == 0 { _ = printf("error: omni manifest contains no events\n"); return false; }
+    return true;
+}
+
+fn omni_append_token(compiled: &CompiledPrompt, token_id: u32) bool {
+    if compiled.token_count >= OMNI_MAX_TOKENS { _ = printf("error: compiled prompt exceeds token cap=%zu\n", OMNI_MAX_TOKENS); return false; }
+    compiled.token_ids[compiled.token_count] = token_id;
+    compiled.position_ids[compiled.token_count] = compiled.token_count as u32;
+    compiled.token_count = compiled.token_count + 1;
+    return true;
+}
+
+fn omni_single_token(tok: &Tokenizer, piece: &const byte, out: &u32) bool {
+    var ids: [u32: 4] = [];
+    var count: usize = 0;
+    if !tokenizer_encode_to_ids(tok, piece, &ids[0], @len(ids), &count) { return false; }
+    if count != 1 { _ = printf("error: media placeholder %s encoded to %zu tokens\n", piece, count); return false; }
+    out[0] = ids[0];
+    return true;
+}
+
+fn omni_add_span(compiled: &CompiledPrompt, kind: PromptEventKind, token_start: u32, embed_count: u32) bool {
+    if compiled.span_count >= OMNI_MAX_SPANS { _ = printf("error: compiled prompt exceeds span cap=%zu\n", OMNI_MAX_SPANS); return false; }
+    compiled.spans[compiled.span_count] = EmbeddingSpan{ kind: kind, token_start: token_start, token_count: 1, embed_start: compiled.media_embedding_count as u32, embed_count: embed_count };
+    compiled.span_count = compiled.span_count + 1;
+    compiled.media_embedding_count = compiled.media_embedding_count + embed_count as usize;
+    return true;
+}
+
+export fn omni_compile_prompt(tok: &Tokenizer, events: &PromptEvent, event_count: usize, compiled: &CompiledPrompt) bool {
+    compiled[0] = compiled_prompt_init();
+    compiled.event_count = event_count;
+    var image_token_id: u32 = 0;
+    var audio_token_id: u32 = 0;
+    var video_token_id: u32 = 0;
+    if !omni_single_token(tok, "<image>\0" as &const byte, &image_token_id) { return false; }
+    if !omni_single_token(tok, "<audio>\0" as &const byte, &audio_token_id) { return false; }
+    if !omni_single_token(tok, "<video>\0" as &const byte, &video_token_id) { return false; }
+    var event_index: usize = 0;
+    while event_index < event_count {
+        const kind: PromptEventKind = events[event_index].kind;
+        if kind == PromptEventKind.Text {
+            var ids: [u32: 64] = [];
+            var count: usize = 0;
+            if !tokenizer_encode_to_ids(tok, &events[event_index].data_ref[0] as &const byte, &ids[0], @len(ids), &count) { return false; }
+            var token_index: usize = 0;
+            while token_index < count { if !omni_append_token(compiled, ids[token_index]) { return false; } token_index = token_index + 1; }
+            compiled.text_event_count = compiled.text_event_count + 1;
+            compiled.text_token_count = compiled.text_token_count + count;
+        } else if kind == PromptEventKind.Image {
+            const token_start: u32 = compiled.token_count as u32;
+            if !omni_append_token(compiled, image_token_id) { return false; }
+            if !omni_add_span(compiled, kind, token_start, 1) { return false; }
+            compiled.image_event_count = compiled.image_event_count + 1;
+        } else if kind == PromptEventKind.VideoFrame {
+            const token_start: u32 = compiled.token_count as u32;
+            if !omni_append_token(compiled, video_token_id) { return false; }
+            if !omni_add_span(compiled, kind, token_start, 1) { return false; }
+            compiled.video_frame_event_count = compiled.video_frame_event_count + 1;
+        } else if kind == PromptEventKind.AudioChunk {
+            const token_start: u32 = compiled.token_count as u32;
+            if !omni_append_token(compiled, audio_token_id) { return false; }
+            if !omni_add_span(compiled, kind, token_start, 1) { return false; }
+            compiled.audio_chunk_event_count = compiled.audio_chunk_event_count + 1;
+        } else if kind == PromptEventKind.SpeechRequest {
+            compiled.speech_request_count = compiled.speech_request_count + 1;
+        } else if kind == PromptEventKind.Control {
+            compiled.control_count = compiled.control_count + 1;
+        } else { return false; }
+        event_index = event_index + 1;
+    }
+    return true;
+}
+
+fn omni_checksum(compiled: &CompiledPrompt) u32 {
+    var hash: u32 = 2166136261;
+    var token_index: usize = 0;
+    while token_index < compiled.token_count {
+        hash = (hash ^ compiled.token_ids[token_index]) * 16777619;
+        hash = (hash ^ compiled.position_ids[token_index]) * 16777619;
+        token_index = token_index + 1;
+    }
+    var span_index: usize = 0;
+    while span_index < compiled.span_count {
+        hash = (hash ^ (compiled.spans[span_index].token_start + 31)) * 16777619;
+        hash = (hash ^ (compiled.spans[span_index].embed_start + 17)) * 16777619;
+        hash = (hash ^ (compiled.spans[span_index].embed_count + 7)) * 16777619;
+        span_index = span_index + 1;
+    }
+    return hash;
+}
+
+fn omni_attention_label(policy: u32) &const byte {
+    if policy == OMNI_ATTENTION_CAUSAL_MEDIA { return "causal+media-spans\0" as &const byte; }
+    return "unknown\0" as &const byte;
+}
+
+export fn omni_smoke_cli(model_path: &const byte, manifest_path: &const byte) i32 {
+    var tok: Tokenizer = tokenizer_init();
+    if !tokenizer_load(model_path, &tok) { return 1; }
+    var events: [PromptEvent: 32] = [];
+    var event_count: usize = 0;
+    if !omni_parse_events(manifest_path, &events[0], &event_count) { return 1; }
+    var compiled: CompiledPrompt = compiled_prompt_init();
+    if !omni_compile_prompt(&tok, &events[0], event_count, &compiled) { return 1; }
+    const checksum: u32 = omni_checksum(&compiled);
+    _ = printf("omni manifest: events=%zu text=%zu image=%zu video_frame=%zu audio_chunk=%zu speech_request=%zu control=%zu\n", compiled.event_count, compiled.text_event_count, compiled.image_event_count, compiled.video_frame_event_count, compiled.audio_chunk_event_count, compiled.speech_request_count, compiled.control_count);
+    _ = printf("omni event order:");
+    var event_index: usize = 0;
+    while event_index < event_count { _ = printf(" %s", omni_kind_label(events[event_index].kind)); event_index = event_index + 1; }
+    _ = printf("\n");
+    _ = printf("omni tokens:");
+    var token_index: usize = 0;
+    while token_index < compiled.token_count { _ = printf(" %u", compiled.token_ids[token_index]); token_index = token_index + 1; }
+    _ = printf("\n");
+    _ = printf("omni positions:");
+    var pos_index: usize = 0;
+    while pos_index < compiled.token_count { _ = printf(" %u", compiled.position_ids[pos_index]); pos_index = pos_index + 1; }
+    _ = printf("\n");
+    _ = printf("omni spans: count=%zu media_embeddings=%zu\n", compiled.span_count, compiled.media_embedding_count);
+    var span_index: usize = 0;
+    while span_index < compiled.span_count {
+        _ = printf("  span[%zu]: kind=%s token_start=%u token_count=%u embed_start=%u embed_count=%u\n", span_index, omni_kind_label(compiled.spans[span_index].kind), compiled.spans[span_index].token_start, compiled.spans[span_index].token_count, compiled.spans[span_index].embed_start, compiled.spans[span_index].embed_count);
+        span_index = span_index + 1;
+    }
+    _ = printf("omni context: tokens=%zu text_tokens=%zu media_embeddings=%zu effective=%zu attention=%s checksum=0x%x\n", compiled.token_count, compiled.text_token_count, compiled.media_embedding_count, compiled.text_token_count + compiled.media_embedding_count, omni_attention_label(compiled.attention_mask_policy), checksum);
+    _ = printf("omni-smoke: PASS\n");
+    return 0;
+}

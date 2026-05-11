@@ -6,6 +6,7 @@ use minicpmo.gguf.audit_gguf;
 use minicpmo.gguf.inspect_gguf;
 use minicpmo.kernels.kernels_smoke_cli;
 use minicpmo.kernels.quant_smoke_cli;
+use minicpmo.omni.omni_smoke_cli;
 use minicpmo.qwen3.qwen3_bind_cli;
 use minicpmo.qwen3.qwen3_chat_cli;
 use minicpmo.qwen3.qwen3_generate_args_cli;
@@ -38,11 +39,12 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya audio-smoke <model.gguf> <audio.raw>\n");
     _ = printf("  minicpm-o-uya audio-preprocess-smoke <audio.pcm>\n");
     _ = printf("  minicpm-o-uya speech-smoke <model.gguf> <prompt> [out.wav]\n");
+    _ = printf("  minicpm-o-uya omni-smoke <model.gguf> <manifest.json>\n");
     _ = printf("  minicpm-o-uya chat <model.gguf>\n");
     _ = printf("  minicpm-o-uya kernels-smoke\n");
     _ = printf("  minicpm-o-uya quant-smoke\n");
     _ = printf("\n");
-    _ = printf("Status: GGUF inspect/audit, tokenizer, tensor/Qwen3 binding, text generation/chat, vision/audio/speech smoke, tiny vocoder WAV, scalar kernels, and quant smoke are implemented.\n");
+    _ = printf("Status: GGUF inspect/audit, tokenizer, tensor/Qwen3 binding, text generation/chat, vision/audio/speech/omni smoke, tiny vocoder WAV, scalar kernels, and quant smoke are implemented.\n");
 }
 
 export extern fn main(argc: i32, argv: & &byte) i32 {
@@ -159,6 +161,13 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
         var wav_path: &const byte = speech_default_wav_path();
         if argc == 5 { wav_path = argv[4] as &const byte; }
         return speech_smoke_cli(argv[2] as &const byte, argv[3] as &const byte, wav_path);
+    }
+    if strcmp(argv[1] as *const byte, "omni-smoke\0" as *const byte) == 0 {
+        if argc != 4 {
+            _ = printf("usage: minicpm-o-uya omni-smoke <model.gguf> <manifest.json>\n");
+            return 1;
+        }
+        return omni_smoke_cli(argv[2] as &const byte, argv[3] as &const byte);
     }
     if strcmp(argv[1] as *const byte, "tensors\0" as *const byte) == 0 {
         if argc != 3 && argc != 4 {

@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture chat-fixture minicpmo-audit clean FORCE
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture chat-fixture minicpmo-audit clean FORCE
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture chat-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture chat-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -154,6 +154,18 @@ minicpmo-audit: build
 
 clean:
 	rm -rf build
+
+omni-fixture: FORCE build fixtures
+	$(OUT) omni-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json >/tmp/minicpm-o-uya-omni.out
+	grep -q "omni-smoke: PASS" /tmp/minicpm-o-uya-omni.out
+	grep -q "omni manifest: events=7 text=2 image=1 video_frame=1 audio_chunk=1 speech_request=1 control=1" /tmp/minicpm-o-uya-omni.out
+	grep -q "omni event order: text image text video_frame audio_chunk speech_request control" /tmp/minicpm-o-uya-omni.out
+	grep -q "omni tokens: 4 5 12 6 14 13" /tmp/minicpm-o-uya-omni.out
+	grep -q "omni spans: count=3 media_embeddings=3" /tmp/minicpm-o-uya-omni.out
+	grep -q "span\[0\]: kind=image token_start=2 token_count=1 embed_start=0 embed_count=1" /tmp/minicpm-o-uya-omni.out
+	grep -q "span\[1\]: kind=video_frame token_start=4 token_count=1 embed_start=1 embed_count=1" /tmp/minicpm-o-uya-omni.out
+	grep -q "span\[2\]: kind=audio_chunk token_start=5 token_count=1 embed_start=2 embed_count=1" /tmp/minicpm-o-uya-omni.out
+	grep -q "omni context: tokens=6 text_tokens=3 media_embeddings=3 effective=6 attention=causal+media-spans checksum=0x4e22ca" /tmp/minicpm-o-uya-omni.out
 
 chat-fixture: FORCE build fixtures
 	printf "hello\n" | $(OUT) chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-chat-repl.out

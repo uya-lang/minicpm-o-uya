@@ -1,0 +1,11 @@
+{
+  "events": [
+    {"kind": "text", "text": "hello "},
+    {"kind": "image", "path": "tiny_rgb.raw"},
+    {"kind": "text", "text": "world"},
+    {"kind": "video_frame", "path": "tiny_rgb.raw"},
+    {"kind": "audio_chunk", "path": "tiny_audio.raw"},
+    {"kind": "speech_request", "voice": "tiny"},
+    {"kind": "control", "name": "end_turn"}
+  ]
+}

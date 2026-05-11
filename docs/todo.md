@@ -307,16 +307,16 @@
 
 ## Phase 16: Omni prompt compiler
 
-- [ ] 定义 `PromptEvent`。
-- [ ] 定义 `CompiledPrompt`。
-- [ ] 支持 text event。
-- [ ] 支持 image event。
-- [ ] 支持 video frame event。
-- [ ] 支持 audio chunk event。
-- [ ] 支持 speech request/control event。
-- [ ] 实现 event -> token/span 编译。
-- [ ] 实现 position id 和 attention mask policy。
-- [ ] 实现 `omni-smoke <manifest.json>`。
+- [x] 定义 `PromptEvent`。
+- [x] 定义 `CompiledPrompt`。
+- [x] 支持 text event。
+- [x] 支持 image event。
+- [x] 支持 video frame event。
+- [x] 支持 audio chunk event。
+- [x] 支持 speech request/control event。
+- [x] 实现 event -> token/span 编译。
+- [x] 实现 position id 和 attention mask policy。
+- [x] 实现 `omni-smoke <manifest.json>`。
 
 验收标准：
 

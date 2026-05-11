@@ -379,6 +379,19 @@ def main() -> None:
     for left, right in stereo_pcm:
         tiny_pcm += struct.pack("<ff", left, right)
     (out_dir / "tiny_audio.pcm").write_bytes(tiny_pcm)
+    tiny_omni = """{
+  "events": [
+    {"kind": "text", "text": "hello "},
+    {"kind": "image", "path": "tiny_rgb.raw"},
+    {"kind": "text", "text": "world"},
+    {"kind": "video_frame", "path": "tiny_rgb.raw"},
+    {"kind": "audio_chunk", "path": "tiny_audio.raw"},
+    {"kind": "speech_request", "voice": "tiny"},
+    {"kind": "control", "name": "end_turn"}
+  ]
+}
+"""
+    (out_dir / "tiny_omni.json").write_text(tiny_omni)
 
     bad_tensor = tensor_info("mystery.branch.weight", [4], 63, 0)
     bad_directory = struct.pack("<IIQQ", 0x46554747, 3, 1, 0) + bad_tensor
