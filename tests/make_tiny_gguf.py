@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+import struct
+from pathlib import Path
+
+
+GGUF_TYPE_UINT32 = 4
+GGUF_TYPE_INT32 = 5
+GGUF_TYPE_STRING = 8
+GGUF_TYPE_ARRAY = 9
+GGML_TYPE_F32 = 0
+GGML_TYPE_F16 = 1
+
+
+def gguf_string(value: str) -> bytes:
+    raw = value.encode("utf-8")
+    return struct.pack("<Q", len(raw)) + raw
+
+
+def metadata_string(key: str, value: str) -> bytes:
+    return gguf_string(key) + struct.pack("<I", GGUF_TYPE_STRING) + gguf_string(value)
+
+
+def metadata_u32(key: str, value: int) -> bytes:
+    return gguf_string(key) + struct.pack("<II", GGUF_TYPE_UINT32, value)
+
+
+def metadata_i32(key: str, value: int) -> bytes:
+    return gguf_string(key) + struct.pack("<Ii", GGUF_TYPE_INT32, value)
+
+
+def metadata_u32_array(key: str, values: list[int]) -> bytes:
+    payload = gguf_string(key)
+    payload += struct.pack("<IIQ", GGUF_TYPE_ARRAY, GGUF_TYPE_UINT32, len(values))
+    for value in values:
+        payload += struct.pack("<I", value)
+    return payload
+
+
+def tensor_info(name: str, dims: list[int], ggml_type: int, offset: int) -> bytes:
+    payload = gguf_string(name)
+    payload += struct.pack("<I", len(dims))
+    for dim in dims:
+        payload += struct.pack("<Q", dim)
+    payload += struct.pack("<IQ", ggml_type, offset)
+    return payload
+
+
+def align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def main() -> None:
+    out_dir = Path(__file__).resolve().parent / "fixtures"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata = [
+        metadata_string("general.architecture", "minicpmo-test"),
+        metadata_string("general.name", "tiny phase1 fixture"),
+        metadata_u32("general.alignment", 32),
+        metadata_i32("test.scalar_i32", -7),
+        metadata_u32_array("test.array_u32", [1, 2, 3, 5, 8]),
+    ]
+    tensors = [
+        tensor_info("blk.0.weight", [4, 2], GGML_TYPE_F32, 0),
+        tensor_info("token_embd.weight", [8, 4], GGML_TYPE_F16, 32),
+    ]
+
+    header = struct.pack("<IIQQ", 0x46554747, 3, len(tensors), len(metadata))
+    directory = header + b"".join(metadata) + b"".join(tensors)
+    data_start = align_up(len(directory), 32)
+    padding = b"\x00" * (data_start - len(directory))
+    tensor_data = bytes(range(32)) + bytes((255 - i) & 0xFF for i in range(64))
+    fixture = directory + padding + tensor_data
+
+    (out_dir / "tiny.gguf").write_bytes(fixture)
+    (out_dir / "tiny.gguf.part").write_bytes(fixture[:48])
+
+
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,6 @@
 use libc.printf;
 use libc.strcmp;
+use minicpmo.gguf.inspect_gguf;
 
 fn print_help() void {
     _ = printf("minicpm-o-uya - pure Uya MiniCPM-o runtime scaffold\n");
@@ -9,13 +10,20 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya inspect <model.gguf>\n");
     _ = printf("  minicpm-o-uya audit <model.gguf>\n");
     _ = printf("\n");
-    _ = printf("Status: planning scaffold only; inference is not implemented yet.\n");
+    _ = printf("Status: GGUF inspect is implemented; inference is not implemented yet.\n");
 }
 
 export extern fn main(argc: i32, argv: & &byte) i32 {
     if argc <= 1 || strcmp(argv[1] as *const byte, "--help\0" as *const byte) == 0 || strcmp(argv[1] as *const byte, "-h\0" as *const byte) == 0 {
         print_help();
         return 0;
+    }
+    if strcmp(argv[1] as *const byte, "inspect\0" as *const byte) == 0 {
+        if argc != 3 {
+            _ = printf("usage: minicpm-o-uya inspect <model.gguf>\n");
+            return 1;
+        }
+        return inspect_gguf(argv[2] as &const byte);
     }
     _ = printf("minicpm-o-uya: command not implemented yet: %s\n", argv[1]);
     return 1;

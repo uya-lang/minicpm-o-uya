@@ -1,0 +1,165 @@
+use libc.O_RDONLY;
+use libc.printf;
+use libc.sys_close;
+use libc.sys_lseek;
+use libc.sys_open;
+use libc.sys_read;
+
+export struct BinaryReader {
+    fd: i32,
+    size: u64,
+    pos: u64,
+}
+
+export fn binary_reader_init() BinaryReader {
+    return BinaryReader{ fd: 0 - 1, size: 0, pos: 0 };
+}
+
+fn binary_error_at(reader: &BinaryReader, context: &const byte, detail: &const byte) void {
+    _ = printf("error: %s: %s (offset=%llu, file_size=%llu)\n", context, detail, reader.pos, reader.size);
+}
+
+export fn binary_open(path: &const byte, reader: &BinaryReader) bool {
+    const fd_result: !i32 = sys_open(path as *const byte, O_RDONLY as i32, 0);
+    const fd: i32 = fd_result catch {
+        _ = printf("error: cannot open file: %s\n", path);
+        return false;
+    };
+
+    const end_result: !i64 = sys_lseek(fd, 0, 2);
+    const end_pos: i64 = end_result catch {
+        _ = printf("error: cannot determine file size: %s\n", path);
+        _ = sys_close(fd);
+        return false;
+    };
+    if end_pos < 0 {
+        _ = printf("error: negative file size from lseek: %s\n", path);
+        _ = sys_close(fd);
+        return false;
+    }
+
+    const reset_result: !i64 = sys_lseek(fd, 0, 0);
+    const reset_pos: i64 = reset_result catch {
+        _ = printf("error: cannot seek to start: %s\n", path);
+        _ = sys_close(fd);
+        return false;
+    };
+    if reset_pos != 0 {
+        _ = printf("error: cannot seek to start: %s\n", path);
+        _ = sys_close(fd);
+        return false;
+    }
+
+    reader.fd = fd;
+    reader.size = end_pos as u64;
+    reader.pos = 0;
+    return true;
+}
+
+export fn binary_close(reader: &BinaryReader) void {
+    if reader.fd >= 0 {
+        _ = sys_close(reader.fd);
+        reader.fd = 0 - 1;
+    }
+}
+
+export fn binary_seek(reader: &BinaryReader, offset: u64, context: &const byte) bool {
+    if offset > reader.size {
+        binary_error_at(reader, context, "seek past end of file\0" as &const byte);
+        return false;
+    }
+    const seek_result: !i64 = sys_lseek(reader.fd, offset as i64, 0);
+    const new_pos: i64 = seek_result catch {
+        binary_error_at(reader, context, "lseek failed\0" as &const byte);
+        return false;
+    };
+    if new_pos < 0 {
+        binary_error_at(reader, context, "lseek returned a negative offset\0" as &const byte);
+        return false;
+    }
+    if (new_pos as u64) != offset {
+        binary_error_at(reader, context, "lseek returned the wrong offset\0" as &const byte);
+        return false;
+    }
+    reader.pos = offset;
+    return true;
+}
+
+export fn binary_skip(reader: &BinaryReader, count: u64, context: &const byte) bool {
+    if count > (reader.size - reader.pos) {
+        binary_error_at(reader, context, "short file while skipping bytes\0" as &const byte);
+        return false;
+    }
+    return binary_seek(reader, reader.pos + count, context);
+}
+
+export fn binary_read_exact(reader: &BinaryReader, dest: &byte, count: usize, context: &const byte) bool {
+    const count64: u64 = count as u64;
+    if count64 > (reader.size - reader.pos) {
+        binary_error_at(reader, context, "short file while reading bytes\0" as &const byte);
+        return false;
+    }
+
+    var done: usize = 0;
+    while done < count {
+        const want: usize = count - done;
+        const read_result: !isize = sys_read(reader.fd, &dest[done], want);
+        const got: isize = read_result catch {
+            binary_error_at(reader, context, "read syscall failed\0" as &const byte);
+            return false;
+        };
+        if got <= (0 as isize) {
+            binary_error_at(reader, context, "short file from read syscall\0" as &const byte);
+            return false;
+        }
+        done = done + (got as usize);
+        reader.pos = reader.pos + (got as u64);
+    }
+    return true;
+}
+
+export fn binary_read_u8(reader: &BinaryReader, out: &u8, context: &const byte) bool {
+    var buf: [byte: 1] = [];
+    if !binary_read_exact(reader, &buf[0], 1, context) {
+        return false;
+    }
+    *out = buf[0] as u8;
+    return true;
+}
+
+export fn binary_read_u16_le(reader: &BinaryReader, out: &u16, context: &const byte) bool {
+    var buf: [byte: 2] = [];
+    if !binary_read_exact(reader, &buf[0], 2, context) {
+        return false;
+    }
+    *out = (buf[0] as u16) | ((buf[1] as u16) << 8);
+    return true;
+}
+
+export fn binary_read_u32_le(reader: &BinaryReader, out: &u32, context: &const byte) bool {
+    var buf: [byte: 4] = [];
+    if !binary_read_exact(reader, &buf[0], 4, context) {
+        return false;
+    }
+    *out = (buf[0] as u32)
+        | ((buf[1] as u32) << 8)
+        | ((buf[2] as u32) << 16)
+        | ((buf[3] as u32) << 24);
+    return true;
+}
+
+export fn binary_read_u64_le(reader: &BinaryReader, out: &u64, context: &const byte) bool {
+    var buf: [byte: 8] = [];
+    if !binary_read_exact(reader, &buf[0], 8, context) {
+        return false;
+    }
+    *out = (buf[0] as u64)
+        | ((buf[1] as u64) << 8)
+        | ((buf[2] as u64) << 16)
+        | ((buf[3] as u64) << 24)
+        | ((buf[4] as u64) << 32)
+        | ((buf[5] as u64) << 40)
+        | ((buf[6] as u64) << 48)
+        | ((buf[7] as u64) << 56);
+    return true;
+}

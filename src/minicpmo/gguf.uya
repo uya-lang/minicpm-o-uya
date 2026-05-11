@@ -1,0 +1,523 @@
+use libc.printf;
+use libc.strcmp;
+use minicpmo.binary.BinaryReader;
+use minicpmo.binary.binary_close;
+use minicpmo.binary.binary_open;
+use minicpmo.binary.binary_read_exact;
+use minicpmo.binary.binary_read_u16_le;
+use minicpmo.binary.binary_read_u32_le;
+use minicpmo.binary.binary_read_u64_le;
+use minicpmo.binary.binary_read_u8;
+use minicpmo.binary.binary_reader_init;
+use minicpmo.binary.binary_seek;
+use minicpmo.binary.binary_skip;
+
+const GGUF_MAGIC: u32 = 0x46554747;
+const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
+const GGUF_MAX_DIMS: u32 = 8;
+const U64_MAX: u64 = 18446744073709551615;
+
+const GGUF_TYPE_UINT8: u32 = 0;
+const GGUF_TYPE_INT8: u32 = 1;
+const GGUF_TYPE_UINT16: u32 = 2;
+const GGUF_TYPE_INT16: u32 = 3;
+const GGUF_TYPE_UINT32: u32 = 4;
+const GGUF_TYPE_INT32: u32 = 5;
+const GGUF_TYPE_FLOAT32: u32 = 6;
+const GGUF_TYPE_BOOL: u32 = 7;
+const GGUF_TYPE_STRING: u32 = 8;
+const GGUF_TYPE_ARRAY: u32 = 9;
+const GGUF_TYPE_UINT64: u32 = 10;
+const GGUF_TYPE_INT64: u32 = 11;
+const GGUF_TYPE_FLOAT64: u32 = 12;
+
+struct GgufStringRead {
+    len: u64,
+    copied: usize,
+    truncated: bool,
+}
+
+struct GgmlTypeInfo {
+    block_size: u64,
+    type_size: u64,
+    name: &const byte,
+    known: bool,
+}
+
+fn checked_add_u64(a: u64, b: u64, out: &u64) bool {
+    if b > (U64_MAX - a) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+fn checked_mul_u64(a: u64, b: u64, out: &u64) bool {
+    if a != 0 && b > (U64_MAX / a) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+fn align_up(value: u64, alignment: u64, out: &u64) bool {
+    if alignment == 0 {
+        return false;
+    }
+    const rem: u64 = value % alignment;
+    if rem == 0 {
+        *out = value;
+        return true;
+    }
+    return checked_add_u64(value, alignment - rem, out);
+}
+
+fn gguf_value_type_name(value_type: u32) &const byte {
+    if value_type == GGUF_TYPE_UINT8 { return "uint8\0" as &const byte; }
+    if value_type == GGUF_TYPE_INT8 { return "int8\0" as &const byte; }
+    if value_type == GGUF_TYPE_UINT16 { return "uint16\0" as &const byte; }
+    if value_type == GGUF_TYPE_INT16 { return "int16\0" as &const byte; }
+    if value_type == GGUF_TYPE_UINT32 { return "uint32\0" as &const byte; }
+    if value_type == GGUF_TYPE_INT32 { return "int32\0" as &const byte; }
+    if value_type == GGUF_TYPE_FLOAT32 { return "float32\0" as &const byte; }
+    if value_type == GGUF_TYPE_BOOL { return "bool\0" as &const byte; }
+    if value_type == GGUF_TYPE_STRING { return "string\0" as &const byte; }
+    if value_type == GGUF_TYPE_ARRAY { return "array\0" as &const byte; }
+    if value_type == GGUF_TYPE_UINT64 { return "uint64\0" as &const byte; }
+    if value_type == GGUF_TYPE_INT64 { return "int64\0" as &const byte; }
+    if value_type == GGUF_TYPE_FLOAT64 { return "float64\0" as &const byte; }
+    return "unknown\0" as &const byte;
+}
+
+fn scalar_metadata_size(value_type: u32) u64 {
+    if value_type == GGUF_TYPE_UINT8 { return 1; }
+    if value_type == GGUF_TYPE_INT8 { return 1; }
+    if value_type == GGUF_TYPE_BOOL { return 1; }
+    if value_type == GGUF_TYPE_UINT16 { return 2; }
+    if value_type == GGUF_TYPE_INT16 { return 2; }
+    if value_type == GGUF_TYPE_UINT32 { return 4; }
+    if value_type == GGUF_TYPE_INT32 { return 4; }
+    if value_type == GGUF_TYPE_FLOAT32 { return 4; }
+    if value_type == GGUF_TYPE_UINT64 { return 8; }
+    if value_type == GGUF_TYPE_INT64 { return 8; }
+    if value_type == GGUF_TYPE_FLOAT64 { return 8; }
+    return 0;
+}
+
+fn ggml_type_info(ggml_type: u32) GgmlTypeInfo {
+    if ggml_type == 0 { return GgmlTypeInfo{ block_size: 1, type_size: 4, name: "F32\0" as &const byte, known: true }; }
+    if ggml_type == 1 { return GgmlTypeInfo{ block_size: 1, type_size: 2, name: "F16\0" as &const byte, known: true }; }
+    if ggml_type == 2 { return GgmlTypeInfo{ block_size: 32, type_size: 18, name: "Q4_0\0" as &const byte, known: true }; }
+    if ggml_type == 3 { return GgmlTypeInfo{ block_size: 32, type_size: 20, name: "Q4_1\0" as &const byte, known: true }; }
+    if ggml_type == 6 { return GgmlTypeInfo{ block_size: 32, type_size: 22, name: "Q5_0\0" as &const byte, known: true }; }
+    if ggml_type == 7 { return GgmlTypeInfo{ block_size: 32, type_size: 24, name: "Q5_1\0" as &const byte, known: true }; }
+    if ggml_type == 8 { return GgmlTypeInfo{ block_size: 32, type_size: 34, name: "Q8_0\0" as &const byte, known: true }; }
+    if ggml_type == 9 { return GgmlTypeInfo{ block_size: 32, type_size: 40, name: "Q8_1\0" as &const byte, known: true }; }
+    if ggml_type == 10 { return GgmlTypeInfo{ block_size: 256, type_size: 84, name: "Q2_K\0" as &const byte, known: true }; }
+    if ggml_type == 11 { return GgmlTypeInfo{ block_size: 256, type_size: 110, name: "Q3_K\0" as &const byte, known: true }; }
+    if ggml_type == 12 { return GgmlTypeInfo{ block_size: 256, type_size: 144, name: "Q4_K\0" as &const byte, known: true }; }
+    if ggml_type == 13 { return GgmlTypeInfo{ block_size: 256, type_size: 176, name: "Q5_K\0" as &const byte, known: true }; }
+    if ggml_type == 14 { return GgmlTypeInfo{ block_size: 256, type_size: 210, name: "Q6_K\0" as &const byte, known: true }; }
+    if ggml_type == 15 { return GgmlTypeInfo{ block_size: 256, type_size: 292, name: "Q8_K\0" as &const byte, known: true }; }
+    if ggml_type == 24 { return GgmlTypeInfo{ block_size: 1, type_size: 1, name: "I8\0" as &const byte, known: true }; }
+    if ggml_type == 25 { return GgmlTypeInfo{ block_size: 1, type_size: 2, name: "I16\0" as &const byte, known: true }; }
+    if ggml_type == 26 { return GgmlTypeInfo{ block_size: 1, type_size: 4, name: "I32\0" as &const byte, known: true }; }
+    if ggml_type == 27 { return GgmlTypeInfo{ block_size: 1, type_size: 8, name: "I64\0" as &const byte, known: true }; }
+    if ggml_type == 28 { return GgmlTypeInfo{ block_size: 1, type_size: 8, name: "F64\0" as &const byte, known: true }; }
+    if ggml_type == 30 { return GgmlTypeInfo{ block_size: 1, type_size: 2, name: "BF16\0" as &const byte, known: true }; }
+    return GgmlTypeInfo{ block_size: 1, type_size: 0, name: "UNKNOWN\0" as &const byte, known: false };
+}
+
+fn read_gguf_string(reader: &BinaryReader, dest: &byte, dest_cap: usize, out: &GgufStringRead, context: &const byte) bool {
+    var len: u64 = 0;
+    if !binary_read_u64_le(reader, &len, context) {
+        return false;
+    }
+
+    out.len = len;
+    out.copied = 0;
+    out.truncated = false;
+
+    if dest_cap > 0 {
+        dest[0] = 0;
+    }
+
+    var copy_len: usize = 0;
+    if dest_cap > 1 {
+        const max_copy: u64 = (dest_cap - 1) as u64;
+        if len > max_copy {
+            copy_len = max_copy as usize;
+            out.truncated = true;
+        } else {
+            copy_len = len as usize;
+        }
+    } else if len > 0 {
+        out.truncated = true;
+    }
+
+    if copy_len > 0 {
+        if !binary_read_exact(reader, dest, copy_len, context) {
+            return false;
+        }
+        dest[copy_len] = 0;
+        out.copied = copy_len;
+    }
+
+    const remaining: u64 = len - (copy_len as u64);
+    if remaining > 0 {
+        if !binary_skip(reader, remaining, context) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn read_metadata_scalar(reader: &BinaryReader, value_type: u32, key: &const byte, alignment: &u64) bool {
+    if value_type == GGUF_TYPE_UINT8 {
+        var value: u8 = 0;
+        if !binary_read_u8(reader, &value, "metadata uint8 value\0" as &const byte) { return false; }
+        _ = printf(" value=%u", value as u32);
+        return true;
+    }
+    if value_type == GGUF_TYPE_INT8 {
+        var value: u8 = 0;
+        if !binary_read_u8(reader, &value, "metadata int8 value\0" as &const byte) { return false; }
+        _ = printf(" value=%d", (value as i8) as i32);
+        return true;
+    }
+    if value_type == GGUF_TYPE_UINT16 {
+        var value: u16 = 0;
+        if !binary_read_u16_le(reader, &value, "metadata uint16 value\0" as &const byte) { return false; }
+        _ = printf(" value=%u", value as u32);
+        return true;
+    }
+    if value_type == GGUF_TYPE_INT16 {
+        var value: u16 = 0;
+        if !binary_read_u16_le(reader, &value, "metadata int16 value\0" as &const byte) { return false; }
+        _ = printf(" value=%d", (value as i16) as i32);
+        return true;
+    }
+    if value_type == GGUF_TYPE_UINT32 {
+        var value: u32 = 0;
+        if !binary_read_u32_le(reader, &value, "metadata uint32 value\0" as &const byte) { return false; }
+        if strcmp(key as *const byte, "general.alignment\0" as *const byte) == 0 {
+            if value == 0 {
+                _ = printf("\nerror: general.alignment must be non-zero\n");
+                return false;
+            }
+            *alignment = value as u64;
+        }
+        _ = printf(" value=%u", value);
+        return true;
+    }
+    if value_type == GGUF_TYPE_INT32 {
+        var value: u32 = 0;
+        if !binary_read_u32_le(reader, &value, "metadata int32 value\0" as &const byte) { return false; }
+        _ = printf(" value=%d", value as i32);
+        return true;
+    }
+    if value_type == GGUF_TYPE_FLOAT32 {
+        var value: u32 = 0;
+        if !binary_read_u32_le(reader, &value, "metadata float32 value\0" as &const byte) { return false; }
+        _ = printf(" value_bits=0x%x", value);
+        return true;
+    }
+    if value_type == GGUF_TYPE_BOOL {
+        var value: u8 = 0;
+        if !binary_read_u8(reader, &value, "metadata bool value\0" as &const byte) { return false; }
+        if value == 0 {
+            _ = printf(" value=false");
+        } else {
+            _ = printf(" value=true");
+        }
+        return true;
+    }
+    if value_type == GGUF_TYPE_UINT64 {
+        var value: u64 = 0;
+        if !binary_read_u64_le(reader, &value, "metadata uint64 value\0" as &const byte) { return false; }
+        _ = printf(" value=%llu", value);
+        return true;
+    }
+    if value_type == GGUF_TYPE_INT64 {
+        var value: u64 = 0;
+        if !binary_read_u64_le(reader, &value, "metadata int64 value\0" as &const byte) { return false; }
+        _ = printf(" value=%lld", value as i64);
+        return true;
+    }
+    if value_type == GGUF_TYPE_FLOAT64 {
+        var value: u64 = 0;
+        if !binary_read_u64_le(reader, &value, "metadata float64 value\0" as &const byte) { return false; }
+        _ = printf(" value_bits=0x%llx", value);
+        return true;
+    }
+    _ = printf("\nerror: unknown metadata scalar type %u\n", value_type);
+    return false;
+}
+
+fn skip_metadata_array(reader: &BinaryReader, element_type: u32, count: u64) bool {
+    const elem_size: u64 = scalar_metadata_size(element_type);
+    if elem_size > 0 {
+        if count > ((reader.size - reader.pos) / elem_size) {
+            _ = printf("\nerror: metadata array is truncated (type=%s, count=%llu)\n", gguf_value_type_name(element_type), count);
+            return false;
+        }
+        return binary_skip(reader, count * elem_size, "metadata scalar array\0" as &const byte);
+    }
+    if element_type == GGUF_TYPE_STRING {
+        var tmp: [byte: 1] = [];
+        var info: GgufStringRead = GgufStringRead{ len: 0, copied: 0, truncated: false };
+        var i: u64 = 0;
+        while i < count {
+            if !read_gguf_string(reader, &tmp[0], 1, &info, "metadata string array element\0" as &const byte) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    if element_type == GGUF_TYPE_ARRAY {
+        _ = printf("\nerror: nested metadata arrays are not supported by GGUF inspector\n");
+        return false;
+    }
+    _ = printf("\nerror: unknown metadata array element type %u\n", element_type);
+    return false;
+}
+
+fn read_metadata_value(reader: &BinaryReader, value_type: u32, key: &const byte, alignment: &u64) bool {
+    if value_type == GGUF_TYPE_STRING {
+        var value: [byte: 129] = [];
+        var info: GgufStringRead = GgufStringRead{ len: 0, copied: 0, truncated: false };
+        if !read_gguf_string(reader, &value[0], @len(value), &info, "metadata string value\0" as &const byte) {
+            return false;
+        }
+        _ = printf(" value=\"%s", &value[0]);
+        if info.truncated {
+            _ = printf("...");
+        }
+        _ = printf("\" len=%llu", info.len);
+        return true;
+    }
+    if value_type == GGUF_TYPE_ARRAY {
+        var element_type: u32 = 0;
+        var count: u64 = 0;
+        if !binary_read_u32_le(reader, &element_type, "metadata array element type\0" as &const byte) { return false; }
+        if !binary_read_u64_le(reader, &count, "metadata array length\0" as &const byte) { return false; }
+        _ = printf(" array_type=%s array_len=%llu", gguf_value_type_name(element_type), count);
+        return skip_metadata_array(reader, element_type, count);
+    }
+    return read_metadata_scalar(reader, value_type, key, alignment);
+}
+
+fn read_metadata_entry(reader: &BinaryReader, index: u64, alignment: &u64) bool {
+    var key: [byte: 193] = [];
+    var key_info: GgufStringRead = GgufStringRead{ len: 0, copied: 0, truncated: false };
+    if !read_gguf_string(reader, &key[0], @len(key), &key_info, "metadata key\0" as &const byte) {
+        return false;
+    }
+
+    var value_type: u32 = 0;
+    if !binary_read_u32_le(reader, &value_type, "metadata value type\0" as &const byte) {
+        return false;
+    }
+
+    _ = printf("metadata[%llu] key=%s", index, &key[0]);
+    if key_info.truncated {
+        _ = printf("...");
+    }
+    _ = printf(" type=%s", gguf_value_type_name(value_type));
+    if !read_metadata_value(reader, value_type, &key[0] as &const byte, alignment) {
+        return false;
+    }
+    _ = printf("\n");
+    return true;
+}
+
+fn tensor_byte_size(ggml_type: u32, dims: &u64, n_dims: u32, out: &u64) bool {
+    const info: GgmlTypeInfo = ggml_type_info(ggml_type);
+    if !info.known {
+        return false;
+    }
+    if n_dims == 0 {
+        return false;
+    }
+    if info.block_size == 0 || info.type_size == 0 {
+        return false;
+    }
+    if dims[0] % info.block_size != 0 {
+        return false;
+    }
+
+    var byte_count: u64 = 0;
+    if !checked_mul_u64(dims[0] / info.block_size, info.type_size, &byte_count) {
+        return false;
+    }
+
+    var i: u32 = 1;
+    while i < n_dims {
+        if !checked_mul_u64(byte_count, dims[i as usize], &byte_count) {
+            return false;
+        }
+        i = i + 1;
+    }
+    *out = byte_count;
+    return true;
+}
+
+fn print_shape(dims: &u64, n_dims: u32) void {
+    _ = printf("[");
+    var i: u32 = 0;
+    while i < n_dims {
+        if i > 0 {
+            _ = printf(",");
+        }
+        _ = printf("%llu", dims[i as usize]);
+        i = i + 1;
+    }
+    _ = printf("]");
+}
+
+fn read_tensor_info(reader: &BinaryReader, index: u64, data_start: u64, print_entry: bool) bool {
+    var name: [byte: 257] = [];
+    var name_info: GgufStringRead = GgufStringRead{ len: 0, copied: 0, truncated: false };
+    if !read_gguf_string(reader, &name[0], @len(name), &name_info, "tensor name\0" as &const byte) {
+        return false;
+    }
+
+    var n_dims: u32 = 0;
+    if !binary_read_u32_le(reader, &n_dims, "tensor n_dims\0" as &const byte) {
+        return false;
+    }
+    if n_dims == 0 || n_dims > GGUF_MAX_DIMS {
+        _ = printf("error: tensor[%llu] has unsupported n_dims=%u\n", index, n_dims);
+        return false;
+    }
+
+    var dims: [u64: 8] = [];
+    var i: u32 = 0;
+    while i < n_dims {
+        if !binary_read_u64_le(reader, &dims[i as usize], "tensor dimension\0" as &const byte) {
+            return false;
+        }
+        i = i + 1;
+    }
+
+    var ggml_type: u32 = 0;
+    var relative_offset: u64 = 0;
+    if !binary_read_u32_le(reader, &ggml_type, "tensor ggml_type\0" as &const byte) { return false; }
+    if !binary_read_u64_le(reader, &relative_offset, "tensor relative offset\0" as &const byte) { return false; }
+
+    if print_entry {
+        const type_info: GgmlTypeInfo = ggml_type_info(ggml_type);
+        var byte_count: u64 = 0;
+        var absolute_offset: u64 = 0;
+        var end_offset: u64 = 0;
+        const have_size: bool = tensor_byte_size(ggml_type, &dims[0], n_dims, &byte_count);
+        const have_absolute: bool = checked_add_u64(data_start, relative_offset, &absolute_offset);
+
+        _ = printf("tensor[%llu] name=%s", index, &name[0]);
+        if name_info.truncated {
+            _ = printf("...");
+        }
+        _ = printf(" dims=");
+        print_shape(&dims[0], n_dims);
+        _ = printf(" type=%s(%u) rel_offset=%llu", type_info.name, ggml_type, relative_offset);
+        if have_absolute {
+            _ = printf(" abs_offset=%llu", absolute_offset);
+        } else {
+            _ = printf(" abs_offset=overflow");
+        }
+        if have_size {
+            _ = printf(" byte_size=%llu", byte_count);
+            if have_absolute && checked_add_u64(absolute_offset, byte_count, &end_offset) {
+                if end_offset > reader.size {
+                    _ = printf(" warning=data_extends_past_file(end=%llu)", end_offset);
+                }
+            } else {
+                _ = printf(" warning=end_offset_overflow");
+            }
+        } else {
+            _ = printf(" byte_size=unsupported");
+        }
+        _ = printf("\n");
+    }
+    return true;
+}
+
+export fn inspect_gguf(path: &const byte) i32 {
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) {
+        return 1;
+    }
+
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var tensor_count: u64 = 0;
+    var metadata_count: u64 = 0;
+    var alignment: u64 = GGUF_DEFAULT_ALIGNMENT;
+
+    if !binary_read_u32_le(&reader, &magic, "GGUF magic\0" as &const byte) { binary_close(&reader); return 1; }
+    if magic != GGUF_MAGIC {
+        _ = printf("error: bad GGUF magic 0x%x, expected 0x%x\n", magic, GGUF_MAGIC);
+        binary_close(&reader);
+        return 1;
+    }
+    if !binary_read_u32_le(&reader, &version, "GGUF version\0" as &const byte) { binary_close(&reader); return 1; }
+    if version != 2 && version != 3 {
+        _ = printf("error: unsupported GGUF version %u (supported: 2, 3)\n", version);
+        binary_close(&reader);
+        return 1;
+    }
+    if !binary_read_u64_le(&reader, &tensor_count, "GGUF tensor_count\0" as &const byte) { binary_close(&reader); return 1; }
+    if !binary_read_u64_le(&reader, &metadata_count, "GGUF metadata_count\0" as &const byte) { binary_close(&reader); return 1; }
+
+    _ = printf("GGUF file: %s\n", path);
+    _ = printf("header: version=%u tensor_count=%llu metadata_count=%llu file_size=%llu\n", version, tensor_count, metadata_count, reader.size);
+
+    var i: u64 = 0;
+    while i < metadata_count {
+        if !read_metadata_entry(&reader, i, &alignment) {
+            binary_close(&reader);
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    const tensor_dir_start: u64 = reader.pos;
+    i = 0;
+    while i < tensor_count {
+        if !read_tensor_info(&reader, i, 0, false) {
+            binary_close(&reader);
+            return 1;
+        }
+        i = i + 1;
+    }
+    const tensor_dir_end: u64 = reader.pos;
+
+    var data_start: u64 = 0;
+    if !align_up(tensor_dir_end, alignment, &data_start) {
+        _ = printf("error: cannot compute aligned data section offset (dir_end=%llu, alignment=%llu)\n", tensor_dir_end, alignment);
+        binary_close(&reader);
+        return 1;
+    }
+
+    _ = printf("layout: alignment=%llu tensor_dir_start=%llu tensor_dir_end=%llu data_start=%llu\n", alignment, tensor_dir_start, tensor_dir_end, data_start);
+    if data_start > reader.size {
+        _ = printf("warning: data_start is past file end; tensor data is truncated or absent\n");
+    }
+
+    if !binary_seek(&reader, tensor_dir_start, "rewind tensor directory\0" as &const byte) {
+        binary_close(&reader);
+        return 1;
+    }
+    i = 0;
+    while i < tensor_count {
+        if !read_tensor_info(&reader, i, data_start, true) {
+            binary_close(&reader);
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    binary_close(&reader);
+    return 0;
+}

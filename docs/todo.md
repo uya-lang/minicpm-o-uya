@@ -22,22 +22,22 @@
 
 ## Phase 1: Binary 与 GGUF inspector
 
-- [ ] 实现 little-endian binary reader。
-- [ ] 实现 safe file seek/read。
-- [ ] 读取 GGUF magic/version/tensor_count/metadata_count。
-- [ ] 安全跳过 GGUF metadata value。
-- [ ] 支持 scalar/string/array metadata。
-- [ ] 读取 tensor name、n_dims、shape、ggml_type、relative offset。
-- [ ] 计算 data section alignment 和 absolute tensor offset。
-- [ ] 计算 tensor byte size。
-- [ ] 实现 `inspect <model.gguf>`。
-- [ ] 对坏 magic、短 header、短 metadata、短 tensor directory 给明确错误。
+- [x] 实现 little-endian binary reader。
+- [x] 实现 safe file seek/read。
+- [x] 读取 GGUF magic/version/tensor_count/metadata_count。
+- [x] 安全跳过 GGUF metadata value。
+- [x] 支持 scalar/string/array metadata。
+- [x] 读取 tensor name、n_dims、shape、ggml_type、relative offset。
+- [x] 计算 data section alignment 和 absolute tensor offset。
+- [x] 计算 tensor byte size。
+- [x] 实现 `inspect <model.gguf>`。
+- [x] 对坏 magic、短 header、短 metadata、短 tensor directory 给明确错误。
 
 验收标准：
 
-- tiny GGUF fixture 可打印 header 和 tensor table。
-- 对 `.part` 截断文件不崩溃。
-- `inspect` 不读取大 tensor data。
+- [x] tiny GGUF fixture 可打印 header 和 tensor table。
+- [x] 对 `.part` 截断文件不崩溃。
+- [x] `inspect` 不读取大 tensor data。
 
 ## Phase 2: MiniCPM-o schema audit
 

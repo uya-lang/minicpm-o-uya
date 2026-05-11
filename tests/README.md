@@ -12,3 +12,13 @@ Planned test layers:
 5. Qwen3 text-only small model fixtures.
 6. Vision/audio/speech fixtures with raw tensor inputs.
 7. Documented external-model smoke targets.
+
+## Phase 1 Fixtures
+
+Run `python3 tests/make_tiny_gguf.py` to generate:
+
+- `tests/fixtures/tiny.gguf` — deterministic GGUF v3 fixture with scalar, string, and array metadata plus two tensors.
+- `tests/fixtures/tiny.gguf.part` — truncated file used to verify short-read errors.
+
+`make test` builds the CLI, inspects `tiny.gguf`, and confirms the truncated
+fixture fails cleanly without reading tensor data.

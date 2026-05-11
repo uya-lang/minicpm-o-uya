@@ -9,7 +9,7 @@ audio input, speech output, and finally streaming omni chat.
 
 ## Status
 
-Planning scaffold only. No real MiniCPM-o inference is implemented yet.
+Phase 1 is implemented: `inspect <model.gguf>` reads GGUF headers, metadata, and tensor directories without reading tensor data. No real MiniCPM-o inference is implemented yet.
 
 ## Goals
 
@@ -19,11 +19,12 @@ Planning scaffold only. No real MiniCPM-o inference is implemented yet.
 - Honest runtime status: audit/inspection is not generation.
 - External model paths only; do not commit large weights.
 
-## Planned CLI
+## CLI
 
 ```sh
 build/minicpm-o-uya --help
 build/minicpm-o-uya inspect /path/to/model.gguf
+# planned next phase
 build/minicpm-o-uya audit /path/to/model.gguf
 build/minicpm-o-uya encode /path/to/model.gguf "hello"
 build/minicpm-o-uya generate /path/to/model.gguf "hello"
@@ -37,3 +38,13 @@ build/minicpm-o-uya chat /path/to/model.gguf
 - `docs/design.md` — detailed pure Uya architecture and implementation plan.
 - `docs/todo.md` — phased TODO checklist and acceptance criteria.
 
+
+## Phase 1 Validation
+
+```sh
+make test
+build/minicpm-o-uya inspect tests/fixtures/tiny.gguf
+```
+
+`tests/make_tiny_gguf.py` generates a tiny deterministic GGUF fixture and a
+truncated `.part` file for short-read diagnostics.
