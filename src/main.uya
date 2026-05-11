@@ -36,7 +36,7 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya format-chat <model.gguf> <user-text>\n");
     _ = printf("  minicpm-o-uya tensors <model.gguf> [--mmap]\n");
     _ = printf("  minicpm-o-uya qwen3-bind <model.gguf>\n");
-    _ = printf("  minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--verbose]\n");
+    _ = printf("  minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose]\n");
     _ = printf("  minicpm-o-uya vision-smoke <model.gguf> <image.raw|image.rgb|manifest>\n");
     _ = printf("  minicpm-o-uya vision-preprocess-smoke <model.gguf> <image.rgb|manifest>\n");
     _ = printf("  minicpm-o-uya audio-smoke <model.gguf> <audio.raw>\n");
@@ -46,7 +46,7 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya omni-chat <model.gguf>\n");
     _ = printf("  minicpm-o-uya stream-chat <model.gguf> <manifest.json>\n");
     _ = printf("  minicpm-o-uya bench <model.gguf> <manifest.json>\n");
-    _ = printf("  minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--verbose]\n");
+    _ = printf("  minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose]\n");
     _ = printf("  minicpm-o-uya kernels-smoke\n");
     _ = printf("  minicpm-o-uya quant-smoke\n");
     _ = printf("\n");
@@ -126,7 +126,7 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
     }
     if strcmp(argv[1] as *const byte, "chat\0" as *const byte) == 0 {
         if argc < 3 {
-            _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--verbose]\n");
+            _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose]\n");
             return 1;
         }
         return qwen3_chat_cli(argc, argv as & &byte);

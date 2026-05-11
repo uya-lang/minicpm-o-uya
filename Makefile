@@ -102,6 +102,11 @@ generate-fixture: FORCE build fixtures
 	$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 1 --temperature 1.0 --top-k 2 --seed 7 >/tmp/minicpm-o-uya-generate-seed-a.out
 	$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 1 --temperature 1.0 --top-k 2 --seed 7 >/tmp/minicpm-o-uya-generate-seed-b.out
 	cmp -s /tmp/minicpm-o-uya-generate-seed-a.out /tmp/minicpm-o-uya-generate-seed-b.out
+	$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 3 >/tmp/minicpm-o-uya-generate-thread1.out
+	$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 3 --threads 2 >/tmp/minicpm-o-uya-generate-thread2.out
+	cmp -s /tmp/minicpm-o-uya-generate-thread1.out /tmp/minicpm-o-uya-generate-thread2.out
+	$(OUT) generate tests/fixtures/tiny.gguf hello >/tmp/minicpm-o-uya-generate-eos.out
+	grep -q "stop: context_limit=32" /tmp/minicpm-o-uya-generate-eos.out
 	$(OUT) generate tests/fixtures/tiny.gguf hello --stop-token 4 >/tmp/minicpm-o-uya-generate-stop.out
 	grep -q "stop: token=4" /tmp/minicpm-o-uya-generate-stop.out
 	@if $(OUT) generate tests/fixtures/tiny.gguf hello --temperature nope >/tmp/minicpm-o-uya-generate-bad.out 2>&1; then \

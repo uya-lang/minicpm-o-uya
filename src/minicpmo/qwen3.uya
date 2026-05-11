@@ -4,6 +4,9 @@ use libc.fgets;
 use libc.fflush;
 use libc.free;
 use libc.powf;
+use libc.pthread_create;
+use libc.pthread_join;
+use libc.pthread_t;
 use libc.printf;
 use libc.sinf;
 use libc.stdin;
@@ -70,6 +73,9 @@ const QWEN3_CHAT_LINE_CAP: usize = 512;
 const QWEN3_CHAT_TURN_CAP: usize = 1024;
 const QWEN3_GENERATED_TEXT_CAP: usize = 4096;
 const QWEN3_TOKENIZER_UNKNOWN_ID: u32 = 4294967295;
+const QWEN3_MAX_THREADS: usize = 64;
+
+var qwen3_thread_count: usize = 1;
 
 export struct Qwen3SamplerConfig {
     max_new_tokens: u32,
@@ -82,6 +88,17 @@ export struct Qwen3SamplerConfig {
     stop_token: u32,
     stop_on_eos: bool,
     verbose: bool,
+    threads: u32,
+}
+
+struct Qwen3MatvecTask {
+    dst: &f32,
+    matrix: &TensorView,
+    x: &const f32,
+    in_dim: usize,
+    out_start: usize,
+    out_end: usize,
+    q8: bool,
 }
 
 struct Qwen3Runtime {
@@ -506,12 +523,17 @@ fn qwen3_zero_f32(dst: &f32, n: usize) void {
     while i < n { dst[i] = 0.0; i = i + 1; }
 }
 
-fn qwen3_q8_0_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) bool {
-    if in_dim % (32 as usize) != 0 { return false; }
-    qwen3_zero_f32(dst, out_dim);
+fn qwen3_set_thread_count(threads: u32) void {
+    var count: usize = threads as usize;
+    if count < 1 { count = 1; }
+    if count > QWEN3_MAX_THREADS { count = QWEN3_MAX_THREADS; }
+    qwen3_thread_count = count;
+}
+
+fn qwen3_q8_0_matvec_range(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) void {
     const blocks_per_row: usize = in_dim / (32 as usize);
-    var j: usize = 0;
-    while j < out_dim {
+    var j: usize = out_start;
+    while j < out_end {
         var sum: f32 = 0.0;
         var b: usize = 0;
         while b < blocks_per_row {
@@ -530,13 +552,17 @@ fn qwen3_q8_0_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim:
         dst[j] = sum;
         j = j + 1;
     }
+}
+
+fn qwen3_q8_0_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) bool {
+    if in_dim % (32 as usize) != 0 { return false; }
+    qwen3_q8_0_matvec_range(dst, matrix, x, in_dim, 0, out_dim);
     return true;
 }
 
-fn qwen3_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) void {
-    if matrix.dtype == TensorDType.Q8_0 && qwen3_q8_0_matvec_view(dst, matrix, x, in_dim, out_dim) { return; }
-    var j: usize = 0;
-    while j < out_dim {
+fn qwen3_dense_matvec_range(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) void {
+    var j: usize = out_start;
+    while j < out_end {
         var sum: f32 = 0.0;
         var i: usize = 0;
         while i < in_dim {
@@ -546,6 +572,57 @@ fn qwen3_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usiz
         dst[j] = sum;
         j = j + 1;
     }
+}
+
+fn qwen3_matvec_worker(arg: &void) &void {
+    const task: &Qwen3MatvecTask = arg as &Qwen3MatvecTask;
+    if task.q8 {
+        qwen3_q8_0_matvec_range(task.dst, task.matrix, task.x, task.in_dim, task.out_start, task.out_end);
+    } else {
+        qwen3_dense_matvec_range(task.dst, task.matrix, task.x, task.in_dim, task.out_start, task.out_end);
+    }
+    return null;
+}
+
+fn qwen3_matvec_parallel(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize, q8: bool) bool {
+    var count: usize = qwen3_thread_count;
+    if count < 2 || out_dim < (64 as usize) { return false; }
+    if count > QWEN3_MAX_THREADS { count = QWEN3_MAX_THREADS; }
+    if count > out_dim { count = out_dim; }
+    var tasks: [Qwen3MatvecTask: 64] = [];
+    var threads: [pthread_t: 64] = [];
+    var launched: [bool: 64] = [];
+    var j: usize = 0;
+    while j < count {
+        const start: usize = (out_dim * j) / count;
+        const end: usize = (out_dim * (j + (1 as usize))) / count;
+        tasks[j] = Qwen3MatvecTask{ dst: dst, matrix: matrix, x: x, in_dim: in_dim, out_start: start, out_end: end, q8: q8 };
+        if pthread_create(&threads[j], null, &qwen3_matvec_worker as &void, &tasks[j] as &void) == 0 {
+            launched[j] = true;
+        } else {
+            _ = qwen3_matvec_worker(&tasks[j] as &void);
+            launched[j] = false;
+        }
+        j = j + 1;
+    }
+    j = 0;
+    while j < count {
+        if launched[j] {
+            var retval: &void = null;
+            _ = pthread_join(&threads[j], &retval);
+        }
+        j = j + 1;
+    }
+    return true;
+}
+
+fn qwen3_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) void {
+    if matrix.dtype == TensorDType.Q8_0 {
+        if in_dim % (32 as usize) == 0 && qwen3_matvec_parallel(dst, matrix, x, in_dim, out_dim, true) { return; }
+        if qwen3_q8_0_matvec_view(dst, matrix, x, in_dim, out_dim) { return; }
+    }
+    if qwen3_matvec_parallel(dst, matrix, x, in_dim, out_dim, false) { return; }
+    qwen3_dense_matvec_range(dst, matrix, x, in_dim, 0, out_dim);
 }
 
 fn qwen3_apply_head_norm(vec: &f32, norm: &TensorView, head_count: usize, head_dim: usize) void {
@@ -754,7 +831,7 @@ export fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, toke
 
 
 fn qwen3_sampler_init() Qwen3SamplerConfig {
-    return Qwen3SamplerConfig{ max_new_tokens: 128, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true, verbose: false };
+    return Qwen3SamplerConfig{ max_new_tokens: 0, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true, verbose: false, threads: 1 };
 }
 
 fn qwen3_sampler_f32(bits: u32) f32 {
@@ -923,6 +1000,10 @@ fn qwen3_parse_sampler_args(argc: i32, argv: & &byte, start_index: i32, sampler:
             sampler.verbose = true;
             i = i + 1; continue;
         }
+        if strcmp(argv[i] as *const byte, "--threads\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &sampler.threads) { return false; }
+            i = i + 2; continue;
+        }
         return false;
     }
     return true;
@@ -990,10 +1071,17 @@ fn qwen3_append_prompt_text(config: &Qwen3Config, weights: &Qwen3Weights, tok: &
 
 fn qwen3_generate_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, sampler: &Qwen3SamplerConfig, tok: &Tokenizer, logits: &f32, text_label: &const byte) i32 {
     var generated: usize = 0;
+    if sampler.verbose {
+        _ = printf("threads: %zu\n", qwen3_thread_count);
+    }
     _ = printf("%s: ", text_label);
     _ = fflush(stdout);
-    while generated < sampler.max_new_tokens as usize {
-        if runtime.total_tokens >= config.context_length as usize || runtime.total_tokens >= runtime.context_capacity { _ = printf("error: context overflow total_tokens=%zu context=%u\n", runtime.total_tokens, config.context_length); return 1; }
+    while sampler.max_new_tokens == 0 || generated < sampler.max_new_tokens as usize {
+        if runtime.total_tokens >= config.context_length as usize || runtime.total_tokens >= runtime.context_capacity {
+            _ = printf("\n");
+            _ = printf("stop: context_limit=%u total_tokens=%zu\n", config.context_length, runtime.total_tokens);
+            return 0;
+        }
         const next_id: u32 = qwen3_sample(logits, config.vocab_size as usize, runtime.prompt_ids, runtime.total_tokens, sampler, &runtime.seed);
         if sampler.verbose {
             _ = printf("sampled token[%zu]: %u piece=%s\n", generated, next_id, tokenizer_piece(tok, next_id));
@@ -1017,6 +1105,9 @@ fn qwen3_generate_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: 
         generated = generated + 1;
     }
     _ = printf("\n");
+    if sampler.max_new_tokens != 0 {
+        _ = printf("stop: max_new_tokens=%u\n", sampler.max_new_tokens);
+    }
     return 0;
 }
 
@@ -1080,18 +1171,24 @@ export fn qwen3_generate_cli(path: &const byte, prompt: &const byte) i32 {
 }
 
 export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
-    if argc < 4 { _ = printf("usage: minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--verbose]\n"); return 1; }
+    if argc < 4 { _ = printf("usage: minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose]\n"); return 1; }
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
     var weights: Qwen3Weights = qwen3_weights_init();
     var tok: Tokenizer = tokenizer_init();
     var runtime: Qwen3Runtime = qwen3_runtime_init();
     var logits: [f32: QWEN3_FORWARD_MAX_VOCAB] = [];
-    if !qwen3_prepare_runtime(argv[2] as &const byte, argv[3] as &const byte, &config, &table, &weights, &tok, &runtime, &logits[0]) { return 1; }
     var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
-    if tok.eos_id != QWEN3_TOKENIZER_UNKNOWN_ID { sampler.stop_token = tok.eos_id; }
-    if !qwen3_parse_sampler_args(argc, argv, 4, &sampler) { _ = printf("error: invalid generate sampler args\n"); tensor_weight_table_detach_mmap(&table); return 1; }
+    if !qwen3_parse_sampler_args(argc, argv, 4, &sampler) { _ = printf("error: invalid generate sampler args\n"); return 1; }
+    qwen3_set_thread_count(sampler.threads);
+    if !qwen3_open_runtime(argv[2] as &const byte, &config, &table, &weights, &tok, &runtime) { return 1; }
+    if sampler.stop_on_eos && tok.eos_id != QWEN3_TOKENIZER_UNKNOWN_ID { sampler.stop_token = tok.eos_id; }
     runtime.seed = sampler.seed;
+    if !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, argv[3] as &const byte, &logits[0]) {
+        qwen3_runtime_free(&runtime);
+        tensor_weight_table_detach_mmap(&table);
+        return 1;
+    }
     _ = printf("generate prompt_tokens:");
     var i: usize = 0;
     while i < runtime.prompt_count { _ = printf(" %u", runtime.prompt_ids[i]); i = i + 1; }
@@ -1102,7 +1199,7 @@ export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
 }
 
 export fn qwen3_chat_cli(argc: i32, argv: & &byte) i32 {
-    if argc < 3 { _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--verbose]\n"); return 1; }
+    if argc < 3 { _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose]\n"); return 1; }
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
     var weights: Qwen3Weights = qwen3_weights_init();
@@ -1117,6 +1214,7 @@ export fn qwen3_chat_cli(argc: i32, argv: & &byte) i32 {
     var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
     if tok.eos_id != QWEN3_TOKENIZER_UNKNOWN_ID { sampler.stop_token = tok.eos_id; }
     if !qwen3_parse_sampler_args(argc, argv, 3, &sampler) { _ = printf("error: invalid chat sampler args\n"); tensor_weight_table_detach_mmap(&table); return 1; }
+    qwen3_set_thread_count(sampler.threads);
     runtime.seed = sampler.seed;
     var logits: [f32: QWEN3_FORWARD_MAX_VOCAB] = [];
     var line: [byte: QWEN3_CHAT_LINE_CAP] = [];
