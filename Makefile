@@ -50,6 +50,14 @@ tokenizer-fixture: build fixtures
 	grep -qx "8 9 10" /tmp/minicpm-o-uya-encode-zh.out
 	$(OUT) encode tests/fixtures/tiny.gguf "<image> hello <audio>" >/tmp/minicpm-o-uya-encode-media.out
 	grep -qx "12 5 4 5 13" /tmp/minicpm-o-uya-encode-media.out
+	$(OUT) encode tests/fixtures/tiny_bpe.gguf "hello" >/tmp/minicpm-o-uya-encode-bpe-hello.out
+	grep -qx "7" /tmp/minicpm-o-uya-encode-bpe-hello.out
+	$(OUT) encode tests/fixtures/tiny_bpe.gguf " world" >/tmp/minicpm-o-uya-encode-bpe-space.out
+	grep -qx "16" /tmp/minicpm-o-uya-encode-bpe-space.out
+	$(OUT) encode tests/fixtures/tiny_bpe.gguf "你" >/tmp/minicpm-o-uya-encode-bpe-zh.out
+	grep -qx "20" /tmp/minicpm-o-uya-encode-bpe-zh.out
+	$(OUT) decode tests/fixtures/tiny_bpe.gguf 7 16 20 >/tmp/minicpm-o-uya-decode-bpe.out
+	grep -qx "hello world你" /tmp/minicpm-o-uya-decode-bpe.out
 	$(OUT) format-chat tests/fixtures/tiny.gguf "<image> hello" >/tmp/minicpm-o-uya-chat.out
 	grep -q "<|im_start|>user" /tmp/minicpm-o-uya-chat.out
 	grep -q "<image> hello<|im_end|>" /tmp/minicpm-o-uya-chat.out
@@ -209,7 +217,7 @@ bench-fixture: FORCE build fixtures
 chat-fixture: FORCE build fixtures
 	printf "hello\n" | $(OUT) chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-chat-repl.out
 	grep -q "chat>" /tmp/minicpm-o-uya-chat-repl.out
-	grep -q "sampled token\[0\]: 4 piece=hello" /tmp/minicpm-o-uya-chat-repl.out
+	grep -q "sampled token\[0\]: 6 piece=world" /tmp/minicpm-o-uya-chat-repl.out
 	@if printf "hello\nhello\nhello\n" | $(OUT) chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-chat-overflow.out 2>&1; then \
 		echo "expected chat context overflow to fail"; \
 		exit 1; \

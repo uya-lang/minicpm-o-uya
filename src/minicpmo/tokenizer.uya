@@ -27,6 +27,7 @@ const TOKENIZER_HARD_MAX_TOKENS: usize = 262144;
 const TOKENIZER_HARD_MAX_MERGES: usize = 262144;
 const TOKENIZER_HARD_MAX_CHAT_TEMPLATE: usize = 16384;
 const TOKENIZER_UNKNOWN_ID: u32 = 4294967295;
+const TOKENIZER_BPE_MAX_PARTS: usize = 1024;
 
 struct TokGgufStringRead {
     len: u64,
@@ -50,6 +51,7 @@ export struct Tokenizer {
     chat_template: &byte,
     chat_template_cap: usize,
     has_chat_template: bool,
+    byte_bpe: bool,
 }
 
 export fn tokenizer_init() Tokenizer {
@@ -69,6 +71,7 @@ export fn tokenizer_init() Tokenizer {
         chat_template: null,
         chat_template_cap: 0,
         has_chat_template: false,
+        byte_bpe: false,
     };
 }
 
@@ -380,7 +383,13 @@ fn skip_metadata_value(reader: &BinaryReader, tok: &Tokenizer, key: &const byte,
         }
         var value: [byte: 512] = [];
         var info: TokGgufStringRead = TokGgufStringRead{ len: 0, copied: 0, truncated: false };
-        return tok_read_gguf_string(reader, &value[0], @len(value), &info, "metadata string value\0" as &const byte);
+        if !tok_read_gguf_string(reader, &value[0], @len(value), &info, "metadata string value\0" as &const byte) {
+            return false;
+        }
+        if tok_cstr_eq(key, "tokenizer.ggml.model\0" as &const byte) {
+            tok.byte_bpe = tok_cstr_eq(&value[0] as &const byte, "gpt2\0" as &const byte);
+        }
+        return true;
     }
     if value_type == TOK_GGUF_TYPE_ARRAY {
         return handle_array_metadata(reader, tok, key);
@@ -478,6 +487,18 @@ fn find_token(tok: &Tokenizer, piece: &const byte) u32 {
         i = i + 1;
     }
     return TOKENIZER_UNKNOWN_ID;
+}
+
+export fn tokenizer_has_piece(tok: &Tokenizer, piece: &const byte) bool {
+    return find_token(tok, piece) != TOKENIZER_UNKNOWN_ID;
+}
+
+fn tokenizer_chat_no_think_supported(tok: &Tokenizer) bool {
+    if !tokenizer_has_piece(tok, "<think>\0" as &const byte) { return false; }
+    if !tokenizer_has_piece(tok, "</think>\0" as &const byte) { return false; }
+    if tok.chat_template == null { return false; }
+    if tok_cstr_contains(tok.chat_template as &const byte, "enable_thinking\0" as &const byte) { return true; }
+    return tok_cstr_contains(tok.chat_template as &const byte, "<think>\0" as &const byte);
 }
 
 fn is_special_piece(piece: &const byte) bool {
@@ -616,8 +637,180 @@ fn print_token_id(id: u32, first: bool) void {
     _ = printf("%u", id);
 }
 
+fn tok_part_ptr(parts: &byte, index: usize) &const byte {
+    return &parts[index * TOKENIZER_PIECE_CAP] as &const byte;
+}
+
+fn tok_part_mut_ptr(parts: &byte, index: usize) &byte {
+    return &parts[index * TOKENIZER_PIECE_CAP];
+}
+
+fn tok_merge_matches_pair(merge: &const byte, left: &const byte, right: &const byte) bool {
+    var i: usize = 0;
+    while left[i] != 0 {
+        if merge[i] == 0 || merge[i] != left[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    if merge[i] != 32 {
+        return false;
+    }
+    i = i + 1;
+    var j: usize = 0;
+    while right[j] != 0 {
+        if merge[i + j] == 0 || merge[i + j] != right[j] {
+            return false;
+        }
+        j = j + 1;
+    }
+    return merge[i + j] == 0;
+}
+
+fn tok_concat_cstr(dest: &byte, dest_cap: usize, left: &const byte, right: &const byte) bool {
+    if dest_cap == 0 {
+        return false;
+    }
+    var pos: usize = 0;
+    var i: usize = 0;
+    while left[i] != 0 {
+        if pos + 1 >= dest_cap {
+            dest[dest_cap - 1] = 0;
+            return false;
+        }
+        dest[pos] = left[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while right[i] != 0 {
+        if pos + 1 >= dest_cap {
+            dest[dest_cap - 1] = 0;
+            return false;
+        }
+        dest[pos] = right[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    dest[pos] = 0;
+    return true;
+}
+
+fn tok_shift_parts_left(parts: &byte, start: usize, count: usize) void {
+    var i: usize = start;
+    while i + 1 < count {
+        tok_copy_cstr(tok_part_mut_ptr(parts, i), TOKENIZER_PIECE_CAP, tok_part_ptr(parts, i + 1));
+        i = i + 1;
+    }
+    if count > 0 {
+        tok_part_mut_ptr(parts, count - 1)[0] = 0;
+    }
+}
+
+fn tokenizer_byte_bpe_append_ids(tok: &Tokenizer, text: &const byte, start: usize, end: usize, out_ids: &u32, out_cap: usize, out_count: &usize) bool {
+    if start >= end {
+        return true;
+    }
+    var parts: [byte: TOKENIZER_BPE_MAX_PARTS * TOKENIZER_PIECE_CAP] = [];
+    var part_count: usize = 0;
+    var pos: usize = start;
+    while pos < end {
+        if part_count >= TOKENIZER_BPE_MAX_PARTS {
+            _ = printf("error: byte-BPE prompt span exceeds part cap=%zu\n", TOKENIZER_BPE_MAX_PARTS);
+            return false;
+        }
+        if !tok_byte_fallback_piece(text[pos], tok_part_mut_ptr(&parts[0], part_count), TOKENIZER_PIECE_CAP) {
+            return false;
+        }
+        part_count = part_count + 1;
+        pos = pos + 1;
+    }
+
+    var merge_index: usize = 0;
+    while merge_index < tok.merge_count {
+        var part_index: usize = 0;
+        while part_index + 1 < part_count {
+            if tok_merge_matches_pair(merge_ptr(tok, merge_index), tok_part_ptr(&parts[0], part_index), tok_part_ptr(&parts[0], part_index + 1)) {
+                var merged: [byte: TOKENIZER_PIECE_CAP] = [];
+                if !tok_concat_cstr(&merged[0], @len(merged), tok_part_ptr(&parts[0], part_index), tok_part_ptr(&parts[0], part_index + 1)) {
+                    _ = printf("error: byte-BPE merged piece exceeds cap=%zu\n", TOKENIZER_PIECE_CAP);
+                    return false;
+                }
+                tok_copy_cstr(tok_part_mut_ptr(&parts[0], part_index), TOKENIZER_PIECE_CAP, &merged[0] as &const byte);
+                tok_shift_parts_left(&parts[0], part_index + 1, part_count);
+                part_count = part_count - 1;
+                part_index = part_index + 1;
+            } else {
+                part_index = part_index + 1;
+            }
+        }
+        merge_index = merge_index + 1;
+    }
+
+    var out_index: usize = 0;
+    while out_index < part_count {
+        if *out_count >= out_cap {
+            _ = printf("error: encoded prompt exceeds token buffer cap=%zu\n", out_cap);
+            return false;
+        }
+        var id: u32 = find_token(tok, tok_part_ptr(&parts[0], out_index));
+        if id == TOKENIZER_UNKNOWN_ID {
+            if tok.unk_id != TOKENIZER_UNKNOWN_ID {
+                id = tok.unk_id;
+            } else {
+                _ = printf("error: no token for byte-BPE piece: %s\n", tok_part_ptr(&parts[0], out_index));
+                return false;
+            }
+        }
+        out_ids[*out_count] = id;
+        *out_count = *out_count + 1;
+        out_index = out_index + 1;
+    }
+    return true;
+}
+
+fn tokenizer_next_special_offset(tok: &Tokenizer, text: &const byte, start: usize) usize {
+    var pos: usize = start;
+    while text[pos] != 0 {
+        var id: u32 = TOKENIZER_UNKNOWN_ID;
+        var match_len: usize = 0;
+        if try_match_special(tok, text, pos, &id, &match_len) {
+            return pos;
+        }
+        pos = pos + 1;
+    }
+    return pos;
+}
+
+fn tokenizer_encode_byte_bpe_to_ids(tok: &Tokenizer, text: &const byte, out_ids: &u32, out_cap: usize, out_count: &usize) bool {
+    *out_count = 0;
+    var pos: usize = 0;
+    while text[pos] != 0 {
+        if *out_count >= out_cap {
+            _ = printf("error: encoded prompt exceeds token buffer cap=%zu\n", out_cap);
+            return false;
+        }
+        var id: u32 = TOKENIZER_UNKNOWN_ID;
+        var match_len: usize = 0;
+        if try_match_special(tok, text, pos, &id, &match_len) || try_match_plain_token(tok, text, pos, &id, &match_len) {
+            out_ids[*out_count] = id;
+            *out_count = *out_count + 1;
+            pos = pos + match_len;
+        } else {
+            const span_end: usize = tokenizer_next_special_offset(tok, text, pos);
+            if !tokenizer_byte_bpe_append_ids(tok, text, pos, span_end, out_ids, out_cap, out_count) {
+                return false;
+            }
+            pos = span_end;
+        }
+    }
+    return true;
+}
 
 export fn tokenizer_encode_to_ids(tok: &Tokenizer, text: &const byte, out_ids: &u32, out_cap: usize, out_count: &usize) bool {
+    if tok.byte_bpe && tok.merge_count > 0 {
+        return tokenizer_encode_byte_bpe_to_ids(tok, text, out_ids, out_cap, out_count);
+    }
     *out_count = 0;
     var pos: usize = 0;
     while text[pos] != 0 {
@@ -663,6 +856,135 @@ export fn tokenizer_piece(tok: &Tokenizer, id: u32) &const byte {
     return token_ptr(tok, id as usize);
 }
 
+fn tok_utf8_decode_one(text: &const byte, pos: &usize, out: &u32) bool {
+    const start: usize = *pos;
+    const b0: u32 = text[start] as u32;
+    if b0 < 128 {
+        *out = b0;
+        *pos = start + 1;
+        return true;
+    }
+    if (b0 & (224 as u32)) == (192 as u32) && text[start + 1] != 0 {
+        const b1: u32 = text[start + 1] as u32;
+        *out = ((b0 & (31 as u32)) << 6) | (b1 & (63 as u32));
+        *pos = start + 2;
+        return true;
+    }
+    if (b0 & (240 as u32)) == (224 as u32) && text[start + 1] != 0 && text[start + 2] != 0 {
+        const b1: u32 = text[start + 1] as u32;
+        const b2: u32 = text[start + 2] as u32;
+        *out = ((b0 & (15 as u32)) << 12) | ((b1 & (63 as u32)) << 6) | (b2 & (63 as u32));
+        *pos = start + 3;
+        return true;
+    }
+    if (b0 & (248 as u32)) == (240 as u32) && text[start + 1] != 0 && text[start + 2] != 0 && text[start + 3] != 0 {
+        const b1: u32 = text[start + 1] as u32;
+        const b2: u32 = text[start + 2] as u32;
+        const b3: u32 = text[start + 3] as u32;
+        *out = ((b0 & (7 as u32)) << 18) | ((b1 & (63 as u32)) << 12) | ((b2 & (63 as u32)) << 6) | (b3 & (63 as u32));
+        *pos = start + 4;
+        return true;
+    }
+    *out = b0;
+    *pos = start + 1;
+    return false;
+}
+
+fn tok_byte_from_codepoint(codepoint: u32, out: &byte) bool {
+    if tok_byte_direct(codepoint) {
+        *out = codepoint as byte;
+        return true;
+    }
+    if codepoint < 256 {
+        return false;
+    }
+    const target: u32 = codepoint - 256;
+    var seen: u32 = 0;
+    var value: u32 = 0;
+    while value < 256 {
+        if !tok_byte_direct(value) {
+            if seen == target {
+                *out = value as byte;
+                return true;
+            }
+            seen = seen + 1;
+        }
+        value = value + 1;
+    }
+    return false;
+}
+
+fn tok_print_raw_bytes(text: &const byte, start: usize, end: usize) void {
+    var i: usize = start;
+    while i < end {
+        _ = printf("%c", text[i] as i32);
+        i = i + 1;
+    }
+}
+
+fn tok_append_byte(dest: &byte, dest_cap: usize, pos: &usize, value: byte) bool {
+    if *pos + 1 >= dest_cap {
+        if dest_cap > 0 {
+            dest[dest_cap - 1] = 0;
+        }
+        return false;
+    }
+    dest[*pos] = value;
+    *pos = *pos + 1;
+    dest[*pos] = 0;
+    return true;
+}
+
+fn tok_append_raw_bytes(dest: &byte, dest_cap: usize, pos: &usize, text: &const byte, start: usize, end: usize) bool {
+    var i: usize = start;
+    while i < end {
+        if !tok_append_byte(dest, dest_cap, pos, text[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn tokenizer_append_piece_text(tok: &Tokenizer, id: u32, dest: &byte, dest_cap: usize, out_pos: &usize) bool {
+    if id >= tok.token_count as u32 {
+        return true;
+    }
+    const piece: &const byte = token_ptr(tok, id as usize);
+    var pos: usize = 0;
+    if !tok.byte_bpe {
+        while piece[pos] != 0 {
+            if !tok_append_byte(dest, dest_cap, out_pos, piece[pos]) {
+                return false;
+            }
+            pos = pos + 1;
+        }
+        return true;
+    }
+    while piece[pos] != 0 {
+        const start: usize = pos;
+        var codepoint: u32 = 0;
+        _ = tok_utf8_decode_one(piece, &pos, &codepoint);
+        var decoded: byte = 0;
+        if tok_byte_from_codepoint(codepoint, &decoded) {
+            if !tok_append_byte(dest, dest_cap, out_pos, decoded) {
+                return false;
+            }
+        } else if !tok_append_raw_bytes(dest, dest_cap, out_pos, piece, start, pos) {
+            return false;
+        }
+    }
+    return true;
+}
+
+export fn tokenizer_print_piece_text(tok: &Tokenizer, id: u32) void {
+    var text: [byte: TOKENIZER_PIECE_CAP] = [];
+    var pos: usize = 0;
+    if tokenizer_append_piece_text(tok, id, &text[0], @len(text), &pos) {
+        _ = printf("%s", &text[0]);
+    }
+}
+
 export fn tokenizer_piece_cli(path: &const byte, id_text: &const byte) i32 {
     var tok: Tokenizer = tokenizer_init();
     if !tokenizer_load(path, &tok) { return 1; }
@@ -693,7 +1015,7 @@ export fn tokenizer_decode_cli(path: &const byte, argc: i32, argv: & &byte, star
             _ = printf("error: token id out of range: %u (vocab=%zu)\n", id, tok.token_count);
             return 1;
         }
-        _ = printf("%s", token_ptr(&tok, id as usize));
+        tokenizer_print_piece_text(&tok, id);
         i = i + 1;
     }
     _ = printf("\n");
@@ -703,36 +1025,17 @@ export fn tokenizer_decode_cli(path: &const byte, argc: i32, argv: & &byte, star
 export fn tokenizer_encode_cli(path: &const byte, text: &const byte) i32 {
     var tok: Tokenizer = tokenizer_init();
     if !tokenizer_load(path, &tok) { return 1; }
-    var pos: usize = 0;
+    var ids: [u32: TOKENIZER_BPE_MAX_PARTS] = [];
+    var id_count: usize = 0;
+    if !tokenizer_encode_to_ids(&tok, text, &ids[0], @len(ids), &id_count) {
+        return 1;
+    }
     var first: bool = true;
-    while text[pos] != 0 {
-        var id: u32 = TOKENIZER_UNKNOWN_ID;
-        var match_len: usize = 0;
-        if try_match_special(&tok, text, pos, &id, &match_len) || try_match_plain_token(&tok, text, pos, &id, &match_len) {
-            print_token_id(id, first);
-            first = false;
-            pos = pos + match_len;
-        } else {
-            var piece: [byte: 8] = [];
-            if !tok_byte_fallback_piece(text[pos], &piece[0], @len(piece)) { return 1; }
-            id = find_token(&tok, &piece[0] as &const byte);
-            if id == TOKENIZER_UNKNOWN_ID {
-                piece[0] = text[pos];
-                piece[1] = 0;
-                id = find_token(&tok, &piece[0] as &const byte);
-            }
-            if id == TOKENIZER_UNKNOWN_ID {
-                if tok.unk_id != TOKENIZER_UNKNOWN_ID {
-                    id = tok.unk_id;
-                } else {
-                    _ = printf("\nerror: no token for byte at offset %zu\n", pos);
-                    return 1;
-                }
-            }
-            print_token_id(id, first);
-            first = false;
-            pos = pos + 1;
-        }
+    var i: usize = 0;
+    while i < id_count {
+        print_token_id(ids[i], first);
+        first = false;
+        i = i + 1;
     }
     _ = printf("\n");
     return 0;
@@ -788,7 +1091,13 @@ export fn tokenizer_format_chat_prompt(tok: &Tokenizer, user_text: &const byte, 
     if !tok_append_cstr(dest, dest_cap, &pos, user_text) {
         return false;
     }
-    return tok_append_cstr(dest, dest_cap, &pos, "<|im_end|>\n<|im_start|>assistant\n\0" as &const byte);
+    if !tok_append_cstr(dest, dest_cap, &pos, "<|im_end|>\n<|im_start|>assistant\n\0" as &const byte) {
+        return false;
+    }
+    if tokenizer_chat_no_think_supported(tok) {
+        return tok_append_cstr(dest, dest_cap, &pos, "<think>\n\n</think>\n\n\0" as &const byte);
+    }
+    return true;
 }
 
 export fn tokenizer_format_chat_cli(path: &const byte, user_text: &const byte) i32 {

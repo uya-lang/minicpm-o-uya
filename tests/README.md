@@ -25,6 +25,7 @@ make fixtures
 Generated files:
 
 - `tests/fixtures/tiny.gguf` — deterministic GGUF v3 fixture with Qwen3, tokenizer, vision, audio, speech, scalar, string, and array metadata plus branchable tensors.
+- `tests/fixtures/tiny_bpe.gguf` — tokenizer-only byte-BPE fixture covering merge-based English, leading-space, and UTF-8 Chinese byte-piece encoding.
 - `tests/fixtures/tiny.gguf.part` — truncated file used to verify short-read errors.
 - `tests/fixtures/tiny_data_truncated.gguf` — tensor-data truncation case used to verify weight-table bounds checks.
 - `tests/fixtures/bad_schema.gguf` — unsupported schema used to verify missing tokenizer/root tensor, unknown dtype, and unknown branch diagnostics.
@@ -61,7 +62,7 @@ Generated files:
 
 ## Golden Coverage
 
-Tokenizer golden coverage includes English, Chinese punctuation, newline-capable vocabulary, and MiniCPM-o media placeholders such as `<image>` and `<audio>` so they are matched as whole tokens.
+Tokenizer golden coverage includes English, Chinese punctuation, newline-capable vocabulary, byte-BPE merges for leading-space and UTF-8 byte pieces, and MiniCPM-o media placeholders such as `<image>` and `<audio>` so they are matched as whole tokens.
 
 Kernel smoke coverage includes F32 vector ops, F16/BF16 loads, normalization, RoPE, softmax, dense matvec, activations, Conv1D/Conv2D, and NaN/Inf/empty-length boundaries.
 

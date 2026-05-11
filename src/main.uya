@@ -46,7 +46,7 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya omni-chat <model.gguf>\n");
     _ = printf("  minicpm-o-uya stream-chat <model.gguf> <manifest.json>\n");
     _ = printf("  minicpm-o-uya bench <model.gguf> <manifest.json>\n");
-    _ = printf("  minicpm-o-uya chat <model.gguf>\n");
+    _ = printf("  minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID]\n");
     _ = printf("  minicpm-o-uya kernels-smoke\n");
     _ = printf("  minicpm-o-uya quant-smoke\n");
     _ = printf("\n");
@@ -125,11 +125,11 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
         return qwen3_generate_args_cli(argc, argv as & &byte);
     }
     if strcmp(argv[1] as *const byte, "chat\0" as *const byte) == 0 {
-        if argc != 3 {
-            _ = printf("usage: minicpm-o-uya chat <model.gguf>\n");
+        if argc < 3 {
+            _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID]\n");
             return 1;
         }
-        return qwen3_chat_cli(argv[2] as &const byte);
+        return qwen3_chat_cli(argc, argv as & &byte);
     }
     if strcmp(argv[1] as *const byte, "vision-smoke\0" as *const byte) == 0 {
         if argc != 4 {

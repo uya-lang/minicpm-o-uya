@@ -42,7 +42,10 @@ def pack_tensor_values(name: str, dims: list[int], ggml_type: int) -> bytes:
     if name == "token_embd.weight":
         for token in range(dims[1]):
             for row in range(dims[0]):
-                values.append(1.0 if row == (token % dims[0]) else 0.0)
+                target_row = token % dims[0]
+                if token == 11:
+                    target_row = 4
+                values.append(1.0 if row == target_row else 0.0)
     elif name == "output_norm.weight":
         values = [1.0] * elements
     elif name == "output.weight":
@@ -346,6 +349,25 @@ def main() -> None:
     (out_dir / "tiny.gguf").write_bytes(fixture)
     (out_dir / "tiny.gguf.part").write_bytes(fixture[:48])
     (out_dir / "tiny_data_truncated.gguf").write_bytes(fixture[:-17])
+
+    bpe_metadata = [
+        metadata_string("general.architecture", "tokenizer-only"),
+        metadata_string("tokenizer.ggml.model", "gpt2"),
+        metadata_string_array("tokenizer.ggml.tokens", [
+            "<unk>", "h", "e", "he", "l", "hel", "lo", "hello",
+            "Ġ", "w", "o", "wo", "r", "wor", "ld", "world", "Ġworld",
+            "ä", "½", "ł", "ä½ł",
+        ]),
+        metadata_string_array("tokenizer.ggml.merges", [
+            "h e", "he l", "l o", "hel lo",
+            "w o", "wo r", "l d", "wor ld", "Ġ world",
+            "ä ½", "ä½ ł",
+        ]),
+        metadata_u32("tokenizer.ggml.unknown_token_id", 0),
+    ]
+    bpe_header = struct.pack("<IIQQ", 0x46554747, 3, 0, len(bpe_metadata))
+    (out_dir / "tiny_bpe.gguf").write_bytes(bpe_header + b"".join(bpe_metadata))
+
     rgb_pixels = bytes([
         0, 64, 128, 32, 96, 160, 64, 128, 192,
         96, 160, 224, 128, 192, 255, 160, 224, 32,
