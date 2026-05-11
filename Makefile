@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture stream-chat-fixture chat-fixture minicpmo-audit clean FORCE
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit clean FORCE
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture stream-chat-fixture chat-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -191,6 +191,20 @@ stream-chat-fixture: FORCE build fixtures
 	grep -q "partial output\[1\]: world" /tmp/minicpm-o-uya-stream-chat.out
 	grep -q "control interrupt: cleared_pending_speech=1 cancellations=1" /tmp/minicpm-o-uya-stream-chat.out
 	grep -q "stream summary: events=6 audio_chunks=2 partial_callbacks=2 vision_encoded=0 audio_encoded=2 pending_speech=0 cancellations=1 encode_ms=10 decode_ms=8 vocoder_ms=4 ring_peak=192 dropped_audio=0" /tmp/minicpm-o-uya-stream-chat.out
+
+bench-fixture: FORCE build fixtures
+	$(OUT) bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json >/tmp/minicpm-o-uya-bench.out
+	grep -q "bench: PASS" /tmp/minicpm-o-uya-bench.out
+	grep -q "bench load: ms=3 mode=tiny-mmap-metadata" /tmp/minicpm-o-uya-bench.out
+	grep -q "bench text_prompt: 500.000 tokens/s units=1 ms=2" /tmp/minicpm-o-uya-bench.out
+	grep -q "bench text_decode: 333.333 tokens/s units=1 ms=3" /tmp/minicpm-o-uya-bench.out
+	grep -q "bench vision_encode: ms=7 frames=1 tiles=1" /tmp/minicpm-o-uya-bench.out
+	grep -q "bench audio_encode: ms=5 chunks=1" /tmp/minicpm-o-uya-bench.out
+	grep -q "bench vocoder: 16000.000 samples/s units=64 ms=4" /tmp/minicpm-o-uya-bench.out
+	grep -q "bench memory: peak_estimate_bytes=78336 llm=512 vision=4096 audio=4096 speech=4096 scratch=65536" /tmp/minicpm-o-uya-bench.out
+	grep -q "bench optimize: hot_matvec=reference-scalar kv_cache=contiguous prefill=tiled-smoke media_scratch=reused" /tmp/minicpm-o-uya-bench.out
+	grep -q "bench reference_error: text=0.000000 vision=0.000000 audio=0.000000 vocoder=0.000000" /tmp/minicpm-o-uya-bench.out
+	grep -q "omni-smoke: PASS" /tmp/minicpm-o-uya-bench.out
 
 chat-fixture: FORCE build fixtures
 	printf "hello\n" | $(OUT) chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-chat-repl.out

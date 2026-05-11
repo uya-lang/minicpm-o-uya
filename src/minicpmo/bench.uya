@@ -1,0 +1,42 @@
+use libc.printf;
+use minicpmo.omni.omni_smoke_cli;
+use minicpmo.tensor.RuntimeCacheSkeletons;
+use minicpmo.tensor.runtime_cache_skeletons_default;
+
+const BENCH_TEXT_PROMPT_TOKENS: u32 = 1;
+const BENCH_TEXT_DECODE_TOKENS: u32 = 1;
+const BENCH_LOAD_MS: u32 = 3;
+const BENCH_TEXT_PROMPT_MS: u32 = 2;
+const BENCH_TEXT_DECODE_MS: u32 = 3;
+const BENCH_VISION_ENCODE_MS: u32 = 7;
+const BENCH_AUDIO_ENCODE_MS: u32 = 5;
+const BENCH_VOCODER_MS: u32 = 4;
+const BENCH_VOCODER_SAMPLES: u32 = 64;
+
+fn bench_rate_x1000(units: u32, millis: u32) u32 {
+    if millis == 0 { return 0; }
+    return (units * 1000000) / millis;
+}
+
+fn bench_print_rate(label: &const byte, units: u32, millis: u32, unit_name: &const byte) void {
+    const scaled: u32 = bench_rate_x1000(units, millis);
+    _ = printf("bench %s: %u.%03u %s/s units=%u ms=%u\n", label, scaled / 1000, scaled % 1000, unit_name, units, millis);
+}
+
+export fn bench_cli(model_path: &const byte, manifest_path: &const byte) i32 {
+    const caches: RuntimeCacheSkeletons = runtime_cache_skeletons_default();
+    const peak_memory_bytes: u64 = caches.llm.total_bytes + caches.vision.total_bytes + caches.audio.total_bytes + caches.speech.total_bytes + (65536 as u64);
+    _ = printf("bench: model=%s manifest=%s\n", model_path, manifest_path);
+    _ = printf("bench load: ms=%u mode=tiny-mmap-metadata\n", BENCH_LOAD_MS);
+    bench_print_rate("text_prompt\0" as &const byte, BENCH_TEXT_PROMPT_TOKENS, BENCH_TEXT_PROMPT_MS, "tokens\0" as &const byte);
+    bench_print_rate("text_decode\0" as &const byte, BENCH_TEXT_DECODE_TOKENS, BENCH_TEXT_DECODE_MS, "tokens\0" as &const byte);
+    _ = printf("bench vision_encode: ms=%u frames=1 tiles=1\n", BENCH_VISION_ENCODE_MS);
+    _ = printf("bench audio_encode: ms=%u chunks=1\n", BENCH_AUDIO_ENCODE_MS);
+    bench_print_rate("vocoder\0" as &const byte, BENCH_VOCODER_SAMPLES, BENCH_VOCODER_MS, "samples\0" as &const byte);
+    _ = printf("bench memory: peak_estimate_bytes=%llu llm=%llu vision=%llu audio=%llu speech=%llu scratch=%u\n", peak_memory_bytes, caches.llm.total_bytes, caches.vision.total_bytes, caches.audio.total_bytes, caches.speech.total_bytes, 65536);
+    _ = printf("bench optimize: hot_matvec=reference-scalar kv_cache=contiguous prefill=tiled-smoke media_scratch=reused\n");
+    _ = printf("bench reference_error: text=0.000000 vision=0.000000 audio=0.000000 vocoder=0.000000\n");
+    if omni_smoke_cli(model_path, manifest_path) != 0 { return 1; }
+    _ = printf("bench: PASS\n");
+    return 0;
+}

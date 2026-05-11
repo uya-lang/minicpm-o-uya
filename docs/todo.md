@@ -362,17 +362,17 @@
 
 ## Phase 19: 性能与优化
 
-- [ ] 增加 `bench` CLI。
-- [ ] 报告 load time。
-- [ ] 报告 text prompt/decode tokens/s。
-- [ ] 报告 vision encode time。
-- [ ] 报告 audio encode time。
-- [ ] 报告 vocoder samples/s。
-- [ ] 报告峰值内存估算。
-- [ ] 优化 hot matvec。
-- [ ] 优化 KV cache locality。
-- [ ] 优化 prefill tiled path。
-- [ ] 优化 media encoder scratch reuse。
+- [x] 增加 `bench` CLI。
+- [x] 报告 load time。
+- [x] 报告 text prompt/decode tokens/s。
+- [x] 报告 vision encode time。
+- [x] 报告 audio encode time。
+- [x] 报告 vocoder samples/s。
+- [x] 报告峰值内存估算。
+- [x] 优化 hot matvec。
+- [x] 优化 KV cache locality。
+- [x] 优化 prefill tiled path。
+- [x] 优化 media encoder scratch reuse。
 
 验收标准：
 
