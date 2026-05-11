@@ -1,0 +1,292 @@
+use libc.cos;
+use libc.expf;
+use libc.printf;
+use libc.sinf;
+use libc.sqrtf;
+use libc.tanh;
+
+const KERNEL_NEG_INF: f32 = -(3.4028234663852886e38 as f32);
+
+export fn f32_fill(dst: &f32, n: usize, value: f32) void {
+    var i: usize = 0;
+    while i < n { dst[i] = value; i = i + 1; }
+}
+
+export fn f32_copy(dst: &f32, src: &const f32, n: usize) void {
+    var i: usize = 0;
+    while i < n { dst[i] = src[i]; i = i + 1; }
+}
+
+export fn f32_add(dst: &f32, a: &const f32, b: &const f32, n: usize) void {
+    var i: usize = 0;
+    while i < n { dst[i] = a[i] + b[i]; i = i + 1; }
+}
+
+export fn f32_mul(dst: &f32, a: &const f32, b: &const f32, n: usize) void {
+    var i: usize = 0;
+    while i < n { dst[i] = a[i] * b[i]; i = i + 1; }
+}
+
+export fn f32_dot(a: &const f32, b: &const f32, n: usize) f32 {
+    var sum: f32 = 0.0;
+    var i: usize = 0;
+    while i < n { sum = sum + a[i] * b[i]; i = i + 1; }
+    return sum;
+}
+
+export fn f16_load_f32(bits: u16) f32 {
+    const sign: u32 = ((bits as u32) >> 15) & (1 as u32);
+    const exp_bits: u32 = ((bits as u32) >> 10) & (31 as u32);
+    const frac: u32 = (bits as u32) & (1023 as u32);
+    var sign_scale: f32 = 1.0;
+    if sign != 0 { sign_scale = 0.0 - 1.0; }
+    if exp_bits == 0 {
+        if frac == 0 { return sign_scale * (0.0 as f32); }
+        return sign_scale * (frac as f32) * (0.000000059604644775390625 as f32);
+    }
+    if exp_bits == 31 {
+        if frac == 0 { return sign_scale * (3.4028234663852886e38 as f32); }
+        return (0.0 as f32) / (0.0 as f32);
+    }
+    var value: f32 = 1.0 + (frac as f32) / 1024.0;
+    var e: i32 = exp_bits as i32 - 15;
+    while e > 0 { value = value * 2.0; e = e - 1; }
+    while e < 0 { value = value * 0.5; e = e + 1; }
+    return sign_scale * value;
+}
+
+export fn bf16_load_f32(bits: u16) f32 {
+    const sign: u32 = ((bits as u32) >> 15) & (1 as u32);
+    const exp_bits: u32 = ((bits as u32) >> 7) & (255 as u32);
+    const frac: u32 = (bits as u32) & (127 as u32);
+    var sign_scale: f32 = 1.0;
+    if sign != 0 { sign_scale = 0.0 - 1.0; }
+    if exp_bits == 0 {
+        if frac == 0 { return sign_scale * (0.0 as f32); }
+        var sub: f32 = (frac as f32) / 128.0;
+        var e: i32 = -126;
+        while e < 0 { sub = sub * 0.5; e = e + 1; }
+        return sign_scale * sub;
+    }
+    if exp_bits == 255 {
+        if frac == 0 { return sign_scale * (3.4028234663852886e38 as f32); }
+        return (0.0 as f32) / (0.0 as f32);
+    }
+    var value: f32 = 1.0 + (frac as f32) / 128.0;
+    var e2: i32 = exp_bits as i32 - 127;
+    while e2 > 0 { value = value * 2.0; e2 = e2 - 1; }
+    while e2 < 0 { value = value * 0.5; e2 = e2 + 1; }
+    return sign_scale * value;
+}
+
+export fn rms_norm(dst: &f32, src: &const f32, weight: &const f32, n: usize, eps: f32) void {
+    if n == 0 { return; }
+    var sum: f32 = 0.0;
+    var i: usize = 0;
+    while i < n { sum = sum + src[i] * src[i]; i = i + 1; }
+    const scale: f32 = 1.0 / sqrtf(sum / (n as f32) + eps);
+    i = 0;
+    while i < n { dst[i] = src[i] * scale * weight[i]; i = i + 1; }
+}
+
+export fn layer_norm(dst: &f32, src: &const f32, weight: &const f32, bias: &const f32, n: usize, eps: f32) void {
+    if n == 0 { return; }
+    var mean: f32 = 0.0;
+    var i: usize = 0;
+    while i < n { mean = mean + src[i]; i = i + 1; }
+    mean = mean / (n as f32);
+    var var_sum: f32 = 0.0;
+    i = 0;
+    while i < n { const d: f32 = src[i] - mean; var_sum = var_sum + d * d; i = i + 1; }
+    const scale: f32 = 1.0 / sqrtf(var_sum / (n as f32) + eps);
+    i = 0;
+    while i < n { dst[i] = (src[i] - mean) * scale * weight[i] + bias[i]; i = i + 1; }
+}
+
+export fn rope_rotate_pair(x0: &f32, x1: &f32, theta: f32) void {
+    const c: f32 = cos(theta as f64) as f32;
+    const s: f32 = sinf(theta);
+    const a: f32 = *x0;
+    const b: f32 = *x1;
+    *x0 = a * c - b * s;
+    *x1 = a * s + b * c;
+}
+
+export fn softmax(dst: &f32, src: &const f32, n: usize) void {
+    if n == 0 { return; }
+    var maxv: f32 = src[0];
+    var i: usize = 1;
+    while i < n { if src[i] > maxv { maxv = src[i]; } i = i + 1; }
+    var sum: f32 = 0.0;
+    i = 0;
+    while i < n { const e: f32 = expf(src[i] - maxv); dst[i] = e; sum = sum + e; i = i + 1; }
+    if sum == 0.0 { return; }
+    i = 0;
+    while i < n { dst[i] = dst[i] / sum; i = i + 1; }
+}
+
+export fn masked_softmax(dst: &f32, src: &const f32, mask: &const i32, n: usize) void {
+    if n == 0 { return; }
+    var tmp: [f32: 128] = [];
+    if n > 128 { return; }
+    var i: usize = 0;
+    while i < n { if mask[i] == 0 { tmp[i] = KERNEL_NEG_INF; } else { tmp[i] = src[i]; } i = i + 1; }
+    softmax(dst, &tmp[0], n);
+}
+
+export fn dense_f32_matvec(dst: &f32, matrix: &const f32, x: &const f32, rows: usize, cols: usize) void {
+    var r: usize = 0;
+    while r < rows { dst[r] = f32_dot(&matrix[r * cols], x, cols); r = r + 1; }
+}
+
+export fn dense_f16_matvec(dst: &f32, matrix: &const u16, x: &const f32, rows: usize, cols: usize) void {
+    var r: usize = 0;
+    while r < rows {
+        var sum: f32 = 0.0;
+        var c: usize = 0;
+        while c < cols { sum = sum + f16_load_f32(matrix[r * cols + c]) * x[c]; c = c + 1; }
+        dst[r] = sum;
+        r = r + 1;
+    }
+}
+
+export fn dense_bf16_matvec(dst: &f32, matrix: &const u16, x: &const f32, rows: usize, cols: usize) void {
+    var r: usize = 0;
+    while r < rows {
+        var sum: f32 = 0.0;
+        var c: usize = 0;
+        while c < cols { sum = sum + bf16_load_f32(matrix[r * cols + c]) * x[c]; c = c + 1; }
+        dst[r] = sum;
+        r = r + 1;
+    }
+}
+
+export fn silu(x: f32) f32 { return x / ((1.0 as f32) + expf((0.0 as f32) - x)); }
+export fn gelu(x: f32) f32 { return (0.5 as f32) * x * ((1.0 as f32) + (tanh(0.7978845608028654 * (x as f64 + 0.044715 * x as f64 * x as f64 * x as f64)) as f32)); }
+
+export fn swiglu(dst: &f32, gate: &const f32, up: &const f32, n: usize) void {
+    var i: usize = 0;
+    while i < n { dst[i] = silu(gate[i]) * up[i]; i = i + 1; }
+}
+
+export fn conv1d_ref(dst: &f32, input: &const f32, kernel: &const f32, in_len: usize, out_channels: usize, kernel_size: usize) void {
+    if in_len < kernel_size { return; }
+    const out_len: usize = in_len - kernel_size + 1;
+    var oc: usize = 0;
+    while oc < out_channels {
+        var x: usize = 0;
+        while x < out_len {
+            var sum: f32 = 0.0;
+            var k: usize = 0;
+            while k < kernel_size { sum = sum + input[x + k] * kernel[oc * kernel_size + k]; k = k + 1; }
+            dst[oc * out_len + x] = sum;
+            x = x + 1;
+        }
+        oc = oc + 1;
+    }
+}
+
+export fn conv2d_ref(dst: &f32, input: &const f32, kernel: &const f32, in_h: usize, in_w: usize, out_channels: usize, kernel_h: usize, kernel_w: usize) void {
+    if in_h < kernel_h || in_w < kernel_w { return; }
+    const out_h: usize = in_h - kernel_h + 1;
+    const out_w: usize = in_w - kernel_w + 1;
+    var oc: usize = 0;
+    while oc < out_channels {
+        var y: usize = 0;
+        while y < out_h {
+            var x: usize = 0;
+            while x < out_w {
+                var sum: f32 = 0.0;
+                var ky: usize = 0;
+                while ky < kernel_h {
+                    var kx: usize = 0;
+                    while kx < kernel_w {
+                        sum = sum + input[(y + ky) * in_w + (x + kx)] * kernel[oc * kernel_h * kernel_w + ky * kernel_w + kx];
+                        kx = kx + 1;
+                    }
+                    ky = ky + 1;
+                }
+                dst[oc * out_h * out_w + y * out_w + x] = sum;
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        oc = oc + 1;
+    }
+}
+
+fn nearly(a: f32, b: f32, eps: f32) bool {
+    var d: f32 = a - b;
+    if d < 0.0 { d = 0.0 - d; }
+    return d <= eps;
+}
+
+fn check(name: &const byte, ok: bool) bool {
+    if ok { _ = printf("ok %s\n", name); return true; }
+    _ = printf("FAIL %s\n", name);
+    return false;
+}
+
+export fn kernels_smoke_cli() i32 {
+    var pass: bool = true;
+    var a: [f32: 8] = [];
+    var b: [f32: 8] = [];
+    var out: [f32: 16] = [];
+    f32_fill(&a[0], 4, 2.0);
+    pass = check("fill\0" as &const byte, nearly(a[0], 2.0, 0.0001) && nearly(a[3], 2.0, 0.0001)) && pass;
+    b[0] = 1.0; b[1] = 2.0; b[2] = 3.0; b[3] = 4.0;
+    f32_copy(&a[0], &b[0], 4);
+    pass = check("copy\0" as &const byte, nearly(a[2], 3.0, 0.0001)) && pass;
+    f32_add(&out[0], &a[0], &b[0], 4);
+    pass = check("add\0" as &const byte, nearly(out[3], 8.0, 0.0001)) && pass;
+    f32_mul(&out[0], &a[0], &b[0], 4);
+    pass = check("mul\0" as &const byte, nearly(out[2], 9.0, 0.0001)) && pass;
+    pass = check("dot\0" as &const byte, nearly(f32_dot(&a[0], &b[0], 4), 30.0, 0.0001) && nearly(f32_dot(&a[0], &b[0], 0), 0.0, 0.0001)) && pass;
+    pass = check("f16\0" as &const byte, nearly(f16_load_f32(0x3c00), 1.0, 0.0001) && nearly(f16_load_f32(0xc000), -2.0, 0.0001)) && pass;
+    pass = check("bf16\0" as &const byte, nearly(bf16_load_f32(0x3f80), 1.0, 0.0001) && nearly(bf16_load_f32(0xc000), -2.0, 0.0001)) && pass;
+    var w: [f32: 4] = [];
+    f32_fill(&w[0], 4, 1.0);
+    rms_norm(&out[0], &b[0], &w[0], 4, 0.0);
+    pass = check("rmsnorm\0" as &const byte, nearly(out[0], 0.365148, 0.001)) && pass;
+    layer_norm(&out[0], &b[0], &w[0], &a[0], 4, 0.0);
+    pass = check("layernorm\0" as &const byte, nearly(out[0], -0.341641, 0.001)) && pass;
+    var rx0: f32 = 1.0; var rx1: f32 = 0.0; rope_rotate_pair(&rx0, &rx1, 1.5707963);
+    pass = check("rope\0" as &const byte, nearly(rx0, 0.0, 0.001) && nearly(rx1, 1.0, 0.001)) && pass;
+    var sm_in: [f32: 4] = [];
+    sm_in[0] = 1.0; sm_in[1] = 2.0; sm_in[2] = 3.0;
+    softmax(&out[0], &sm_in[0], 3);
+    pass = check("softmax\0" as &const byte, nearly(out[0] + out[1] + out[2], 1.0, 0.001) && out[2] > out[1]) && pass;
+    var mask: [i32: 4] = [];
+    mask[0] = 1; mask[1] = 0; mask[2] = 1;
+    masked_softmax(&out[0], &sm_in[0], &mask[0], 3);
+    pass = check("masked_softmax\0" as &const byte, nearly(out[1], 0.0, 0.001) && nearly(out[0] + out[2], 1.0, 0.001)) && pass;
+    var mat: [f32: 6] = [];
+    mat[0] = 1.0; mat[1] = 2.0; mat[2] = 3.0; mat[3] = 4.0; mat[4] = 5.0; mat[5] = 6.0;
+    var x: [f32: 3] = [];
+    x[0] = 1.0; x[1] = 1.0; x[2] = 1.0;
+    dense_f32_matvec(&out[0], &mat[0], &x[0], 2, 3);
+    pass = check("dense_f32\0" as &const byte, nearly(out[0], 6.0, 0.001) && nearly(out[1], 15.0, 0.001)) && pass;
+    var hmat: [u16: 4] = [];
+    hmat[0] = 0x3c00; hmat[1] = 0x4000; hmat[2] = 0x4200; hmat[3] = 0x4400;
+    dense_f16_matvec(&out[0], &hmat[0], &x[0], 2, 2);
+    pass = check("dense_f16\0" as &const byte, nearly(out[0], 3.0, 0.001) && nearly(out[1], 7.0, 0.001)) && pass;
+    var bhmat: [u16: 4] = [];
+    bhmat[0] = 0x3f80; bhmat[1] = 0x4000; bhmat[2] = 0x4040; bhmat[3] = 0x4080;
+    dense_bf16_matvec(&out[0], &bhmat[0], &x[0], 2, 2);
+    pass = check("dense_bf16\0" as &const byte, nearly(out[0], 3.0, 0.001) && nearly(out[1], 7.0, 0.001)) && pass;
+    pass = check("activations\0" as &const byte, nearly(silu(0.0), 0.0, 0.001) && nearly(gelu(0.0), 0.0, 0.001)) && pass;
+    swiglu(&out[0], &b[0], &x[0], 3);
+    pass = check("swiglu\0" as &const byte, out[2] > out[1]) && pass;
+    conv1d_ref(&out[0], &b[0], &x[0], 4, 1, 2);
+    pass = check("conv1d\0" as &const byte, nearly(out[0], 3.0, 0.001) && nearly(out[2], 7.0, 0.001)) && pass;
+    var img: [f32: 9] = [];
+    var ii: usize = 0; while ii < 9 { img[ii] = (ii + 1) as f32; ii = ii + 1; }
+    var k2: [f32: 4] = [];
+    f32_fill(&k2[0], 4, 1.0);
+    conv2d_ref(&out[0], &img[0], &k2[0], 3, 3, 1, 2, 2);
+    pass = check("conv2d\0" as &const byte, nearly(out[0], 12.0, 0.001) && nearly(out[3], 28.0, 0.001)) && pass;
+    pass = check("nan_inf_empty\0" as &const byte, (f16_load_f32(0x7e00) != f16_load_f32(0x7e00)) && f16_load_f32(0x7c00) > 1000000.0) && pass;
+    if pass { _ = printf("kernels smoke: PASS\n"); return 0; }
+    _ = printf("kernels smoke: FAIL\n");
+    return 1;
+}

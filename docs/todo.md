@@ -103,24 +103,24 @@
 
 ## Phase 5: Reference kernels 基础
 
-- [ ] F32 vector fill/copy/add/mul/dot。
-- [ ] F16 load -> F32。
-- [ ] BF16 load -> F32。
-- [ ] RMSNorm。
-- [ ] LayerNorm。
-- [ ] RoPE。
-- [ ] Softmax/masked softmax。
-- [ ] Dense F32/F16/BF16 matvec。
-- [ ] SwiGLU/SiLU/GELU。
-- [ ] Conv1D reference。
-- [ ] Conv2D reference。
-- [ ] Tiny golden tests。
+- [x] F32 vector fill/copy/add/mul/dot。
+- [x] F16 load -> F32。
+- [x] BF16 load -> F32。
+- [x] RMSNorm。
+- [x] LayerNorm。
+- [x] RoPE。
+- [x] Softmax/masked softmax。
+- [x] Dense F32/F16/BF16 matvec。
+- [x] SwiGLU/SiLU/GELU。
+- [x] Conv1D reference。
+- [x] Conv2D reference。
+- [x] Tiny golden tests。
 
 验收标准：
 
-- 每个 kernel 有小尺寸 deterministic golden。
-- NaN/Inf/空长度边界处理明确。
-- scalar reference 输出稳定。
+- [x] 每个 kernel 有小尺寸 deterministic golden。
+- [x] NaN/Inf/空长度边界处理明确。
+- [x] scalar reference 输出稳定。
 
 ## Phase 6: Quantization kernels
 
