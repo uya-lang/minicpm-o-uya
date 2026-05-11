@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture minicpmo-audit clean
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture minicpmo-audit clean
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -53,6 +53,17 @@ tokenizer-fixture: build fixtures
 	$(OUT) format-chat tests/fixtures/tiny.gguf "<image> hello" >/tmp/minicpm-o-uya-chat.out
 	grep -q "<|im_start|>user" /tmp/minicpm-o-uya-chat.out
 	grep -q "<image> hello<|im_end|>" /tmp/minicpm-o-uya-chat.out
+
+
+tensor-fixture: build fixtures
+	$(OUT) tensors tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-tensors.out
+	grep -q "tensor table: count=7" /tmp/minicpm-o-uya-tensors.out
+	grep -q "root token_embd=token_embd.weight root output=output.weight" /tmp/minicpm-o-uya-tensors.out
+	grep -q "cache skeleton: llm_bytes=" /tmp/minicpm-o-uya-tensors.out
+	$(OUT) tensors tests/fixtures/tiny.gguf --mmap >/tmp/minicpm-o-uya-tensors-mmap.out
+	grep -q "mmap=yes" /tmp/minicpm-o-uya-tensors-mmap.out
+	@if $(OUT) tensors tests/fixtures/bad_schema.gguf >/tmp/minicpm-o-uya-tensors-bad.out 2>&1; then 		echo "expected bad schema tensor table to fail"; 		exit 1; 	else 		grep -q "unknown ggml_type" /tmp/minicpm-o-uya-tensors-bad.out; 	fi
+	@if $(OUT) tensors tests/fixtures/tiny_data_truncated.gguf >/tmp/minicpm-o-uya-tensors-trunc.out 2>&1; then 		echo "expected truncated tensor data to fail"; 		exit 1; 	else 		grep -q "data extends past file end" /tmp/minicpm-o-uya-tensors-trunc.out; 	fi
 
 minicpmo-audit: build
 	@if [ -z "$(MINICPM_O_GGUF)" ]; then \

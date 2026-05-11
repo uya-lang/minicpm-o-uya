@@ -82,24 +82,24 @@
 
 ## Phase 4: Tensor runtime 与 mmap 权重
 
-- [ ] 定义 `TensorDType`。
-- [ ] 定义 `TensorView`。
-- [ ] 定义 `TensorWeightTable`。
-- [ ] 定义 shape/stride/byte-size helpers。
-- [ ] 将 GGUF tensor table 转为 weight table。
-- [ ] 支持只读 mmap 挂接 tensor data。
-- [ ] 实现 root tensor lookup。
-- [ ] 实现 per-layer tensor name builder。
-- [ ] 实现 scratch arena。
-- [ ] 实现 LLM KV cache layout。
-- [ ] 实现 vision/audio/speech cache skeleton。
-- [ ] 增加越界、shape mismatch、缺 data tests。
+- [x] 定义 `TensorDType`。
+- [x] 定义 `TensorView`。
+- [x] 定义 `TensorWeightTable`。
+- [x] 定义 shape/stride/byte-size helpers。
+- [x] 将 GGUF tensor table 转为 weight table。
+- [x] 支持只读 mmap 挂接 tensor data。
+- [x] 实现 root tensor lookup。
+- [x] 实现 per-layer tensor name builder。
+- [x] 实现 scratch arena。
+- [x] 实现 LLM KV cache layout。
+- [x] 实现 vision/audio/speech cache skeleton。
+- [x] 增加越界、shape mismatch、缺 data tests。
 
 验收标准：
 
-- 不复制大 tensor 即可建立 `TensorView.data`。
-- 能按 tensor 名称查 dtype、shape、offset、data pointer。
-- 对未知 dtype 和 byte-size 不明的 tensor 明确报错。
+- [x] 不复制大 tensor 即可建立 `TensorView.data`。
+- [x] 能按 tensor 名称查 dtype、shape、offset、data pointer。
+- [x] 对未知 dtype 和 byte-size 不明的 tensor 明确报错。
 
 ## Phase 5: Reference kernels 基础
 

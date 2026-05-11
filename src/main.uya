@@ -6,6 +6,7 @@ use minicpmo.tokenizer.tokenizer_decode_cli;
 use minicpmo.tokenizer.tokenizer_encode_cli;
 use minicpmo.tokenizer.tokenizer_format_chat_cli;
 use minicpmo.tokenizer.tokenizer_piece_cli;
+use minicpmo.tensor.tensor_table_cli;
 
 fn print_help() void {
     _ = printf("minicpm-o-uya - pure Uya MiniCPM-o runtime scaffold\n");
@@ -18,6 +19,7 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya encode <model.gguf> <text>\n");
     _ = printf("  minicpm-o-uya decode <model.gguf> <token-id>...\n");
     _ = printf("  minicpm-o-uya format-chat <model.gguf> <user-text>\n");
+    _ = printf("  minicpm-o-uya tensors <model.gguf> [--mmap]\n");
     _ = printf("\n");
     _ = printf("Status: GGUF inspect/audit and tokenizer CLI are implemented; inference is not implemented yet.\n");
 }
@@ -68,6 +70,21 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
             return 1;
         }
         return tokenizer_format_chat_cli(argv[2] as &const byte, argv[3] as &const byte);
+    }
+    if strcmp(argv[1] as *const byte, "tensors\0" as *const byte) == 0 {
+        if argc != 3 && argc != 4 {
+            _ = printf("usage: minicpm-o-uya tensors <model.gguf> [--mmap]\n");
+            return 1;
+        }
+        var attach: bool = false;
+        if argc == 4 {
+            if strcmp(argv[3] as *const byte, "--mmap\0" as *const byte) != 0 {
+                _ = printf("usage: minicpm-o-uya tensors <model.gguf> [--mmap]\n");
+                return 1;
+            }
+            attach = true;
+        }
+        return tensor_table_cli(argv[2] as &const byte, attach);
     }
     _ = printf("minicpm-o-uya: command not implemented yet: %s\n", argv[1]);
     return 1;

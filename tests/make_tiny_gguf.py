@@ -146,6 +146,7 @@ def main() -> None:
 
     (out_dir / "tiny.gguf").write_bytes(fixture)
     (out_dir / "tiny.gguf.part").write_bytes(fixture[:48])
+    (out_dir / "tiny_data_truncated.gguf").write_bytes(fixture[:-17])
 
     bad_tensor = tensor_info("mystery.branch.weight", [4], 63, 0)
     bad_directory = struct.pack("<IIQQ", 0x46554747, 3, 1, 0) + bad_tensor

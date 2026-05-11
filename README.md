@@ -9,7 +9,7 @@ audio input, speech output, and finally streaming omni chat.
 
 ## Status
 
-Phase 3 is implemented: `inspect`, `audit`, tokenizer lookup/encode/decode, and ChatML-style `format-chat` work on GGUF metadata without reading tensor data. No real MiniCPM-o inference is implemented yet.
+Phase 4 is implemented: `inspect`, `audit`, tokenizer CLI, and tensor weight-table/mmap inspection work on GGUF metadata and tensor directories. No real MiniCPM-o inference is implemented yet.
 
 ## Goals
 
@@ -29,6 +29,7 @@ build/minicpm-o-uya piece /path/to/model.gguf 42
 build/minicpm-o-uya encode /path/to/model.gguf "hello"
 build/minicpm-o-uya decode /path/to/model.gguf 1 2 3
 build/minicpm-o-uya format-chat /path/to/model.gguf "<image> hello"
+build/minicpm-o-uya tensors /path/to/model.gguf --mmap
 MINICPM_O_GGUF=/path/to/model.gguf make minicpmo-audit
 build/minicpm-o-uya generate /path/to/model.gguf "hello"
 build/minicpm-o-uya vision-smoke /path/to/model.gguf /path/to/image.raw
@@ -50,6 +51,7 @@ build/minicpm-o-uya inspect tests/fixtures/tiny.gguf
 build/minicpm-o-uya audit tests/fixtures/tiny.gguf
 build/minicpm-o-uya encode tests/fixtures/tiny.gguf "<image> hello <audio>"
 build/minicpm-o-uya format-chat tests/fixtures/tiny.gguf "<image> hello"
+build/minicpm-o-uya tensors tests/fixtures/tiny.gguf --mmap
 ```
 
 `tests/make_tiny_gguf.py` generates deterministic GGUF fixtures for inspect/audit, including a truncated `.part` file and an intentionally unsupported schema for diagnostics.
