@@ -610,15 +610,63 @@ fn print_chat_default(user_text: &const byte) void {
     _ = printf("<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user_text);
 }
 
+export fn tokenizer_chat_template_supported(tok: &Tokenizer) bool {
+    if !tok.has_chat_template {
+        return true;
+    }
+    if tok_cstr_eq(&tok.chat_template[0] as &const byte, "minicpmo.chatml\0" as &const byte) {
+        return true;
+    }
+    return tok_cstr_starts_with(&tok.chat_template[0] as &const byte, "<|im_start|>\0" as &const byte);
+}
+
+fn tok_append_cstr(dest: &byte, dest_cap: usize, pos: &usize, src: &const byte) bool {
+    var i: usize = 0;
+    while src[i] != 0 {
+        if *pos + 1 >= dest_cap {
+            if dest_cap > 0 {
+                dest[dest_cap - 1] = 0;
+            }
+            return false;
+        }
+        dest[*pos] = src[i];
+        *pos = *pos + 1;
+        i = i + 1;
+    }
+    if dest_cap > 0 {
+        dest[*pos] = 0;
+    }
+    return true;
+}
+
+export fn tokenizer_format_chat_prompt(tok: &Tokenizer, user_text: &const byte, close_previous_assistant: bool, dest: &byte, dest_cap: usize) bool {
+    if !tokenizer_chat_template_supported(tok) || dest_cap == 0 {
+        return false;
+    }
+    dest[0] = 0;
+    var pos: usize = 0;
+    if close_previous_assistant && !tok_append_cstr(dest, dest_cap, &pos, "<|im_end|>\n\0" as &const byte) {
+        return false;
+    }
+    if !tok_append_cstr(dest, dest_cap, &pos, "<|im_start|>user\n\0" as &const byte) {
+        return false;
+    }
+    if !tok_append_cstr(dest, dest_cap, &pos, user_text) {
+        return false;
+    }
+    return tok_append_cstr(dest, dest_cap, &pos, "<|im_end|>\n<|im_start|>assistant\n\0" as &const byte);
+}
+
 export fn tokenizer_format_chat_cli(path: &const byte, user_text: &const byte) i32 {
     var tok: Tokenizer = tokenizer_init();
     if !tokenizer_load(path, &tok) { return 1; }
-    if !tok.has_chat_template {
-        print_chat_default(user_text);
-        return 0;
-    }
-    if tok_cstr_eq(&tok.chat_template[0] as &const byte, "minicpmo.chatml\0" as &const byte) || tok_cstr_starts_with(&tok.chat_template[0] as &const byte, "<|im_start|>\0" as &const byte) {
-        print_chat_default(user_text);
+    if tokenizer_chat_template_supported(&tok) {
+        var prompt: [byte: 1024] = [];
+        if !tokenizer_format_chat_prompt(&tok, user_text, false, &prompt[0], @len(prompt)) {
+            _ = printf("error: formatted chat prompt exceeds buffer cap=%zu\n", @len(prompt));
+            return 1;
+        }
+        _ = printf("%s", &prompt[0]);
         return 0;
     }
     _ = printf("%s\n", &tok.chat_template[0]);

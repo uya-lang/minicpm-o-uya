@@ -1,4 +1,7 @@
+use libc.fgets;
 use libc.printf;
+use libc.stdin;
+use libc.strtod;
 use libc.sqrtf;
 use libc.strcmp;
 use minicpmo.binary.BinaryReader;
@@ -27,7 +30,9 @@ use minicpmo.tensor.tensor_weight_table_attach_mmap;
 use minicpmo.tensor.tensor_weight_table_detach_mmap;
 use minicpmo.tensor.tensor_weight_table_load;
 use minicpmo.tokenizer.Tokenizer;
+use minicpmo.tokenizer.tokenizer_chat_template_supported;
 use minicpmo.tokenizer.tokenizer_encode_to_ids;
+use minicpmo.tokenizer.tokenizer_format_chat_prompt;
 use minicpmo.tokenizer.tokenizer_init;
 use minicpmo.tokenizer.tokenizer_load;
 use minicpmo.tokenizer.tokenizer_piece;
@@ -51,6 +56,30 @@ const QWEN3_FORWARD_MAX_KVDIM: usize = 64;
 const QWEN3_FORWARD_MAX_VOCAB: usize = 256;
 const QWEN3_FORWARD_MAX_PROMPT: usize = 64;
 const QWEN3_FORWARD_EPS: f32 = 0.000001;
+const QWEN3_SAMPLER_DEFAULT_SEED: u32 = 1;
+const QWEN3_CHAT_LINE_CAP: usize = 512;
+const QWEN3_CHAT_TURN_CAP: usize = 1024;
+
+export struct Qwen3SamplerConfig {
+    max_new_tokens: u32,
+    temperature_bits: u32,
+    top_k: u32,
+    top_p_bits: u32,
+    min_p_bits: u32,
+    repeat_penalty_bits: u32,
+    seed: u32,
+    stop_token: u32,
+    stop_on_eos: bool,
+}
+
+struct Qwen3Runtime {
+    k_cache: [f32: 16384],
+    v_cache: [f32: 16384],
+    prompt_ids: [u32: 64],
+    prompt_count: usize,
+    total_tokens: usize,
+    seed: u32,
+}
 
 export struct Qwen3Config {
     vocab_size: u32,
@@ -607,39 +636,344 @@ fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u
     return true;
 }
 
-export fn qwen3_generate_cli(path: &const byte, prompt: &const byte) i32 {
-    var config: Qwen3Config = qwen3_config_init();
-    if !qwen3_config_load_metadata(path, &config) { return 1; }
-    var table: TensorWeightTable = tensor_table_init();
-    if !tensor_weight_table_load(path, &table) { return 1; }
-    if !qwen3_complete_config_from_tensors(&config, &table) { return 1; }
-    if !qwen3_check_forward_caps(&config) { return 1; }
-    if !tensor_weight_table_attach_mmap(path, &table) { return 1; }
-    var weights: Qwen3Weights = qwen3_weights_init();
-    if !qwen3_bind_weights(&table, &config, &weights) { tensor_weight_table_detach_mmap(&table); return 1; }
-    var tok: Tokenizer = tokenizer_init();
-    if !tokenizer_load(path, &tok) { tensor_weight_table_detach_mmap(&table); return 1; }
+
+fn qwen3_sampler_init() Qwen3SamplerConfig {
+    return Qwen3SamplerConfig{ max_new_tokens: 1, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true };
+}
+
+fn qwen3_sampler_f32(bits: u32) f32 {
+    const ptr: &const f32 = &bits as &const f32;
+    return ptr[0];
+}
+
+fn qwen3_parse_u32_value(text: &const byte, out: &u32) bool {
+    var i: usize = 0;
+    var value: u32 = 0;
+    if text[0] == 0 { return false; }
+    while text[i] != 0 {
+        if text[i] < 48 || text[i] > 57 { return false; }
+        value = value * 10 + ((text[i] - 48) as u32);
+        i = i + 1;
+    }
+    *out = value;
+    return true;
+}
+
+fn qwen3_parse_f32_value(text: &const byte, out_bits: &u32) bool {
+    var end_ptr: &const byte = null;
+    const value: f32 = strtod(text, &end_ptr) as f32;
+    if end_ptr == null {
+        return false;
+    }
+    if end_ptr == text || end_ptr[0] != 0 {
+        return false;
+    }
+    const bits_ptr: &const u32 = &value as &const u32;
+    *out_bits = bits_ptr[0];
+    return true;
+}
+
+fn qwen3_xorshift32(state: &u32) u32 {
+    var x: u32 = *state;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 17);
+    x = x ^ (x << 5);
+    *state = x;
+    return x;
+}
+
+fn qwen3_random_unit(seed: &u32) f32 {
+    const value: u32 = qwen3_xorshift32(seed);
+    return ((value as f32) / 4294967295.0) as f32;
+}
+
+fn qwen3_apply_repeat_penalty(logits: &f32, vocab: usize, seen: &const u32, seen_count: usize, penalty: f32) void {
+    if penalty <= 1.0 { return; }
+    var i: usize = 0;
+    while i < seen_count {
+        const token: usize = seen[i] as usize;
+        if token < vocab {
+            if logits[token] > 0.0 { logits[token] = logits[token] / penalty; }
+            if logits[token] < 0.0 { logits[token] = logits[token] * penalty; }
+        }
+        i = i + 1;
+    }
+}
+
+fn qwen3_sample(logits: &f32, vocab: usize, seen: &const u32, seen_count: usize, sampler: &Qwen3SamplerConfig, seed: &u32) u32 {
+    const temp: f32 = qwen3_sampler_f32(sampler.temperature_bits);
+    const top_p: f32 = qwen3_sampler_f32(sampler.top_p_bits);
+    const min_p: f32 = qwen3_sampler_f32(sampler.min_p_bits);
+    const repeat_penalty: f32 = qwen3_sampler_f32(sampler.repeat_penalty_bits);
+    var local: [f32: 256] = [];
+    var probs: [f32: 256] = [];
+    var order: [u32: 256] = [];
+    var i: usize = 0;
+    while i < vocab {
+        local[i] = logits[i];
+        order[i] = i as u32;
+        i = i + 1;
+    }
+    qwen3_apply_repeat_penalty(&local[0], vocab, seen, seen_count, repeat_penalty);
+    if temp <= 0.000001 || sampler.top_k <= 1 { return qwen3_argmax(&local[0], vocab); }
+    i = 0;
+    while i < vocab {
+        local[i] = local[i] / temp;
+        i = i + 1;
+    }
+    softmax(&probs[0], &local[0], vocab);
+    var a: usize = 0;
+    while a < vocab {
+        var b: usize = a + 1;
+        while b < vocab {
+            if probs[b] > probs[a] {
+                const tp: f32 = probs[a]; probs[a] = probs[b]; probs[b] = tp;
+                const ti: u32 = order[a]; order[a] = order[b]; order[b] = ti;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    var limit: usize = vocab;
+    if sampler.top_k > 0 && sampler.top_k < limit as u32 { limit = sampler.top_k as usize; }
+    var cumulative: f32 = 0.0;
+    var kept: usize = 0;
+    while kept < limit {
+        if kept >= vocab || kept >= 256 { break; }
+        cumulative = cumulative + probs[kept];
+        kept = kept + 1;
+        if cumulative >= top_p && top_p < 0.999999 { break; }
+    }
+    var max_prob: f32 = probs[0];
+    if min_p > 0.0 {
+        while kept > 1 {
+            const tail: usize = kept - 1;
+            if tail >= 256 || probs[tail] >= (max_prob * min_p) { break; }
+            kept = kept - 1;
+        }
+    }
+    var norm: f32 = 0.0;
+    i = 0;
+    while i < kept { norm = norm + probs[i]; i = i + 1; }
+    const r: f32 = qwen3_random_unit(seed);
+    var acc: f32 = 0.0;
+    i = 0;
+    while i < kept {
+        acc = acc + probs[i] / norm;
+        if r <= acc || i + 1 == kept { return order[i]; }
+        i = i + 1;
+    }
+    return order[0];
+}
+
+fn qwen3_parse_sampler_args(argc: i32, argv: & &byte, start_index: i32, sampler: &Qwen3SamplerConfig) bool {
+    var i: i32 = start_index;
+    while i < argc {
+        if strcmp(argv[i] as *const byte, "--max-new-tokens\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &sampler.max_new_tokens) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "--temperature\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_f32_value(argv[i + 1] as &const byte, &sampler.temperature_bits) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "--top-k\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &sampler.top_k) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "--top-p\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_f32_value(argv[i + 1] as &const byte, &sampler.top_p_bits) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "--min-p\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_f32_value(argv[i + 1] as &const byte, &sampler.min_p_bits) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "--repeat-penalty\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_f32_value(argv[i + 1] as &const byte, &sampler.repeat_penalty_bits) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "--seed\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &sampler.seed) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "--stop-token\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &sampler.stop_token) { return false; }
+            sampler.stop_on_eos = false;
+            i = i + 2; continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn qwen3_runtime_init() Qwen3Runtime {
+    return Qwen3Runtime{ k_cache: [], v_cache: [], prompt_ids: [], prompt_count: 0, total_tokens: 0, seed: QWEN3_SAMPLER_DEFAULT_SEED };
+}
+
+fn qwen3_append_prompt_ids(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, ids: &const u32, id_count: usize, logits: &f32) bool {
+    if id_count == 0 {
+        _ = printf("error: empty prompt\n");
+        return false;
+    }
+    if runtime.total_tokens + id_count > config.context_length as usize || runtime.total_tokens + id_count > QWEN3_FORWARD_MAX_CONTEXT {
+        _ = printf("error: context overflow total_tokens=%zu add_tokens=%zu context=%u\n", runtime.total_tokens, id_count, config.context_length);
+        return false;
+    }
+    var i: usize = 0;
+    while i < id_count {
+        const pos: usize = runtime.total_tokens;
+        runtime.prompt_ids[pos] = ids[i];
+        if !qwen3_forward_token(config, weights, ids[i], pos, &runtime.k_cache[0], &runtime.v_cache[0], logits) { return false; }
+        runtime.total_tokens = runtime.total_tokens + 1;
+        i = i + 1;
+    }
+    runtime.prompt_count = runtime.total_tokens;
+    return true;
+}
+
+fn qwen3_append_prompt_text(config: &Qwen3Config, weights: &Qwen3Weights, tok: &Tokenizer, runtime: &Qwen3Runtime, prompt: &const byte, logits: &f32) bool {
     var ids: [u32: 64] = [];
     var id_count: usize = 0;
-    if !tokenizer_encode_to_ids(&tok, prompt, &ids[0], QWEN3_FORWARD_MAX_PROMPT, &id_count) { tensor_weight_table_detach_mmap(&table); return 1; }
-    if id_count == 0 { _ = printf("error: empty prompt\n"); tensor_weight_table_detach_mmap(&table); return 1; }
-    if id_count > config.context_length as usize || id_count > QWEN3_FORWARD_MAX_CONTEXT { _ = printf("error: prompt token count=%zu exceeds context=%u\n", id_count, config.context_length); tensor_weight_table_detach_mmap(&table); return 1; }
-    var k_cache: [f32: 16384] = [];
-    var v_cache: [f32: 16384] = [];
-    var logits: [f32: 256] = [];
-    var pos: usize = 0;
-    while pos < id_count {
-        if !qwen3_forward_token(&config, &weights, ids[pos], pos, &k_cache[0], &v_cache[0], &logits[0]) { tensor_weight_table_detach_mmap(&table); return 1; }
-        pos = pos + 1;
+    if !tokenizer_encode_to_ids(tok, prompt, &ids[0], QWEN3_FORWARD_MAX_PROMPT, &id_count) {
+        return false;
     }
-    const greedy: u32 = qwen3_argmax(&logits[0], config.vocab_size as usize);
+    return qwen3_append_prompt_ids(config, weights, runtime, &ids[0], id_count, logits);
+}
+
+fn qwen3_generate_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, sampler: &Qwen3SamplerConfig, tok: &Tokenizer, logits: &f32) i32 {
+    var generated: usize = 0;
+    while generated < sampler.max_new_tokens as usize {
+        if runtime.total_tokens >= config.context_length as usize || runtime.total_tokens >= QWEN3_FORWARD_MAX_CONTEXT { _ = printf("error: context overflow total_tokens=%zu context=%u\n", runtime.total_tokens, config.context_length); return 1; }
+        const next_id: u32 = qwen3_sample(logits, config.vocab_size as usize, &runtime.prompt_ids[0], runtime.total_tokens, sampler, &runtime.seed);
+        _ = printf("sampled token[%zu]: %u piece=%s\n", generated, next_id, tokenizer_piece(tok, next_id));
+        if next_id == sampler.stop_token {
+            _ = printf("stop: token=%u\n", next_id);
+            return 0;
+        }
+        runtime.prompt_ids[runtime.total_tokens] = next_id;
+        runtime.total_tokens = runtime.total_tokens + 1;
+        if !qwen3_forward_token(config, weights, next_id, runtime.total_tokens - 1, &runtime.k_cache[0], &runtime.v_cache[0], logits) { return 1; }
+        generated = generated + 1;
+    }
+    return 0;
+}
+
+fn qwen3_open_runtime(path: &const byte, config: &Qwen3Config, table: &TensorWeightTable, weights: &Qwen3Weights, tok: &Tokenizer, runtime: &Qwen3Runtime) bool {
+    if !qwen3_config_load_metadata(path, config) { return false; }
+    table[0] = tensor_table_init();
+    if !tensor_weight_table_load(path, table) { return false; }
+    if !qwen3_complete_config_from_tensors(config, table) { return false; }
+    if !qwen3_check_forward_caps(config) { return false; }
+    if !tensor_weight_table_attach_mmap(path, table) { return false; }
+    weights[0] = qwen3_weights_init();
+    if !qwen3_bind_weights(table, config, weights) { tensor_weight_table_detach_mmap(table); return false; }
+    tok[0] = tokenizer_init();
+    if !tokenizer_load(path, tok) { tensor_weight_table_detach_mmap(table); return false; }
+    runtime[0] = qwen3_runtime_init();
+    return true;
+}
+
+fn qwen3_prepare_runtime(path: &const byte, prompt: &const byte, config: &Qwen3Config, table: &TensorWeightTable, weights: &Qwen3Weights, tok: &Tokenizer, runtime: &Qwen3Runtime, logits: &f32) bool {
+    if !qwen3_open_runtime(path, config, table, weights, tok, runtime) { return false; }
+    if !qwen3_append_prompt_text(config, weights, tok, runtime, prompt, logits) {
+        tensor_weight_table_detach_mmap(table);
+        return false;
+    }
+    return true;
+}
+
+fn qwen3_trim_line(line: &byte) void {
+    var len: usize = 0;
+    while line[len] != 0 {
+        len = len + 1;
+    }
+    while len > 0 && (line[len - 1] == 10 || line[len - 1] == 13) {
+        line[len - 1] = 0;
+        len = len - 1;
+    }
+}
+
+export fn qwen3_generate_cli(path: &const byte, prompt: &const byte) i32 {
+    var config: Qwen3Config = qwen3_config_init();
+    var table: TensorWeightTable = tensor_table_init();
+    var weights: Qwen3Weights = qwen3_weights_init();
+    var tok: Tokenizer = tokenizer_init();
+    var runtime: Qwen3Runtime = qwen3_runtime_init();
+    var logits: [f32: 256] = [];
+    if !qwen3_prepare_runtime(path, prompt, &config, &table, &weights, &tok, &runtime, &logits[0]) { return 1; }
+    var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
     _ = printf("generate prompt_tokens:");
     var i: usize = 0;
-    while i < id_count { _ = printf(" %u", ids[i]); i = i + 1; }
+    while i < runtime.prompt_count { _ = printf(" %u", runtime.prompt_ids[i]); i = i + 1; }
     _ = printf("\n");
-    _ = printf("logits[0..4]: %.6f %.6f %.6f %.6f %.6f\n", logits[0] as f64, logits[1] as f64, logits[2] as f64, logits[3] as f64, logits[4] as f64);
-    _ = printf("greedy token: %u piece=%s\n", greedy, tokenizer_piece(&tok, greedy));
-    _ = printf("generated: %s\n", tokenizer_piece(&tok, greedy));
+    const rc: i32 = qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, &logits[0]);
+    if rc == 0 {
+        _ = printf("logits[0..4]: %.6f %.6f %.6f %.6f %.6f\n", logits[0] as f64, logits[1] as f64, logits[2] as f64, logits[3] as f64, logits[4] as f64);
+    }
+    tensor_weight_table_detach_mmap(&table);
+    return rc;
+}
+
+export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
+    if argc < 4 { _ = printf("usage: minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID]\n"); return 1; }
+    var config: Qwen3Config = qwen3_config_init();
+    var table: TensorWeightTable = tensor_table_init();
+    var weights: Qwen3Weights = qwen3_weights_init();
+    var tok: Tokenizer = tokenizer_init();
+    var runtime: Qwen3Runtime = qwen3_runtime_init();
+    var logits: [f32: 256] = [];
+    if !qwen3_prepare_runtime(argv[2] as &const byte, argv[3] as &const byte, &config, &table, &weights, &tok, &runtime, &logits[0]) { return 1; }
+    var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
+    if !qwen3_parse_sampler_args(argc, argv, 4, &sampler) { _ = printf("error: invalid generate sampler args\n"); tensor_weight_table_detach_mmap(&table); return 1; }
+    runtime.seed = sampler.seed;
+    _ = printf("generate prompt_tokens:");
+    var i: usize = 0;
+    while i < runtime.prompt_count { _ = printf(" %u", runtime.prompt_ids[i]); i = i + 1; }
+    _ = printf("\n");
+    const rc: i32 = qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, &logits[0]);
+    tensor_weight_table_detach_mmap(&table);
+    return rc;
+}
+
+export fn qwen3_chat_cli(path: &const byte) i32 {
+    var config: Qwen3Config = qwen3_config_init();
+    var table: TensorWeightTable = tensor_table_init();
+    var weights: Qwen3Weights = qwen3_weights_init();
+    var tok: Tokenizer = tokenizer_init();
+    var runtime: Qwen3Runtime = qwen3_runtime_init();
+    if !qwen3_open_runtime(path, &config, &table, &weights, &tok, &runtime) { return 1; }
+    if !tokenizer_chat_template_supported(&tok) {
+        _ = printf("error: unsupported chat template: %s\n", &tok.chat_template[0]);
+        tensor_weight_table_detach_mmap(&table);
+        return 1;
+    }
+    var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
+    sampler.max_new_tokens = 1;
+    var logits: [f32: 256] = [];
+    var line: [byte: QWEN3_CHAT_LINE_CAP] = [];
+    var turn_prompt: [byte: QWEN3_CHAT_TURN_CAP] = [];
+    var close_previous_assistant: bool = false;
+    _ = printf("chat> ");
+    while fgets(&line[0], QWEN3_CHAT_LINE_CAP, stdin) != null {
+        qwen3_trim_line(&line[0]);
+        if line[0] == 0 {
+            _ = printf("chat> ");
+            continue;
+        }
+        if !tokenizer_format_chat_prompt(&tok, &line[0] as &const byte, close_previous_assistant, &turn_prompt[0], QWEN3_CHAT_TURN_CAP) {
+            _ = printf("error: formatted chat prompt exceeds buffer cap=%zu\n", QWEN3_CHAT_TURN_CAP);
+            tensor_weight_table_detach_mmap(&table);
+            return 1;
+        }
+        if !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, &turn_prompt[0] as &const byte, &logits[0]) {
+            tensor_weight_table_detach_mmap(&table);
+            return 1;
+        }
+        if qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, &logits[0]) != 0 { tensor_weight_table_detach_mmap(&table); return 1; }
+        close_previous_assistant = true;
+        _ = printf("chat> ");
+    }
     tensor_weight_table_detach_mmap(&table);
     return 0;
 }

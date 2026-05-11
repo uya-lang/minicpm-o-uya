@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture minicpmo-audit clean
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture chat-fixture minicpmo-audit clean FORCE
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture chat-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -86,6 +86,23 @@ qwen3-fixture: build fixtures
 		grep -q "missing tensor blk.0.attn_q.weight" /tmp/minicpm-o-uya-qwen3-missing.out; \
 	fi
 
+
+generate-fixture: FORCE build fixtures
+	$(OUT) generate tests/fixtures/tiny.gguf hello >/tmp/minicpm-o-uya-generate.out
+	grep -q "generate prompt_tokens: 4" /tmp/minicpm-o-uya-generate.out
+	grep -q "sampled token\[0\]: 4 piece=hello" /tmp/minicpm-o-uya-generate.out
+	$(OUT) generate tests/fixtures/tiny.gguf hello --temperature 1.0 --top-k 2 --seed 7 >/tmp/minicpm-o-uya-generate-seed-a.out
+	$(OUT) generate tests/fixtures/tiny.gguf hello --temperature 1.0 --top-k 2 --seed 7 >/tmp/minicpm-o-uya-generate-seed-b.out
+	cmp -s /tmp/minicpm-o-uya-generate-seed-a.out /tmp/minicpm-o-uya-generate-seed-b.out
+	$(OUT) generate tests/fixtures/tiny.gguf hello --stop-token 4 >/tmp/minicpm-o-uya-generate-stop.out
+	grep -q "stop: token=4" /tmp/minicpm-o-uya-generate-stop.out
+	@if $(OUT) generate tests/fixtures/tiny.gguf hello --temperature nope >/tmp/minicpm-o-uya-generate-bad.out 2>&1; then \
+		echo "expected invalid sampler args to fail"; \
+		exit 1; \
+	else \
+		grep -q "error: invalid generate sampler args" /tmp/minicpm-o-uya-generate-bad.out; \
+	fi
+
 minicpmo-audit: build
 	@if [ -z "$(MINICPM_O_GGUF)" ]; then \
 		echo "usage: MINICPM_O_GGUF=/path/to/model.gguf make minicpmo-audit"; \
@@ -95,3 +112,16 @@ minicpmo-audit: build
 
 clean:
 	rm -rf build
+
+chat-fixture: FORCE build fixtures
+	printf "hello\n" | $(OUT) chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-chat-repl.out
+	grep -q "chat>" /tmp/minicpm-o-uya-chat-repl.out
+	grep -q "sampled token\[0\]: 4 piece=hello" /tmp/minicpm-o-uya-chat-repl.out
+	@if printf "hello\nhello\nhello\n" | $(OUT) chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-chat-overflow.out 2>&1; then \
+		echo "expected chat context overflow to fail"; \
+		exit 1; \
+	else \
+		grep -q "error: context overflow" /tmp/minicpm-o-uya-chat-overflow.out; \
+	fi
+
+FORCE:

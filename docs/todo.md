@@ -185,22 +185,22 @@
 
 ## Phase 9: Sampler 与文本 CLI
 
-- [ ] greedy sampler。
-- [ ] temperature。
-- [ ] top-k。
-- [ ] top-p。
-- [ ] min-p 或 typical-p，如模型推荐需要。
-- [ ] repeat penalty。
-- [ ] seed 管理。
-- [ ] stop token/stop string。
-- [ ] `chat` text-only REPL。
-- [ ] 多轮对话 KV/cache 策略。
+- [x] greedy sampler。
+- [x] temperature。
+- [x] top-k。
+- [x] top-p。
+- [x] min-p 或 typical-p，如模型推荐需要。
+- [x] repeat penalty。
+- [x] seed 管理。
+- [x] stop token/stop string。
+- [x] `chat` text-only REPL。
+- [x] 多轮对话 KV/cache 策略。
 
 验收标准：
 
-- 同 seed 同参数输出一致。
-- `chat` 使用 chat template。
-- context 溢出有清楚错误或截断策略。
+- [x] 同 seed 同参数输出一致。
+- [x] `chat` 使用 chat template。
+- [x] context 溢出有清楚错误或截断策略。
 
 ## Phase 10: Vision raw tensor smoke
 
