@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture minicpmo-audit clean
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture minicpmo-audit clean
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -69,6 +69,11 @@ tensor-fixture: build fixtures
 kernels-fixture: build
 	$(OUT) kernels-smoke >/tmp/minicpm-o-uya-kernels.out
 	grep -q "kernels smoke: PASS" /tmp/minicpm-o-uya-kernels.out
+
+quant-fixture: build
+	$(OUT) quant-smoke >/tmp/minicpm-o-uya-quant.out
+	grep -q "quant smoke: PASS" /tmp/minicpm-o-uya-quant.out
+	grep -q "unsupported quant dtype: tensor=blk.0.bad.weight dtype=IQ_UNKNOWN" /tmp/minicpm-o-uya-quant.out
 
 minicpmo-audit: build
 	@if [ -z "$(MINICPM_O_GGUF)" ]; then \

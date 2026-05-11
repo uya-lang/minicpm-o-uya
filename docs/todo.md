@@ -124,21 +124,21 @@
 
 ## Phase 6: Quantization kernels
 
-- [ ] 根据 MiniCPM-o GGUF audit 选择首批 dtype。
-- [ ] 实现 Q8_0 dot。
-- [ ] 实现 Q4_K dot。
-- [ ] 实现 Q5_K dot。
-- [ ] 实现 Q6_K dot。
-- [ ] 实现必要 IQ dtype dot。
-- [ ] 实现 fused dequant + dot。
-- [ ] 支持 quant matvec row stride。
-- [ ] 与 scalar dequant reference 对照。
+- [x] 根据 MiniCPM-o GGUF audit 选择首批 dtype。
+- [x] 实现 Q8_0 dot。
+- [x] 实现 Q4_K dot。
+- [x] 实现 Q5_K dot。
+- [x] 实现 Q6_K dot。
+- [x] 实现必要 IQ dtype dot。
+- [x] 实现 fused dequant + dot。
+- [x] 支持 quant matvec row stride。
+- [x] 与 scalar dequant reference 对照。
 
 验收标准：
 
-- 支持真实模型中 text decoder 命中的首批 dtype。
-- quant kernel 误差在阈值内。
-- unsupported dtype 报 tensor name 和 dtype。
+- [x] 支持真实模型中 text decoder 命中的首批 dtype（首批覆盖 Q8_0、Q4_K、Q5_K、Q6_K、IQ4_NL）。
+- [x] quant kernel 误差在阈值内。
+- [x] unsupported dtype 报 tensor name 和 dtype。
 
 ## Phase 7: Qwen3 text config 与权重绑定
 

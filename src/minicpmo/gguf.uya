@@ -119,6 +119,7 @@ fn ggml_type_info(ggml_type: u32) GgmlTypeInfo {
     if ggml_type == 13 { return GgmlTypeInfo{ block_size: 256, type_size: 176, name: "Q5_K\0" as &const byte, known: true }; }
     if ggml_type == 14 { return GgmlTypeInfo{ block_size: 256, type_size: 210, name: "Q6_K\0" as &const byte, known: true }; }
     if ggml_type == 15 { return GgmlTypeInfo{ block_size: 256, type_size: 292, name: "Q8_K\0" as &const byte, known: true }; }
+    if ggml_type == 20 { return GgmlTypeInfo{ block_size: 32, type_size: 18, name: "IQ4_NL\0" as &const byte, known: true }; }
     if ggml_type == 24 { return GgmlTypeInfo{ block_size: 1, type_size: 1, name: "I8\0" as &const byte, known: true }; }
     if ggml_type == 25 { return GgmlTypeInfo{ block_size: 1, type_size: 2, name: "I16\0" as &const byte, known: true }; }
     if ggml_type == 26 { return GgmlTypeInfo{ block_size: 1, type_size: 4, name: "I32\0" as &const byte, known: true }; }
