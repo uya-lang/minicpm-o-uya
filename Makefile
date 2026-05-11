@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture chat-fixture minicpmo-audit clean FORCE
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture chat-fixture minicpmo-audit clean FORCE
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture chat-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture chat-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -166,6 +166,20 @@ omni-fixture: FORCE build fixtures
 	grep -q "span\[1\]: kind=video_frame token_start=4 token_count=1 embed_start=1 embed_count=1" /tmp/minicpm-o-uya-omni.out
 	grep -q "span\[2\]: kind=audio_chunk token_start=5 token_count=1 embed_start=2 embed_count=1" /tmp/minicpm-o-uya-omni.out
 	grep -q "omni context: tokens=6 text_tokens=3 media_embeddings=3 effective=6 attention=causal+media-spans checksum=0x4e22ca" /tmp/minicpm-o-uya-omni.out
+
+omni-chat-fixture: FORCE build fixtures
+	printf "hello\nworld\n" | $(OUT) omni-chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-omni-chat-text.out
+	grep -q "omni-chat: model loaded once" /tmp/minicpm-o-uya-omni-chat-text.out
+	grep -q "turn\[0\]: input=text events=1 tokens=1 spans=0 media_embeddings=0 text_tokens=1 cache_tokens=1 resets=0" /tmp/minicpm-o-uya-omni-chat-text.out
+	grep -q "assistant text: hello" /tmp/minicpm-o-uya-omni-chat-text.out
+	grep -q "turn\[1\]: input=text events=1 tokens=1 spans=0 media_embeddings=0 text_tokens=1 cache_tokens=2 resets=0" /tmp/minicpm-o-uya-omni-chat-text.out
+	grep -q "assistant text: world" /tmp/minicpm-o-uya-omni-chat-text.out
+	grep -q "omni-chat: done turns=2 resets=0 cache_tokens=2" /tmp/minicpm-o-uya-omni-chat-text.out
+	printf "manifest tests/fixtures/tiny_omni.json\n" | $(OUT) omni-chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-omni-chat-manifest.out
+	grep -q "turn\[0\]: input=manifest events=7 tokens=6 spans=3 media_embeddings=3 text_tokens=3 cache_tokens=6 resets=0" /tmp/minicpm-o-uya-omni-chat-manifest.out
+	grep -q "assistant text: hello" /tmp/minicpm-o-uya-omni-chat-manifest.out
+	grep -q "speech output: unsupported in blocking omni-chat; queued_requests=1 text output preserved" /tmp/minicpm-o-uya-omni-chat-manifest.out
+	grep -q "turn boundary: turn=0 cache_policy=preserve-until-overflow" /tmp/minicpm-o-uya-omni-chat-manifest.out
 
 chat-fixture: FORCE build fixtures
 	printf "hello\n" | $(OUT) chat tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-chat-repl.out

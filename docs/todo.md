@@ -326,14 +326,14 @@
 
 ## Phase 17: 阻塞式 omni chat
 
-- [ ] 加载一次模型进入 REPL。
-- [ ] 支持文本输入。
-- [ ] 支持 manifest 图片输入。
-- [ ] 支持 manifest 音频输入。
-- [ ] 支持 text output。
-- [ ] 支持 optional speech output。
-- [ ] 多轮对话状态管理。
-- [ ] turn boundary 和 cache reset 策略。
+- [x] 加载一次模型进入 REPL。
+- [x] 支持文本输入。
+- [x] 支持 manifest 图片输入。
+- [x] 支持 manifest 音频输入。
+- [x] 支持 text output。
+- [x] 支持 optional speech output。
+- [x] 多轮对话状态管理。
+- [x] turn boundary 和 cache reset 策略。
 
 验收标准：
 
