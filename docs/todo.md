@@ -382,15 +382,15 @@
 
 ## Phase 20: 文档、兼容性与发布
 
-- [ ] 完善 README usage。
-- [ ] 记录支持的 MiniCPM-o 版本和文件格式。
-- [ ] 记录支持 dtype 列表。
-- [ ] 记录 unsupported modality 列表。
-- [ ] 记录外部模型 smoke 命令。
-- [ ] 记录 golden 对照来源和误差阈值。
-- [ ] 记录性能结果。
-- [ ] 增加 troubleshooting。
-- [ ] 增加架构图或数据流图。
+- [x] 完善 README usage。
+- [x] 记录支持的 MiniCPM-o 版本和文件格式。
+- [x] 记录支持 dtype 列表。
+- [x] 记录 unsupported modality 列表。
+- [x] 记录外部模型 smoke 命令。
+- [x] 记录 golden 对照来源和误差阈值。
+- [x] 记录性能结果。
+- [x] 增加 troubleshooting。
+- [x] 增加架构图或数据流图。
 
 验收标准：
 

@@ -1,46 +1,117 @@
 # Tests
 
-This project should use tiny synthetic fixtures first. Full MiniCPM-o weights,
-images, audio, and videos must stay outside the repository.
+This project uses tiny synthetic fixtures first. Full MiniCPM-o weights, images, audio, and videos must stay outside the repository and be referenced through external paths.
 
-Planned test layers:
+## Test Layers
 
-1. Binary/GGUF metadata fixtures.
-2. Tokenizer golden prompts.
-3. Tensor shape and dtype validation.
-4. Scalar kernel golden values.
-5. Qwen3 text-only small model fixtures.
-6. Vision/audio/speech fixtures with raw tensor inputs.
-7. Documented external-model smoke targets.
+1. Binary/GGUF metadata and truncation fixtures.
+2. Tokenizer golden prompts and ChatML-like formatting.
+3. Tensor shape, dtype, mmap, and bounds validation.
+4. Scalar kernel golden values and quant fused dequant+dot checks.
+5. Tiny Qwen3-like text binding, generation, sampler, and chat smoke.
+6. Vision, audio, speech, omni, stream-chat, and benchmark fixtures with raw inputs/manifests.
+7. Documented external-model smoke commands for manual compatibility work.
 
-## GGUF Fixtures
+## Fixture Generation
 
-Run `python3 tests/make_tiny_gguf.py` to generate:
+Run:
+
+```sh
+python3 tests/make_tiny_gguf.py
+# or
+make fixtures
+```
+
+Generated files:
 
 - `tests/fixtures/tiny.gguf` — deterministic GGUF v3 fixture with Qwen3, tokenizer, vision, audio, speech, scalar, string, and array metadata plus branchable tensors.
 - `tests/fixtures/tiny.gguf.part` — truncated file used to verify short-read errors.
-- `tests/fixtures/tiny_image.raw` — deterministic raw vision tensor fixture: little-endian `UYAI` magic (`0x49415955`), version `1`, `width`, `height`, `channels`, dtype `0` for NCHW F32, followed by `width * height * channels` float32 values.
-- `tests/fixtures/tiny_rgb.raw` — minimal raw RGB fixture: little-endian `UYRG` magic (`0x47525955`), version `1`, `width`, `height`, channels `3`, dtype `0` for row-major uint8 RGB bytes.
-- `tests/fixtures/tiny_image.uyim` — image manifest fixture: `UYIM`, version `1`, image count, target shape/tile shape, followed by an embedded `UYRG` payload.
-- `tests/fixtures/tiny_video.uyvm` — video frame sequence manifest: `UYVM`, version `1`, frame count, target shape/tile shape, followed by embedded `UYRG` frame payloads; no MP4 decoding is involved.
-- `tests/fixtures/tiny_audio.raw` — deterministic log-mel audio fixture: little-endian `UYAM` magic (`0x4D415955`), version `1`, frame count `1`, mel bins `4`, dtype `0` for F32, followed by four float32 bins.
-- `tests/fixtures/bad_schema.gguf` — generated unsupported schema used to verify missing tokenizer/root tensor, unknown dtype, and unknown branch diagnostics.
-- `tests/fixtures/tiny_data_truncated.gguf` — generated tensor-data truncation case used to verify weight-table bounds checks.
+- `tests/fixtures/tiny_data_truncated.gguf` — tensor-data truncation case used to verify weight-table bounds checks.
+- `tests/fixtures/bad_schema.gguf` — unsupported schema used to verify missing tokenizer/root tensor, unknown dtype, and unknown branch diagnostics.
+- `tests/fixtures/tiny_qwen3_missing_q.gguf` — missing text projection fixture for Qwen3 binding diagnostics.
+- `tests/fixtures/tiny_audio_missing.gguf` — missing audio branch fixture for modality diagnostics.
+- `tests/fixtures/tiny_image.raw` — `UYAI` raw NCHW F32 image tensor fixture.
+- `tests/fixtures/tiny_rgb.raw` — `UYRG` row-major uint8 RGB fixture.
+- `tests/fixtures/tiny_image.uyim` — `UYIM` image manifest with embedded `UYRG` payload.
+- `tests/fixtures/tiny_video.uyvm` — `UYVM` video-frame manifest with embedded `UYRG` frames; no MP4 decoding is involved.
+- `tests/fixtures/tiny_audio.raw` — `UYAM` log-mel F32 audio fixture.
+- `tests/fixtures/tiny_audio.pcm` — `UYAP` PCM fixture for preprocessing smoke.
+- `tests/fixtures/tiny_omni.json` — mixed text/image/audio/speech prompt manifest for omni smoke and benchmark.
+- `tests/fixtures/tiny_stream.json` — streaming event manifest for queue/ring/interrupt smoke.
 
-`make test` builds the CLI, runs `inspect`, `audit`, tokenizer piece/encode/decode, `format-chat`, tensor table/mmap inspection, Qwen3 binding, tiny text-only generation, vision raw tensor smoke, vision preprocessing smoke, audio log-mel encoder smoke, sampler/chat CLI, and scalar and quant kernel golden smoke tests; it also confirms truncated fixtures fail cleanly and checks unsupported-schema diagnostics without reading tensor data.
+## Default Validation
+
+`make test` builds the CLI, regenerates fixtures, and runs:
+
+- `inspect-fixture` and `audit-fixture` for GGUF parsing, schema summaries, and unsupported diagnostics.
+- `tokenizer-fixture` for `piece`, `encode`, `decode`, and `format-chat` goldens.
+- `tensor-fixture` for tensor table conversion, mmap view setup, cache skeletons, unknown dtype errors, and tensor-data bounds errors.
+- `kernels-fixture` for scalar reference kernel goldens.
+- `quant-fixture` for selected GGML quant kernel goldens and unsupported dtype diagnostics.
+- `qwen3-fixture` for tiny Qwen3 config/weight binding and missing tensor diagnostics.
+- `generate-fixture` for deterministic prefill/decode, KV cache writes, logits, and sampler output.
+- `vision-fixture` for raw image tensor smoke, RGB preprocessing, image/video manifest handling, tile counts, and checksum stability.
+- `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
+- `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.
+- `omni-fixture` for mixed manifest parsing, placeholder spans, media embedding counts, and prompt compilation.
+- `omni-chat-fixture` for blocking text and manifest turns, context preservation, and explicit unsupported speech output diagnostics.
+- `stream-chat-fixture` for stream queue, audio ring buffer, partial callbacks, backpressure, interrupt, and pending speech cleanup diagnostics.
+- `bench-fixture` for deterministic performance/memory/reference-error output.
+- `chat-fixture` for text REPL behavior and context overflow diagnostics.
+
+## Golden Coverage
 
 Tokenizer golden coverage includes English, Chinese punctuation, newline-capable vocabulary, and MiniCPM-o media placeholders such as `<image>` and `<audio>` so they are matched as whole tokens.
 
-Audio smoke coverage binds the tiny conv/front-end, one transformer block, output norm, projector, and `<audio>` embedding injection path. The current golden checks are raw checksum `0xbca0dcc`, embedding checksum `0x625ac595`, a non-zero logits diff, and a clear missing-branch error for `audio.conv1.weight`.
-
 Kernel smoke coverage includes F32 vector ops, F16/BF16 loads, normalization, RoPE, softmax, dense matvec, activations, Conv1D/Conv2D, and NaN/Inf/empty-length boundaries.
 
-Quant smoke coverage includes Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL fused dequant+dot checks, row-stride Q8_0 matvec, and unsupported dtype diagnostics with tensor name plus dtype.
+Quant smoke coverage includes `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ4_NL` fused dequant+dot checks, row-stride `Q8_0` matvec, and unsupported dtype diagnostics with tensor name plus dtype.
 
 Qwen3 binding coverage uses a tiny one-layer Qwen3-like GGUF with token embedding, output norm/head, attention projections, optional q/k norms, and FFN projections; it also checks missing tensor diagnostics include layer and tensor name.
 
-Generation smoke coverage uses the deterministic tiny Qwen3-like fixture to validate token embedding lookup, prefill/decode, KV cache writes, causal attention, final logits, and greedy next-token selection for fixed prompts.
+Generation smoke coverage uses the deterministic tiny Qwen3-like fixture to validate token embedding lookup, prefill/decode, KV cache writes, causal attention, final logits, and greedy/sampler next-token selection for fixed prompts.
 
-Vision smoke coverage uses the tiny raw image fixture to validate patch embedding, a one-block vision transformer, resampler/projector binding, image embedding span injection, stable checksum `0xb5a01b45`, placeholder/span alignment, and observable image-vs-text logits difference. Vision preprocessing coverage validates `UYRG` resize/crop-pad/normalize output checksum `0xea7fa412`, image manifest parity, video manifest frame/tile/placeholder counts, and 2D position embedding interpolation without PNG/JPEG/MP4 decoders.
+Vision smoke coverage uses tiny raw image fixtures to validate patch embedding, one-block vision transformer behavior, resampler/projector binding, image embedding span injection, stable checksum `0xb5a01b45`, placeholder/span alignment, RGB resize/crop-pad/normalize checksum `0xea7fa412`, image manifest parity, video manifest frame/tile counts, and 2D position embedding interpolation.
 
-Sampler/chat coverage validates deterministic seed behavior, sampler-arg validation, stop-token handling, and a minimal text-only `chat` REPL loop that preserves multi-turn context until the tiny fixture hits its context limit.
+Audio smoke coverage binds the tiny conv/front-end, one transformer block, output norm, projector, and `<audio>` embedding injection path. Current checks include raw checksum `0xbca0dcc`, embedding checksum `0x625ac595`, non-zero logits diff, PCM preprocessing, and clear missing-branch errors.
+
+Speech smoke coverage validates prompt-to-token setup, deterministic decoder features, vocoder sample generation, optional WAV writing, and unsupported/missing speech tensor diagnostics without claiming natural audio quality.
+
+Omni and stream coverage validates fixed JSON manifests, media placeholder spans, cache/accounting, stream queue high-watermark, audio ring usage, partial outputs, interrupt cleanup, and explicit unsupported speech behavior in blocking `omni-chat`.
+
+Benchmark coverage validates the tiny fixture output:
+
+```text
+bench load: ms=3 mode=tiny-mmap-metadata
+bench text_prompt: 500.000 tokens/s units=1 ms=2
+bench text_decode: 333.333 tokens/s units=1 ms=3
+bench vision_encode: ms=7 frames=1 tiles=1
+bench audio_encode: ms=5 chunks=1
+bench vocoder: 16000.000 samples/s units=64 ms=4
+bench memory: peak_estimate_bytes=78336 llm=512 vision=4096 audio=4096 speech=4096 scratch=65536
+bench reference_error: text=0.000000 vision=0.000000 audio=0.000000 vocoder=0.000000
+```
+
+## External Smoke
+
+Default tests never require external weights. For real/community models, set paths outside the repository and run commands manually:
+
+```sh
+export MINICPM_O_GGUF=/path/to/minicpm-o.gguf
+export MINICPM_O_TEXT_GGUF=/path/to/qwen3-text.gguf
+export MINICPM_O_IMAGE_RAW=/path/to/image.raw
+export MINICPM_O_AUDIO_RAW=/path/to/audio.raw
+export MINICPM_O_MANIFEST=/path/to/omni-manifest.json
+
+MINICPM_O_GGUF="$MINICPM_O_GGUF" make minicpmo-audit
+build/minicpm-o-uya inspect "$MINICPM_O_GGUF"
+build/minicpm-o-uya audit "$MINICPM_O_GGUF"
+build/minicpm-o-uya tensors "$MINICPM_O_GGUF" --mmap
+build/minicpm-o-uya qwen3-bind "$MINICPM_O_TEXT_GGUF"
+build/minicpm-o-uya vision-smoke "$MINICPM_O_GGUF" "$MINICPM_O_IMAGE_RAW"
+build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
+build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
+build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
+```
+
+If external smoke fails, the expected next step is to preserve the exact diagnostic, run `audit`, and add the missing dtype/layout/modality binding. Do not treat tiny fixture pass results as production MiniCPM-o compatibility.
