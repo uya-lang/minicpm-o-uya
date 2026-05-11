@@ -48,9 +48,11 @@ use minicpmo.tokenizer.tokenizer_init;
 use minicpmo.tokenizer.tokenizer_load;
 use minicpmo.tokenizer.tokenizer_piece;
 
-@c_import("qwen3_kernels.c", "-O3 -march=native");
+@c_import("qwen3_kernels.c", "-O3 -march=native -pthread", "-pthread");
 
 extern fn qwen3_q8_0_matvec_range_c(dst: &f32, matrix_data: &const byte, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) void;
+extern fn qwen3_q8_0_matvec_parallel_c(dst: &f32, matrix_data: &const byte, x: &const f32, in_dim: usize, out_dim: usize, thread_count: usize) i32;
+extern fn qwen3_q8_0_thread_pool_shutdown_c() void;
 
 const QWEN3_GGUF_MAGIC: u32 = 0x46554747;
 const QWEN3_GGUF_TYPE_UINT32: u32 = 4;
@@ -576,6 +578,7 @@ fn qwen3_matvec_parallel(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: 
     if count < 2 || out_dim < (64 as usize) { return false; }
     if count > QWEN3_MAX_THREADS { count = QWEN3_MAX_THREADS; }
     if count > out_dim { count = out_dim; }
+    if q8 && qwen3_q8_0_matvec_parallel_c(dst, matrix.data, x, in_dim, out_dim, count) != 0 { return true; }
     var tasks: [Qwen3MatvecTask: 64] = [];
     var threads: [pthread_t: 64] = [];
     var launched: [bool: 64] = [];
@@ -1078,6 +1081,7 @@ fn qwen3_runtime_free(runtime: &Qwen3Runtime) void {
     if runtime.rope_cos != null { free(runtime.rope_cos as &void); }
     if runtime.rope_sin != null { free(runtime.rope_sin as &void); }
     if runtime.prompt_ids != null { free(runtime.prompt_ids as &void); }
+    qwen3_q8_0_thread_pool_shutdown_c();
     runtime[0] = qwen3_runtime_init();
 }
 
