@@ -104,10 +104,17 @@ generate-fixture: FORCE build fixtures
 	fi
 
 vision-fixture: FORCE build fixtures
+	$(OUT) vision-preprocess-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_rgb.raw >/tmp/minicpm-o-uya-vision-pre.out
+	grep -q "vision-preprocess: source=uyrg-u8 frames=1 output=2x2x3 tiles=1 placeholders=1 checksum=0xea7fa412" /tmp/minicpm-o-uya-vision-pre.out
+	grep -q "vision-preprocess values\[0..5\]: -1.000000 -0.749019 -0.247058 0.003921 -0.498039 -0.247058" /tmp/minicpm-o-uya-vision-pre.out
+	$(OUT) vision-preprocess-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_image.uyim >/tmp/minicpm-o-uya-vision-manifest.out
+	grep -q "source=uyim-image-manifest frames=1 output=2x2x3 tiles=1 placeholders=1 checksum=0xea7fa412" /tmp/minicpm-o-uya-vision-manifest.out
+	$(OUT) vision-preprocess-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_video.uyvm >/tmp/minicpm-o-uya-video-manifest.out
+	grep -q "source=uyvm-video-manifest frames=2 output=2x2x3 tiles=2 placeholders=2 checksum=0xbc359fc5" /tmp/minicpm-o-uya-video-manifest.out
 	$(OUT) vision-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_image.raw >/tmp/minicpm-o-uya-vision.out
 	grep -q "vision-smoke: PASS" /tmp/minicpm-o-uya-vision.out
 	grep -q "placeholders=1 span=1" /tmp/minicpm-o-uya-vision.out
-	grep -q "vision embedding checksum: 0xbab3d2ad" /tmp/minicpm-o-uya-vision.out
+	grep -q "vision embedding checksum: 0xb5a01b45" /tmp/minicpm-o-uya-vision.out
 	grep -q "diff_l1=" /tmp/minicpm-o-uya-vision.out
 
 minicpmo-audit: build

@@ -223,20 +223,20 @@
 
 ## Phase 11: Vision preprocessing
 
-- [ ] 定义 minimal raw RGB 输入格式。
-- [ ] 实现 resize reference。
-- [ ] 实现 crop/pad。
-- [ ] 实现 normalize。
-- [ ] 实现 patch/tiling 策略。
-- [ ] 实现 position embedding interpolation。
-- [ ] 增加 image manifest。
-- [ ] 增加视频 frame raw sequence manifest。
+- [x] 定义 minimal raw RGB 输入格式。
+- [x] 实现 resize reference。
+- [x] 实现 crop/pad。
+- [x] 实现 normalize。
+- [x] 实现 patch/tiling 策略。
+- [x] 实现 position embedding interpolation。
+- [x] 增加 image manifest。
+- [x] 增加视频 frame raw sequence manifest。
 
 验收标准：
 
-- 固定小图预处理输出 golden。
-- 与官方 processor 的 shape、tile 数、placeholder 数一致。
-- 不依赖 PNG/JPEG/MP4 解码库。
+- [x] 固定小图预处理输出 golden。
+- [x] 与官方 processor 的 shape、tile 数、placeholder 数一致。
+- [x] 不依赖 PNG/JPEG/MP4 解码库。
 
 ## Phase 12: Audio log-mel/encoder smoke
 

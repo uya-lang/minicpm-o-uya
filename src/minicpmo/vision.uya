@@ -38,8 +38,12 @@ use minicpmo.tokenizer.tokenizer_load;
 
 const VISION_GGUF_MAGIC: u32 = 0x46554747;
 const VISION_RAW_MAGIC: u32 = 0x49415955;
+const VISION_RGB_MAGIC: u32 = 0x47525955;
+const VISION_IMAGE_MANIFEST_MAGIC: u32 = 0x4d495955;
+const VISION_VIDEO_MANIFEST_MAGIC: u32 = 0x4d565955;
 const VISION_RAW_VERSION: u32 = 1;
 const VISION_RAW_DTYPE_F32: u32 = 0;
+const VISION_RGB_DTYPE_U8: u32 = 0;
 const VISION_GGUF_TYPE_UINT32: u32 = 4;
 const VISION_GGUF_TYPE_INT32: u32 = 5;
 const VISION_GGUF_TYPE_FLOAT32: u32 = 6;
@@ -51,6 +55,8 @@ const VISION_GGUF_TYPE_FLOAT64: u32 = 12;
 const VISION_MAX_LAYERS: usize = 4;
 const VISION_MAX_PATCHES: usize = 16;
 const VISION_MAX_PIXELS: usize = 1024;
+const VISION_MAX_RGB_BYTES: usize = 12288;
+const VISION_MAX_VIDEO_FRAMES: usize = 4;
 const VISION_MAX_PATCH_DIM: usize = 64;
 const VISION_MAX_HIDDEN: usize = 64;
 const VISION_MAX_FFN: usize = 128;
@@ -73,6 +79,18 @@ export struct VisionConfig {
     llm_hidden_size: u32,
     image_token_id: u32,
     has_image_token_id: bool,
+    preprocess_width: u32,
+    preprocess_height: u32,
+    crop_width: u32,
+    crop_height: u32,
+    tile_width: u32,
+    tile_height: u32,
+    mean_r: f32,
+    mean_g: f32,
+    mean_b: f32,
+    std_r: f32,
+    std_g: f32,
+    std_b: f32,
 }
 
 export struct VisionLayerWeights {
@@ -106,6 +124,25 @@ struct VisionRawImage {
     element_count: usize,
 }
 
+struct VisionRgbImage {
+    width: u32,
+    height: u32,
+    channels: u32,
+    values: [byte: 12288],
+    byte_count: usize,
+}
+
+struct VisionPreprocessStats {
+    source_kind: u32,
+    frame_count: u32,
+    tile_count: u32,
+    placeholder_count: u32,
+    output_width: u32,
+    output_height: u32,
+    output_channels: u32,
+    checksum: u32,
+}
+
 struct VisionStringRead {
     len: u64,
     copied: usize,
@@ -113,7 +150,7 @@ struct VisionStringRead {
 }
 
 export fn vision_config_init() VisionConfig {
-    return VisionConfig{ image_width: 0, image_height: 0, channel_count: 0, patch_size: 0, patch_count: 0, patch_dim: 0, hidden_size: 0, layer_count: 0, head_count: 0, head_dim: 0, intermediate_size: 0, llm_hidden_size: 0, image_token_id: 0, has_image_token_id: false };
+    return VisionConfig{ image_width: 0, image_height: 0, channel_count: 0, patch_size: 0, patch_count: 0, patch_dim: 0, hidden_size: 0, layer_count: 0, head_count: 0, head_dim: 0, intermediate_size: 0, llm_hidden_size: 0, image_token_id: 0, has_image_token_id: false, preprocess_width: 0, preprocess_height: 0, crop_width: 0, crop_height: 0, tile_width: 0, tile_height: 0, mean_r: 0.0, mean_g: 0.0, mean_b: 0.0, std_r: 1.0, std_g: 1.0, std_b: 1.0 };
 }
 
 export fn vision_weights_init() VisionWeights {
@@ -167,6 +204,11 @@ fn vision_skip_array(reader: &BinaryReader, element_type: u32, count: u64) bool 
     return false;
 }
 
+fn vision_f32_from_bits(bits: u32) f32 {
+    const ptr: &const f32 = &bits as &const f32;
+    return ptr[0];
+}
+
 fn vision_apply_u32_metadata(config: &VisionConfig, key: &const byte, value: u32) void {
     if vision_cstr_eq(key, "vision.image_width\0" as &const byte) { config.image_width = value; return; }
     if vision_cstr_eq(key, "vision.image_height\0" as &const byte) { config.image_height = value; return; }
@@ -179,7 +221,22 @@ fn vision_apply_u32_metadata(config: &VisionConfig, key: &const byte, value: u32
     if vision_cstr_eq(key, "vision.attention.head_count\0" as &const byte) { config.head_count = value; return; }
     if vision_cstr_eq(key, "vision.feed_forward_length\0" as &const byte) { config.intermediate_size = value; return; }
     if vision_cstr_eq(key, "vision.projector.output_length\0" as &const byte) { config.llm_hidden_size = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.target_width\0" as &const byte) { config.preprocess_width = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.target_height\0" as &const byte) { config.preprocess_height = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.crop_width\0" as &const byte) { config.crop_width = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.crop_height\0" as &const byte) { config.crop_height = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.tile_width\0" as &const byte) { config.tile_width = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.tile_height\0" as &const byte) { config.tile_height = value; return; }
     if vision_cstr_eq(key, "minicpmo.media.image_token_id\0" as &const byte) { config.image_token_id = value; config.has_image_token_id = true; return; }
+}
+
+fn vision_apply_f32_metadata(config: &VisionConfig, key: &const byte, value: f32) void {
+    if vision_cstr_eq(key, "vision.preprocess.mean_r\0" as &const byte) { config.mean_r = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.mean_g\0" as &const byte) { config.mean_g = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.mean_b\0" as &const byte) { config.mean_b = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.std_r\0" as &const byte) { config.std_r = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.std_g\0" as &const byte) { config.std_g = value; return; }
+    if vision_cstr_eq(key, "vision.preprocess.std_b\0" as &const byte) { config.std_b = value; return; }
 }
 
 fn vision_skip_metadata_value(reader: &BinaryReader, config: &VisionConfig, key: &const byte, value_type: u32) bool {
@@ -199,6 +256,12 @@ fn vision_skip_metadata_value(reader: &BinaryReader, config: &VisionConfig, key:
         var value: u32 = 0;
         if !binary_read_u32_le(reader, &value, "metadata int/uint32 value\0" as &const byte) { return false; }
         vision_apply_u32_metadata(config, key, value);
+        return true;
+    }
+    if value_type == VISION_GGUF_TYPE_FLOAT32 {
+        var bits: u32 = 0;
+        if !binary_read_u32_le(reader, &bits, "metadata float32 value\0" as &const byte) { return false; }
+        vision_apply_f32_metadata(config, key, vision_f32_from_bits(bits));
         return true;
     }
     const elem_size: u64 = vision_scalar_metadata_size(value_type);
@@ -277,6 +340,259 @@ fn vision_raw_load(path: &const byte, image: &VisionRawImage) bool {
     return true;
 }
 
+
+fn vision_rgb_image_init() VisionRgbImage {
+    return VisionRgbImage{ width: 0, height: 0, channels: 0, values: [], byte_count: 0 };
+}
+
+fn vision_preprocess_stats_init() VisionPreprocessStats {
+    return VisionPreprocessStats{ source_kind: 0, frame_count: 0, tile_count: 0, placeholder_count: 0, output_width: 0, output_height: 0, output_channels: 0, checksum: 0 };
+}
+
+fn vision_peek_magic(path: &const byte, out: &u32) bool {
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    if !binary_read_u32_le(&reader, out, "input magic\0" as &const byte) { binary_close(&reader); return false; }
+    binary_close(&reader);
+    return true;
+}
+
+fn vision_rgb_read_from_reader(reader: &BinaryReader, rgb: &VisionRgbImage) bool {
+    rgb[0] = vision_rgb_image_init();
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var dtype: u32 = 0;
+    if !binary_read_u32_le(reader, &magic, "raw RGB magic\0" as &const byte) { return false; }
+    if magic != VISION_RGB_MAGIC { _ = printf("error: raw RGB bad magic; expected UYRG\n"); return false; }
+    if !binary_read_u32_le(reader, &version, "raw RGB version\0" as &const byte) { return false; }
+    if version != VISION_RAW_VERSION { _ = printf("error: raw RGB unsupported version=%u\n", version); return false; }
+    if !binary_read_u32_le(reader, &rgb.width, "raw RGB width\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &rgb.height, "raw RGB height\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &rgb.channels, "raw RGB channels\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &dtype, "raw RGB dtype\0" as &const byte) { return false; }
+    if dtype != VISION_RGB_DTYPE_U8 { _ = printf("error: raw RGB dtype=%u unsupported; only uint8 RGB is supported\n", dtype); return false; }
+    if rgb.channels != 3 { _ = printf("error: raw RGB channels=%u unsupported; expected 3\n", rgb.channels); return false; }
+    const byte_count_u64: u64 = (rgb.width as u64) * (rgb.height as u64) * (rgb.channels as u64);
+    if byte_count_u64 == 0 || byte_count_u64 > VISION_MAX_RGB_BYTES as u64 { _ = printf("error: raw RGB byte_count=%llu exceeds cap=%zu\n", byte_count_u64, VISION_MAX_RGB_BYTES); return false; }
+    rgb.byte_count = byte_count_u64 as usize;
+    return binary_read_exact(reader, &rgb.values[0], rgb.byte_count, "raw RGB payload\0" as &const byte);
+}
+
+fn vision_rgb_load(path: &const byte, rgb: &VisionRgbImage) bool {
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    if !vision_rgb_read_from_reader(&reader, rgb) { binary_close(&reader); return false; }
+    if reader.pos != reader.size { _ = printf("error: raw RGB has trailing bytes=%llu\n", reader.size - reader.pos); binary_close(&reader); return false; }
+    binary_close(&reader);
+    return true;
+}
+
+fn vision_finalize_preprocess_config(config: &VisionConfig) void {
+    if config.channel_count == 0 { config.channel_count = 3; }
+    if config.patch_size == 0 { config.patch_size = 1; }
+    if config.preprocess_width == 0 { config.preprocess_width = config.image_width; }
+    if config.preprocess_height == 0 { config.preprocess_height = config.image_height; }
+    if config.crop_width == 0 { config.crop_width = config.preprocess_width; }
+    if config.crop_height == 0 { config.crop_height = config.preprocess_height; }
+    if config.image_width == 0 { config.image_width = config.crop_width; }
+    if config.image_height == 0 { config.image_height = config.crop_height; }
+    if config.tile_width == 0 { config.tile_width = config.image_width; }
+    if config.tile_height == 0 { config.tile_height = config.image_height; }
+    if config.std_r == 0.0 { config.std_r = 1.0; }
+    if config.std_g == 0.0 { config.std_g = 1.0; }
+    if config.std_b == 0.0 { config.std_b = 1.0; }
+}
+
+fn vision_channel_mean(config: &VisionConfig, channel: u32) f32 {
+    if channel == 0 { return config.mean_r; }
+    if channel == 1 { return config.mean_g; }
+    return config.mean_b;
+}
+
+fn vision_channel_std(config: &VisionConfig, channel: u32) f32 {
+    if channel == 0 { return config.std_r; }
+    if channel == 1 { return config.std_g; }
+    return config.std_b;
+}
+
+fn vision_rgb_u8(rgb: &VisionRgbImage, row: u32, col: u32, channel: u32) byte {
+    const index: usize = (((row * rgb.width + col) * rgb.channels + channel) as usize);
+    return rgb.values[index];
+}
+
+fn vision_resize_rgb_nearest(rgb: &VisionRgbImage, dest: &f32, out_w: u32, out_h: u32) void {
+    var channel: u32 = 0;
+    while channel < 3 {
+        var y: u32 = 0;
+        while y < out_h {
+            const src_y: u32 = (y * rgb.height) / out_h;
+            var x: u32 = 0;
+            while x < out_w {
+                const src_x: u32 = (x * rgb.width) / out_w;
+                const dst_index: usize = (((channel * out_h + y) * out_w + x) as usize);
+                dest[dst_index] = (vision_rgb_u8(rgb, src_y, src_x, channel) as f32) / 255.0;
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        channel = channel + 1;
+    }
+}
+
+fn vision_crop_pad_normalize(config: &VisionConfig, src: &const f32, src_w: u32, src_h: u32, image: &VisionRawImage) void {
+    image.width = config.image_width;
+    image.height = config.image_height;
+    image.channels = config.channel_count;
+    image.element_count = (image.width * image.height * image.channels) as usize;
+    var channel: u32 = 0;
+    while channel < config.channel_count {
+        var y: u32 = 0;
+        while y < image.height {
+            var x: u32 = 0;
+            while x < image.width {
+                var value: f32 = vision_channel_mean(config, channel);
+                var in_bounds: bool = false;
+                var src_y: u32 = 0;
+                var src_x: u32 = 0;
+                if src_h >= image.height {
+                    src_y = y + ((src_h - image.height) / 2);
+                    in_bounds = true;
+                } else {
+                    const pad_top: u32 = (image.height - src_h) / 2;
+                    if y >= pad_top && y < pad_top + src_h { src_y = y - pad_top; in_bounds = true; }
+                }
+                if in_bounds {
+                    if src_w >= image.width {
+                        src_x = x + ((src_w - image.width) / 2);
+                    } else {
+                        const pad_left: u32 = (image.width - src_w) / 2;
+                        if x >= pad_left && x < pad_left + src_w { src_x = x - pad_left; } else { in_bounds = false; }
+                    }
+                }
+                if in_bounds { value = src[((channel * src_h + src_y) * src_w + src_x) as usize]; }
+                const std_value: f32 = vision_channel_std(config, channel);
+                image.values[((channel * image.height + y) * image.width + x) as usize] = (value - vision_channel_mean(config, channel)) / std_value;
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        channel = channel + 1;
+    }
+}
+
+fn vision_compute_tile_count_for_dims(width: u32, height: u32, tile_width: u32, tile_height: u32) u32 {
+    if tile_width == 0 || tile_height == 0 { return 0; }
+    const tiles_x: u32 = (width + tile_width - 1) / tile_width;
+    const tiles_y: u32 = (height + tile_height - 1) / tile_height;
+    return tiles_x * tiles_y;
+}
+
+fn vision_compute_placeholder_count(config: &VisionConfig) u32 {
+    if config.patch_size == 0 { return 0; }
+    return (config.image_width / config.patch_size) * (config.image_height / config.patch_size);
+}
+
+fn vision_preprocess_rgb(config: &VisionConfig, rgb: &VisionRgbImage, image: &VisionRawImage, stats: &VisionPreprocessStats, source_kind: u32, frame_count: u32) bool {
+    vision_finalize_preprocess_config(config);
+    if config.channel_count != 3 { _ = printf("error: raw RGB preprocessing requires vision.channel_count=3 got=%u\n", config.channel_count); return false; }
+    if config.preprocess_width == 0 || config.preprocess_height == 0 || config.image_width == 0 || config.image_height == 0 { _ = printf("error: vision preprocess target shape is incomplete\n"); return false; }
+    const resize_elements: u64 = (config.preprocess_width as u64) * (config.preprocess_height as u64) * (config.channel_count as u64);
+    const output_elements: u64 = (config.image_width as u64) * (config.image_height as u64) * (config.channel_count as u64);
+    if resize_elements > VISION_MAX_PIXELS as u64 || output_elements > VISION_MAX_PIXELS as u64 { _ = printf("error: vision preprocess tensor exceeds cap resize=%llu output=%llu cap=%zu\n", resize_elements, output_elements, VISION_MAX_PIXELS); return false; }
+    var resized: [f32: 1024] = [];
+    image[0] = vision_raw_image_init();
+    vision_resize_rgb_nearest(rgb, &resized[0], config.preprocess_width, config.preprocess_height);
+    vision_crop_pad_normalize(config, &resized[0], config.preprocess_width, config.preprocess_height, image);
+    stats[0] = vision_preprocess_stats_init();
+    stats.source_kind = source_kind;
+    stats.frame_count = frame_count;
+    stats.tile_count = vision_compute_tile_count_for_dims(config.image_width, config.image_height, config.tile_width, config.tile_height);
+    stats.placeholder_count = vision_compute_placeholder_count(config);
+    stats.output_width = image.width;
+    stats.output_height = image.height;
+    stats.output_channels = image.channels;
+    return true;
+}
+
+fn vision_image_manifest_read(path: &const byte, config: &VisionConfig, image: &VisionRawImage, stats: &VisionPreprocessStats) bool {
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var image_count: u32 = 0;
+    if !binary_read_u32_le(&reader, &magic, "image manifest magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != VISION_IMAGE_MANIFEST_MAGIC { _ = printf("error: image manifest bad magic; expected UYIM\n"); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &version, "image manifest version\0" as &const byte) { binary_close(&reader); return false; }
+    if version != VISION_RAW_VERSION { _ = printf("error: image manifest unsupported version=%u\n", version); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &image_count, "image manifest count\0" as &const byte) { binary_close(&reader); return false; }
+    if image_count != 1 { _ = printf("error: image manifest image_count=%u unsupported; expected 1\n", image_count); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &config.preprocess_width, "image manifest target width\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &config.preprocess_height, "image manifest target height\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &config.tile_width, "image manifest tile width\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &config.tile_height, "image manifest tile height\0" as &const byte) { binary_close(&reader); return false; }
+    config.crop_width = config.preprocess_width;
+    config.crop_height = config.preprocess_height;
+    config.image_width = config.crop_width;
+    config.image_height = config.crop_height;
+    var rgb: VisionRgbImage = vision_rgb_image_init();
+    if !vision_rgb_read_from_reader(&reader, &rgb) { binary_close(&reader); return false; }
+    if reader.pos != reader.size { _ = printf("error: image manifest has trailing bytes=%llu\n", reader.size - reader.pos); binary_close(&reader); return false; }
+    const ok: bool = vision_preprocess_rgb(config, &rgb, image, stats, 2, 1);
+    binary_close(&reader);
+    return ok;
+}
+
+fn vision_video_manifest_first_frame(path: &const byte, config: &VisionConfig, image: &VisionRawImage, stats: &VisionPreprocessStats) bool {
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var frame_count: u32 = 0;
+    if !binary_read_u32_le(&reader, &magic, "video manifest magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != VISION_VIDEO_MANIFEST_MAGIC { _ = printf("error: video manifest bad magic; expected UYVM\n"); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &version, "video manifest version\0" as &const byte) { binary_close(&reader); return false; }
+    if version != VISION_RAW_VERSION { _ = printf("error: video manifest unsupported version=%u\n", version); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &frame_count, "video manifest frame count\0" as &const byte) { binary_close(&reader); return false; }
+    if frame_count == 0 || frame_count > VISION_MAX_VIDEO_FRAMES as u32 { _ = printf("error: video manifest frame_count=%u exceeds cap=%zu\n", frame_count, VISION_MAX_VIDEO_FRAMES); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &config.preprocess_width, "video manifest target width\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &config.preprocess_height, "video manifest target height\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &config.tile_width, "video manifest tile width\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &config.tile_height, "video manifest tile height\0" as &const byte) { binary_close(&reader); return false; }
+    config.crop_width = config.preprocess_width;
+    config.crop_height = config.preprocess_height;
+    config.image_width = config.crop_width;
+    config.image_height = config.crop_height;
+    var rgb: VisionRgbImage = vision_rgb_image_init();
+    if !vision_rgb_read_from_reader(&reader, &rgb) { binary_close(&reader); return false; }
+    const ok: bool = vision_preprocess_rgb(config, &rgb, image, stats, 3, frame_count);
+    binary_close(&reader);
+    return ok;
+}
+
+fn vision_load_input_image(path: &const byte, config: &VisionConfig, image: &VisionRawImage, stats: &VisionPreprocessStats) bool {
+    var magic: u32 = 0;
+    if !vision_peek_magic(path, &magic) { return false; }
+    stats[0] = vision_preprocess_stats_init();
+    if magic == VISION_RAW_MAGIC {
+        if !vision_raw_load(path, image) { return false; }
+        stats.source_kind = 0;
+        stats.frame_count = 1;
+        stats.output_width = image.width;
+        stats.output_height = image.height;
+        stats.output_channels = image.channels;
+        return true;
+    }
+    if magic == VISION_RGB_MAGIC {
+        var rgb: VisionRgbImage = vision_rgb_image_init();
+        if !vision_rgb_load(path, &rgb) { return false; }
+        return vision_preprocess_rgb(config, &rgb, image, stats, 1, 1);
+    }
+    if magic == VISION_IMAGE_MANIFEST_MAGIC { return vision_image_manifest_read(path, config, image, stats); }
+    if magic == VISION_VIDEO_MANIFEST_MAGIC { return vision_video_manifest_first_frame(path, config, image, stats); }
+    _ = printf("error: unsupported vision input magic=0x%x\n", magic);
+    return false;
+}
+
 fn vision_build_layer_name(layer: u32, suffix: &const byte, dest: &byte, dest_cap: usize) bool {
     if dest_cap < 40 { return false; }
     _ = sprintf(dest as *byte, "vision.blk.%u.%s", layer, suffix);
@@ -335,11 +651,47 @@ fn vision_check_matrix(view: &TensorView, in_dim: u32, out_dim: u32, label: &con
     return false;
 }
 
+
+fn vision_check_position_embedding(view: &TensorView, hidden: u32, label: &const byte) bool {
+    if !vision_check_dtype(view, label) { return false; }
+    if view.n_dims == 2 && view.shape[0] > 0 && view.shape[0] <= VISION_MAX_PATCHES as u64 && view.shape[1] == hidden as u64 { return true; }
+    _ = printf("error: vision bind tensor=%s label=%s bad shape got=", &view.name[0], label);
+    vision_print_shape(view);
+    _ = printf(" expected=[1..%zu,%u]\n", VISION_MAX_PATCHES, hidden);
+    return false;
+}
+
+fn vision_sqrt_floor_u32(value: u32) u32 {
+    var root: u32 = 0;
+    while (root + 1) * (root + 1) <= value { root = root + 1; }
+    return root;
+}
+
+fn vision_position_value(config: &VisionConfig, weights: &VisionWeights, patch_index: usize, hidden_index: usize) f32 {
+    const source_count: usize = weights.position_embd.shape[0] as usize;
+    const target_count: usize = config.patch_count as usize;
+    var source_index: usize = patch_index;
+    if source_count != target_count {
+        const source_grid: u32 = vision_sqrt_floor_u32(source_count as u32);
+        const target_grid: u32 = vision_sqrt_floor_u32(target_count as u32);
+        if source_grid * source_grid == source_count as u32 && target_grid * target_grid == target_count as u32 && target_grid > 0 {
+            const target_row: u32 = (patch_index as u32) / target_grid;
+            const target_col: u32 = (patch_index as u32) % target_grid;
+            const source_row: u32 = (target_row * source_grid) / target_grid;
+            const source_col: u32 = (target_col * source_grid) / target_grid;
+            source_index = (source_row * source_grid + source_col) as usize;
+        } else {
+            source_index = (patch_index * source_count) / target_count;
+        }
+    }
+    return qwen3_tensor_get(weights.position_embd, source_index * (config.hidden_size as usize) + hidden_index);
+}
+
 export fn vision_complete_config(config: &VisionConfig, table: &TensorWeightTable, image: &VisionRawImage) bool {
     if config.image_width == 0 { config.image_width = image.width; }
     if config.image_height == 0 { config.image_height = image.height; }
     if config.channel_count == 0 { config.channel_count = image.channels; }
-    if config.patch_size == 0 { config.patch_size = 1; }
+    vision_finalize_preprocess_config(config);
     if config.head_count == 0 { config.head_count = 1; }
     if !config.has_image_token_id { config.image_token_id = 12; }
     if config.image_width != image.width || config.image_height != image.height || config.channel_count != image.channels {
@@ -383,7 +735,7 @@ export fn vision_bind_weights(table: &TensorWeightTable, config: &VisionConfig, 
     weights.patch_bias = tensor_lookup(table, "vision.patch_embd.bias\0" as &const byte);
     if weights.patch_bias != null && !vision_check_vec(weights.patch_bias, config.hidden_size, "patch bias\0" as &const byte) { return false; }
     weights.position_embd = tensor_lookup(table, "vision.position_embd.weight\0" as &const byte);
-    if weights.position_embd == null || !vision_check_matrix(weights.position_embd, config.patch_count, config.hidden_size, "position embedding\0" as &const byte) { return false; }
+    if weights.position_embd == null || !vision_check_position_embedding(weights.position_embd, config.hidden_size, "position embedding\0" as &const byte) { return false; }
     weights.output_norm = tensor_lookup(table, "vision.output_norm.weight\0" as &const byte);
     if weights.output_norm == null || !vision_check_vec(weights.output_norm, config.hidden_size, "output norm\0" as &const byte) { return false; }
     weights.resampler = tensor_lookup(table, "vision.resampler.weight\0" as &const byte);
@@ -474,7 +826,7 @@ fn vision_patch_embedding(config: &VisionConfig, weights: &VisionWeights, image:
             var hidden_index: usize = 0;
             while hidden_index < config.hidden_size as usize {
                 if weights.patch_bias != null { states[patch_index * VISION_MAX_HIDDEN + hidden_index] = states[patch_index * VISION_MAX_HIDDEN + hidden_index] + qwen3_tensor_get(weights.patch_bias, hidden_index); }
-                states[patch_index * VISION_MAX_HIDDEN + hidden_index] = states[patch_index * VISION_MAX_HIDDEN + hidden_index] + qwen3_tensor_get(weights.position_embd, patch_index * (config.hidden_size as usize) + hidden_index);
+                states[patch_index * VISION_MAX_HIDDEN + hidden_index] = states[patch_index * VISION_MAX_HIDDEN + hidden_index] + vision_position_value(config, weights, patch_index, hidden_index);
                 hidden_index = hidden_index + 1;
             }
             patch_index = patch_index + 1;
@@ -648,16 +1000,100 @@ fn vision_logits_l1(a: &const f32, b: &const f32, count: usize) f32 {
     return sum;
 }
 
-export fn vision_smoke_cli(model_path: &const byte, image_path: &const byte) i32 {
+
+fn vision_preprocess_source_label(kind: u32) &const byte {
+    if kind == 0 { return "uyai-f32\0" as &const byte; }
+    if kind == 1 { return "uyrg-u8\0" as &const byte; }
+    if kind == 2 { return "uyim-image-manifest\0" as &const byte; }
+    if kind == 3 { return "uyvm-video-manifest\0" as &const byte; }
+    return "unknown\0" as &const byte;
+}
+
+fn vision_preprocess_video_manifest_cli(model_path: &const byte, input_path: &const byte) i32 {
+    var config: VisionConfig = vision_config_init();
+    if !vision_config_load_metadata(model_path, &config) { return 1; }
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(input_path, &reader) { return 1; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var frame_count: u32 = 0;
+    if !binary_read_u32_le(&reader, &magic, "video manifest magic\0" as &const byte) { binary_close(&reader); return 1; }
+    if magic != VISION_VIDEO_MANIFEST_MAGIC { _ = printf("error: video manifest bad magic; expected UYVM\n"); binary_close(&reader); return 1; }
+    if !binary_read_u32_le(&reader, &version, "video manifest version\0" as &const byte) { binary_close(&reader); return 1; }
+    if version != VISION_RAW_VERSION { _ = printf("error: video manifest unsupported version=%u\n", version); binary_close(&reader); return 1; }
+    if !binary_read_u32_le(&reader, &frame_count, "video manifest frame count\0" as &const byte) { binary_close(&reader); return 1; }
+    if frame_count == 0 || frame_count > VISION_MAX_VIDEO_FRAMES as u32 { _ = printf("error: video manifest frame_count=%u exceeds cap=%zu\n", frame_count, VISION_MAX_VIDEO_FRAMES); binary_close(&reader); return 1; }
+    if !binary_read_u32_le(&reader, &config.preprocess_width, "video manifest target width\0" as &const byte) { binary_close(&reader); return 1; }
+    if !binary_read_u32_le(&reader, &config.preprocess_height, "video manifest target height\0" as &const byte) { binary_close(&reader); return 1; }
+    if !binary_read_u32_le(&reader, &config.tile_width, "video manifest tile width\0" as &const byte) { binary_close(&reader); return 1; }
+    if !binary_read_u32_le(&reader, &config.tile_height, "video manifest tile height\0" as &const byte) { binary_close(&reader); return 1; }
+    config.crop_width = config.preprocess_width;
+    config.crop_height = config.preprocess_height;
+    config.image_width = config.crop_width;
+    config.image_height = config.crop_height;
+    var frame_index: u32 = 0;
+    var total_tiles: u32 = 0;
+    var total_placeholders: u32 = 0;
+    var combined: u32 = 2166136261;
+    var last_image: VisionRawImage = vision_raw_image_init();
+    while frame_index < frame_count {
+        var rgb: VisionRgbImage = vision_rgb_image_init();
+        var image: VisionRawImage = vision_raw_image_init();
+        var stats: VisionPreprocessStats = vision_preprocess_stats_init();
+        if !vision_rgb_read_from_reader(&reader, &rgb) { binary_close(&reader); return 1; }
+        if !vision_preprocess_rgb(&config, &rgb, &image, &stats, 3, frame_count) { binary_close(&reader); return 1; }
+        const checksum: u32 = vision_checksum(&image.values[0], image.element_count);
+        combined = (combined ^ checksum) * (16777619 as u32);
+        total_tiles = total_tiles + stats.tile_count;
+        total_placeholders = total_placeholders + stats.placeholder_count;
+        last_image.width = image.width;
+        last_image.height = image.height;
+        last_image.channels = image.channels;
+        last_image.element_count = image.element_count;
+        var copy_index: usize = 0;
+        while copy_index < image.element_count { last_image.values[copy_index] = image.values[copy_index]; copy_index = copy_index + 1; }
+        frame_index = frame_index + 1;
+    }
+    if reader.pos != reader.size { _ = printf("error: video manifest has trailing bytes=%llu\n", reader.size - reader.pos); binary_close(&reader); return 1; }
+    binary_close(&reader);
+    _ = printf("vision-preprocess: source=uyvm-video-manifest frames=%u output=%ux%ux%u tiles=%u placeholders=%u checksum=0x%x\n", frame_count, last_image.width, last_image.height, last_image.channels, total_tiles, total_placeholders, combined);
+    _ = printf("vision-preprocess values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", last_image.values[0] as f64, last_image.values[1] as f64, last_image.values[2] as f64, last_image.values[3] as f64, last_image.values[4] as f64, last_image.values[5] as f64);
+    _ = printf("vision-preprocess: PASS\n");
+    return 0;
+}
+
+export fn vision_preprocess_smoke_cli(model_path: &const byte, input_path: &const byte) i32 {
+    var magic: u32 = 0;
+    if !vision_peek_magic(input_path, &magic) { return 1; }
+    if magic == VISION_VIDEO_MANIFEST_MAGIC { return vision_preprocess_video_manifest_cli(model_path, input_path); }
+    var config: VisionConfig = vision_config_init();
+    if !vision_config_load_metadata(model_path, &config) { return 1; }
     var image: VisionRawImage = vision_raw_image_init();
-    if !vision_raw_load(image_path, &image) { return 1; }
+    var stats: VisionPreprocessStats = vision_preprocess_stats_init();
+    if !vision_load_input_image(input_path, &config, &image, &stats) { return 1; }
+    const checksum: u32 = vision_checksum(&image.values[0], image.element_count);
+    stats.checksum = checksum;
+    if stats.tile_count == 0 { stats.tile_count = vision_compute_tile_count_for_dims(image.width, image.height, config.tile_width, config.tile_height); }
+    if stats.placeholder_count == 0 { stats.placeholder_count = vision_compute_placeholder_count(&config); }
+    _ = printf("vision-preprocess: source=%s frames=%u output=%ux%ux%u tiles=%u placeholders=%u checksum=0x%x\n", vision_preprocess_source_label(stats.source_kind), stats.frame_count, image.width, image.height, image.channels, stats.tile_count, stats.placeholder_count, checksum);
+    _ = printf("vision-preprocess values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", image.values[0] as f64, image.values[1] as f64, image.values[2] as f64, image.values[3] as f64, image.values[4] as f64, image.values[5] as f64);
+    _ = printf("vision-preprocess: PASS\n");
+    return 0;
+}
+
+export fn vision_smoke_cli(model_path: &const byte, image_path: &const byte) i32 {
     var vision_config: VisionConfig = vision_config_init();
     if !vision_config_load_metadata(model_path, &vision_config) { return 1; }
+    var image: VisionRawImage = vision_raw_image_init();
+    var preprocess_stats: VisionPreprocessStats = vision_preprocess_stats_init();
+    if !vision_load_input_image(image_path, &vision_config, &image, &preprocess_stats) { return 1; }
     var qwen_config: Qwen3Config = qwen3_config_init();
     if !qwen3_config_load_metadata(model_path, &qwen_config) { return 1; }
     var table: TensorWeightTable = tensor_table_init();
     if !tensor_weight_table_load(model_path, &table) { return 1; }
     if !vision_complete_config(&vision_config, &table, &image) { return 1; }
+    if preprocess_stats.tile_count == 0 { preprocess_stats.tile_count = vision_compute_tile_count_for_dims(vision_config.image_width, vision_config.image_height, vision_config.tile_width, vision_config.tile_height); }
+    preprocess_stats.placeholder_count = vision_config.patch_count;
     if !qwen3_complete_config_from_tensors(&qwen_config, &table) { return 1; }
     if qwen_config.hidden_size != vision_config.llm_hidden_size { _ = printf("error: vision projector output=%u does not match qwen hidden=%u\n", vision_config.llm_hidden_size, qwen_config.hidden_size); return 1; }
     if !qwen3_check_forward_caps(&qwen_config) { return 1; }
@@ -690,6 +1126,7 @@ export fn vision_smoke_cli(model_path: &const byte, image_path: &const byte) i32
     const image_logits_checksum: u32 = vision_checksum(&logits_image[0], qwen_config.vocab_size as usize);
     const text_logits_checksum: u32 = vision_checksum(&logits_text[0], qwen_config.vocab_size as usize);
     _ = printf("vision raw: width=%u height=%u channels=%u dtype=f32 elements=%zu\n", image.width, image.height, image.channels, image.element_count);
+    _ = printf("vision preprocess: source=%u frames=%u output=%ux%ux%u tiles=%u placeholders=%u\n", preprocess_stats.source_kind, preprocess_stats.frame_count, preprocess_stats.output_width, preprocess_stats.output_height, preprocess_stats.output_channels, preprocess_stats.tile_count, preprocess_stats.placeholder_count);
     _ = printf("vision config: patch=%u patch_dim=%u patches=%u hidden=%u layers=%u heads=%u ffn=%u llm_hidden=%u image_token=%u\n", vision_config.patch_size, vision_config.patch_dim, vision_config.patch_count, vision_config.hidden_size, vision_config.layer_count, vision_config.head_count, vision_config.intermediate_size, vision_config.llm_hidden_size, vision_config.image_token_id);
     _ = printf("vision bind: patch=%s pos=%s resampler=%s projector=%s layers=%u\n", &vision_weights.patch_embd.name[0], &vision_weights.position_embd.name[0], &vision_weights.resampler.name[0], &vision_weights.projector.name[0], vision_weights.layer_count);
     _ = printf("vision-smoke prompt_tokens:");

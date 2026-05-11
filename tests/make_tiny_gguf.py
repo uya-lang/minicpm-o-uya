@@ -74,11 +74,13 @@ def pack_tensor_values(name: str, dims: list[int], ggml_type: int) -> bytes:
     elif name == "vision.patch_embd.weight":
         for col in range(dims[1]):
             for row in range(dims[0]):
-                values.append(1.0 if row == col else 0.0)
+                values.append(0.5 if (row % dims[1]) == col else 0.0)
     elif name == "vision.patch_embd.bias":
         values = [0.0] * elements
     elif name == "vision.position_embd.weight":
-        values = [0.05, 0.10, 0.15, 0.20]
+        for pos in range(dims[0]):
+            for col in range(dims[1]):
+                values.append(0.05 * (pos + 1) * (col + 1))
     elif name == "vision.output_norm.weight":
         values = [1.0] * elements
     elif name == "vision.resampler.weight":
@@ -202,8 +204,20 @@ def main() -> None:
         metadata_f32("qwen3.rope.freq_base", 1000000.0),
         metadata_u32("vision.image_width", 2),
         metadata_u32("vision.image_height", 2),
-        metadata_u32("vision.channel_count", 1),
+        metadata_u32("vision.channel_count", 3),
         metadata_u32("vision.patch_size", 2),
+        metadata_u32("vision.preprocess.target_width", 2),
+        metadata_u32("vision.preprocess.target_height", 2),
+        metadata_u32("vision.preprocess.crop_width", 2),
+        metadata_u32("vision.preprocess.crop_height", 2),
+        metadata_u32("vision.preprocess.tile_width", 2),
+        metadata_u32("vision.preprocess.tile_height", 2),
+        metadata_f32("vision.preprocess.mean_r", 0.5),
+        metadata_f32("vision.preprocess.mean_g", 0.5),
+        metadata_f32("vision.preprocess.mean_b", 0.5),
+        metadata_f32("vision.preprocess.std_r", 0.5),
+        metadata_f32("vision.preprocess.std_g", 0.5),
+        metadata_f32("vision.preprocess.std_b", 0.5),
         metadata_u32("vision.embedding_length", 4),
         metadata_u32("vision.siglip2.block_count", 1),
         metadata_u32("vision.attention.head_count", 1),
@@ -246,9 +260,9 @@ def main() -> None:
         ("blk.0.ffn_down.weight", [16, 8], GGML_TYPE_F16),
     ]
     branch_tensor_specs = [
-        ("vision.patch_embd.weight", [4, 4], GGML_TYPE_F32),
+        ("vision.patch_embd.weight", [12, 4], GGML_TYPE_F32),
         ("vision.patch_embd.bias", [4], GGML_TYPE_F32),
-        ("vision.position_embd.weight", [1, 4], GGML_TYPE_F32),
+        ("vision.position_embd.weight", [4, 4], GGML_TYPE_F32),
         ("vision.blk.0.attn_norm.weight", [4], GGML_TYPE_F32),
         ("vision.blk.0.attn_q.weight", [4, 4], GGML_TYPE_F32),
         ("vision.blk.0.attn_k.weight", [4, 4], GGML_TYPE_F32),
@@ -288,9 +302,26 @@ def main() -> None:
     (out_dir / "tiny.gguf").write_bytes(fixture)
     (out_dir / "tiny.gguf.part").write_bytes(fixture[:48])
     (out_dir / "tiny_data_truncated.gguf").write_bytes(fixture[:-17])
-    tiny_image = struct.pack("<IIIIII", 0x49415955, 1, 2, 2, 1, 0)
-    tiny_image += b"".join(struct.pack("<f", value) for value in [0.25, 0.5, 0.75, 1.0])
+    rgb_pixels = bytes([
+        0, 64, 128, 32, 96, 160, 64, 128, 192,
+        96, 160, 224, 128, 192, 255, 160, 224, 32,
+    ])
+    rgb_frame_b = bytes((value + 17) % 256 for value in rgb_pixels)
+    tiny_rgb = struct.pack("<IIIIII", 0x47525955, 1, 3, 2, 3, 0) + rgb_pixels
+    tiny_rgb_b = struct.pack("<IIIIII", 0x47525955, 1, 3, 2, 3, 0) + rgb_frame_b
+    (out_dir / "tiny_rgb.raw").write_bytes(tiny_rgb)
+    tiny_image_values = [
+        -1.0, -0.7490196078431373, -0.24705882352941178, 0.0039215686274509665,
+        -0.4980392156862745, -0.24705882352941178, 0.2549019607843137, 0.5058823529411764,
+        0.0039215686274509665, 0.2549019607843137, 0.7568627450980392, 1.0,
+    ]
+    tiny_image = struct.pack("<IIIIII", 0x49415955, 1, 2, 2, 3, 0)
+    tiny_image += b"".join(struct.pack("<f", value) for value in tiny_image_values)
     (out_dir / "tiny_image.raw").write_bytes(tiny_image)
+    tiny_image_manifest = struct.pack("<IIIIIII", 0x4D495955, 1, 1, 2, 2, 2, 2) + tiny_rgb
+    (out_dir / "tiny_image.uyim").write_bytes(tiny_image_manifest)
+    tiny_video_manifest = struct.pack("<IIIIIII", 0x4D565955, 1, 2, 2, 2, 2, 2) + tiny_rgb + tiny_rgb_b
+    (out_dir / "tiny_video.uyvm").write_bytes(tiny_video_manifest)
 
     bad_tensor = tensor_info("mystery.branch.weight", [4], 63, 0)
     bad_directory = struct.pack("<IIQQ", 0x46554747, 3, 1, 0) + bad_tensor

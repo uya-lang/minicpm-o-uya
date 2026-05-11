@@ -9,7 +9,7 @@ audio input, speech output, and finally streaming omni chat.
 
 ## Status
 
-Phase 10 is implemented: `inspect`, `audit`, tokenizer CLI, tensor weight-table/mmap inspection, Qwen3 config/weight binding, tiny Qwen3 text-only generation, sampler controls, text-only chat REPL, and `vision-smoke` raw tensor image injection are available.
+Phase 11 is implemented: `inspect`, `audit`, tokenizer CLI, tensor weight-table/mmap inspection, Qwen3 config/weight binding, tiny Qwen3 text-only generation, sampler controls, text-only chat REPL, `vision-smoke`, and `vision-preprocess-smoke` raw RGB/image/video-manifest preprocessing are available.
 
 ## Goals
 
@@ -36,6 +36,7 @@ build/minicpm-o-uya quant-smoke
 MINICPM_O_GGUF=/path/to/model.gguf make minicpmo-audit
 build/minicpm-o-uya generate /path/to/model.gguf "hello"
 build/minicpm-o-uya vision-smoke /path/to/model.gguf /path/to/image.raw
+build/minicpm-o-uya vision-preprocess-smoke /path/to/model.gguf /path/to/image.rgb
 build/minicpm-o-uya audio-smoke /path/to/model.gguf /path/to/audio.raw
 build/minicpm-o-uya chat /path/to/model.gguf
 ```
@@ -57,8 +58,9 @@ build/minicpm-o-uya format-chat tests/fixtures/tiny.gguf "<image> hello"
 build/minicpm-o-uya tensors tests/fixtures/tiny.gguf --mmap
 build/minicpm-o-uya qwen3-bind tests/fixtures/tiny.gguf
 build/minicpm-o-uya vision-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_image.raw
+build/minicpm-o-uya vision-preprocess-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_rgb.raw
 build/minicpm-o-uya kernels-smoke
 build/minicpm-o-uya quant-smoke
 ```
 
-`tests/make_tiny_gguf.py` generates deterministic GGUF fixtures for inspect/audit plus `tiny_image.raw` for vision smoke, including a truncated `.part` file and an intentionally unsupported schema for diagnostics.
+`tests/make_tiny_gguf.py` generates deterministic GGUF fixtures for inspect/audit plus `tiny_image.raw`, `tiny_rgb.raw`, `tiny_image.uyim`, and `tiny_video.uyvm` for vision smoke/preprocessing, including a truncated `.part` file and an intentionally unsupported schema for diagnostics.

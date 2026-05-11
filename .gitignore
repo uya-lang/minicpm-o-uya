@@ -28,6 +28,8 @@ build/
 *.pth
 *.onnx
 *.raw
+*.uyim
+*.uyvm
 *.wav
 *.mp3
 *.mp4

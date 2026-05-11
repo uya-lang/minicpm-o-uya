@@ -12,6 +12,7 @@ use minicpmo.tokenizer.tokenizer_encode_cli;
 use minicpmo.tokenizer.tokenizer_format_chat_cli;
 use minicpmo.tokenizer.tokenizer_piece_cli;
 use minicpmo.tensor.tensor_table_cli;
+use minicpmo.vision.vision_preprocess_smoke_cli;
 use minicpmo.vision.vision_smoke_cli;
 
 fn print_help() void {
@@ -28,12 +29,13 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya tensors <model.gguf> [--mmap]\n");
     _ = printf("  minicpm-o-uya qwen3-bind <model.gguf>\n");
     _ = printf("  minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID]\n");
-    _ = printf("  minicpm-o-uya vision-smoke <model.gguf> <image.raw>\n");
+    _ = printf("  minicpm-o-uya vision-smoke <model.gguf> <image.raw|image.rgb|manifest>\n");
+    _ = printf("  minicpm-o-uya vision-preprocess-smoke <model.gguf> <image.rgb|manifest>\n");
     _ = printf("  minicpm-o-uya chat <model.gguf>\n");
     _ = printf("  minicpm-o-uya kernels-smoke\n");
     _ = printf("  minicpm-o-uya quant-smoke\n");
     _ = printf("\n");
-    _ = printf("Status: GGUF inspect/audit, tokenizer, tensor/Qwen3 binding, text generation/chat, vision raw tensor smoke, scalar kernels, and quant smoke are implemented.\n");
+    _ = printf("Status: GGUF inspect/audit, tokenizer, tensor/Qwen3 binding, text generation/chat, vision raw/preprocess smoke, scalar kernels, and quant smoke are implemented.\n");
 }
 
 export extern fn main(argc: i32, argv: & &byte) i32 {
@@ -116,10 +118,17 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
     }
     if strcmp(argv[1] as *const byte, "vision-smoke\0" as *const byte) == 0 {
         if argc != 4 {
-            _ = printf("usage: minicpm-o-uya vision-smoke <model.gguf> <image.raw>\n");
+            _ = printf("usage: minicpm-o-uya vision-smoke <model.gguf> <image.raw|image.rgb|manifest>\n");
             return 1;
         }
         return vision_smoke_cli(argv[2] as &const byte, argv[3] as &const byte);
+    }
+    if strcmp(argv[1] as *const byte, "vision-preprocess-smoke\0" as *const byte) == 0 {
+        if argc != 4 {
+            _ = printf("usage: minicpm-o-uya vision-preprocess-smoke <model.gguf> <image.rgb|manifest>\n");
+            return 1;
+        }
+        return vision_preprocess_smoke_cli(argv[2] as &const byte, argv[3] as &const byte);
     }
     if strcmp(argv[1] as *const byte, "tensors\0" as *const byte) == 0 {
         if argc != 3 && argc != 4 {
