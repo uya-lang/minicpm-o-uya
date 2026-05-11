@@ -521,3 +521,635 @@ export fn inspect_gguf(path: &const byte) i32 {
     binary_close(&reader);
     return 0;
 }
+
+struct AuditStats {
+    metadata_type_counts: [u64: 13],
+    metadata_unknown_type_count: u64,
+    array_element_type_counts: [u64: 13],
+    array_unknown_element_type_count: u64,
+    dtype_counts: [u64: 64],
+    dtype_overflow_count: u64,
+    unknown_dtype_count: u64,
+    first_unknown_dtype: u32,
+    root_tensor_count: u64,
+    text_tensor_count: u64,
+    vision_tensor_count: u64,
+    audio_tensor_count: u64,
+    speech_tensor_count: u64,
+    unknown_tensor_count: u64,
+    first_unknown_tensor: [byte: 257],
+    tensor_data_warning_count: u64,
+    has_tokenizer_metadata: bool,
+    has_tokenizer_tokens: bool,
+    has_special_token_metadata: bool,
+    has_media_placeholder_metadata: bool,
+    has_chat_template: bool,
+    has_qwen3_metadata: bool,
+    has_qwen_metadata: bool,
+    has_text_metadata: bool,
+    has_vision_metadata: bool,
+    has_audio_metadata: bool,
+    has_speech_metadata: bool,
+    has_token_embd_tensor: bool,
+    has_output_tensor: bool,
+    has_text_tensor: bool,
+    has_vision_tensor: bool,
+    has_audio_tensor: bool,
+    has_speech_tensor: bool,
+}
+
+fn audit_stats_init() AuditStats {
+    return AuditStats{
+        metadata_type_counts: [],
+        metadata_unknown_type_count: 0,
+        array_element_type_counts: [],
+        array_unknown_element_type_count: 0,
+        dtype_counts: [],
+        dtype_overflow_count: 0,
+        unknown_dtype_count: 0,
+        first_unknown_dtype: 0,
+        root_tensor_count: 0,
+        text_tensor_count: 0,
+        vision_tensor_count: 0,
+        audio_tensor_count: 0,
+        speech_tensor_count: 0,
+        unknown_tensor_count: 0,
+        first_unknown_tensor: [],
+        tensor_data_warning_count: 0,
+        has_tokenizer_metadata: false,
+        has_tokenizer_tokens: false,
+        has_special_token_metadata: false,
+        has_media_placeholder_metadata: false,
+        has_chat_template: false,
+        has_qwen3_metadata: false,
+        has_qwen_metadata: false,
+        has_text_metadata: false,
+        has_vision_metadata: false,
+        has_audio_metadata: false,
+        has_speech_metadata: false,
+        has_token_embd_tensor: false,
+        has_output_tensor: false,
+        has_text_tensor: false,
+        has_vision_tensor: false,
+        has_audio_tensor: false,
+        has_speech_tensor: false,
+    };
+}
+
+fn ascii_lower(c: byte) byte {
+    if c >= 65 && c <= 90 {
+        return c + 32;
+    }
+    return c;
+}
+
+fn cstr_len(s: &const byte) usize {
+    var len: usize = 0;
+    while s[len] != 0 {
+        len = len + 1;
+    }
+    return len;
+}
+
+fn cstr_contains_ci(haystack: &const byte, needle: &const byte) bool {
+    const needle_len: usize = cstr_len(needle);
+    if needle_len == 0 {
+        return true;
+    }
+    const haystack_len: usize = cstr_len(haystack);
+    if needle_len > haystack_len {
+        return false;
+    }
+    var i: usize = 0;
+    while i <= haystack_len - needle_len {
+        var j: usize = 0;
+        var matched: bool = true;
+        while j < needle_len {
+            if ascii_lower(haystack[i + j]) != ascii_lower(needle[j]) {
+                matched = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if matched {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn cstr_starts_with_ci(value: &const byte, prefix: &const byte) bool {
+    const prefix_len: usize = cstr_len(prefix);
+    const value_len: usize = cstr_len(value);
+    if prefix_len > value_len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < prefix_len {
+        if ascii_lower(value[i]) != ascii_lower(prefix[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn copy_cstr(dest: &byte, dest_cap: usize, src: &const byte) void {
+    if dest_cap == 0 {
+        return;
+    }
+    var i: usize = 0;
+    while i + 1 < dest_cap && src[i] != 0 {
+        dest[i] = src[i];
+        i = i + 1;
+    }
+    dest[i] = 0;
+}
+
+fn audit_mark_type(stats: &AuditStats, value_type: u32) void {
+    if value_type < 13 {
+        stats.metadata_type_counts[value_type as usize] = stats.metadata_type_counts[value_type as usize] + 1;
+    } else {
+        stats.metadata_unknown_type_count = stats.metadata_unknown_type_count + 1;
+    }
+}
+
+fn audit_mark_array_element_type(stats: &AuditStats, value_type: u32) void {
+    if value_type < 13 {
+        stats.array_element_type_counts[value_type as usize] = stats.array_element_type_counts[value_type as usize] + 1;
+    } else {
+        stats.array_unknown_element_type_count = stats.array_unknown_element_type_count + 1;
+    }
+}
+
+fn audit_mark_metadata_signal(stats: &AuditStats, key: &const byte, value: &const byte, has_value: bool) void {
+    if cstr_contains_ci(key, "tokenizer\0" as &const byte) {
+        stats.has_tokenizer_metadata = true;
+    }
+    if cstr_contains_ci(key, "tokenizer.ggml.tokens\0" as &const byte) || cstr_contains_ci(key, "tokenizer.model\0" as &const byte) || cstr_contains_ci(key, "tokenizer.ggml.merges\0" as &const byte) {
+        stats.has_tokenizer_tokens = true;
+    }
+    if cstr_contains_ci(key, "chat_template\0" as &const byte) {
+        stats.has_chat_template = true;
+        stats.has_special_token_metadata = true;
+    }
+    if cstr_contains_ci(key, "special\0" as &const byte) || cstr_contains_ci(key, "added\0" as &const byte) || cstr_contains_ci(key, "bos\0" as &const byte) || cstr_contains_ci(key, "eos\0" as &const byte) || cstr_contains_ci(key, "pad\0" as &const byte) || cstr_contains_ci(key, "unk\0" as &const byte) {
+        stats.has_special_token_metadata = true;
+    }
+    if cstr_contains_ci(key, "image_token\0" as &const byte) || cstr_contains_ci(key, "audio_token\0" as &const byte) || cstr_contains_ci(key, "video_token\0" as &const byte) || cstr_contains_ci(key, "media\0" as &const byte) || cstr_contains_ci(key, "placeholder\0" as &const byte) {
+        stats.has_media_placeholder_metadata = true;
+        stats.has_special_token_metadata = true;
+    }
+
+    if cstr_contains_ci(key, "qwen3\0" as &const byte) {
+        stats.has_qwen3_metadata = true;
+        stats.has_qwen_metadata = true;
+        stats.has_text_metadata = true;
+    }
+    if cstr_contains_ci(key, "qwen\0" as &const byte) || cstr_contains_ci(key, "llm\0" as &const byte) || cstr_contains_ci(key, "text\0" as &const byte) || cstr_contains_ci(key, "attention\0" as &const byte) || cstr_contains_ci(key, "rope\0" as &const byte) {
+        stats.has_qwen_metadata = true;
+        stats.has_text_metadata = true;
+    }
+    if cstr_contains_ci(key, "vision\0" as &const byte) || cstr_contains_ci(key, "visual\0" as &const byte) || cstr_contains_ci(key, "siglip\0" as &const byte) || cstr_contains_ci(key, "clip\0" as &const byte) || cstr_contains_ci(key, "image\0" as &const byte) {
+        stats.has_vision_metadata = true;
+    }
+    if cstr_contains_ci(key, "audio\0" as &const byte) || cstr_contains_ci(key, "whisper\0" as &const byte) || cstr_contains_ci(key, "mel\0" as &const byte) {
+        stats.has_audio_metadata = true;
+    }
+    if cstr_contains_ci(key, "speech\0" as &const byte) || cstr_contains_ci(key, "vocoder\0" as &const byte) || cstr_contains_ci(key, "cosy\0" as &const byte) || cstr_contains_ci(key, "codec\0" as &const byte) || cstr_contains_ci(key, "tts\0" as &const byte) {
+        stats.has_speech_metadata = true;
+    }
+
+    if has_value {
+        if cstr_contains_ci(value, "qwen3\0" as &const byte) {
+            stats.has_qwen3_metadata = true;
+            stats.has_qwen_metadata = true;
+            stats.has_text_metadata = true;
+        }
+        if cstr_contains_ci(value, "qwen\0" as &const byte) {
+            stats.has_qwen_metadata = true;
+            stats.has_text_metadata = true;
+        }
+        if cstr_contains_ci(value, "siglip\0" as &const byte) || cstr_contains_ci(value, "clip\0" as &const byte) || cstr_contains_ci(value, "vision\0" as &const byte) {
+            stats.has_vision_metadata = true;
+        }
+        if cstr_contains_ci(value, "whisper\0" as &const byte) || cstr_contains_ci(value, "audio\0" as &const byte) {
+            stats.has_audio_metadata = true;
+        }
+        if cstr_contains_ci(value, "cosy\0" as &const byte) || cstr_contains_ci(value, "vocoder\0" as &const byte) || cstr_contains_ci(value, "speech\0" as &const byte) || cstr_contains_ci(value, "codec\0" as &const byte) {
+            stats.has_speech_metadata = true;
+        }
+        if cstr_contains_ci(value, "<image\0" as &const byte) || cstr_contains_ci(value, "<audio\0" as &const byte) || cstr_contains_ci(value, "<video\0" as &const byte) || cstr_contains_ci(value, "im_start\0" as &const byte) || cstr_contains_ci(value, "media\0" as &const byte) {
+            stats.has_media_placeholder_metadata = true;
+            stats.has_special_token_metadata = true;
+        }
+    }
+}
+
+fn audit_skip_string_array(reader: &BinaryReader, stats: &AuditStats, key: &const byte, count: u64) bool {
+    var tmp: [byte: 129] = [];
+    var info: GgufStringRead = GgufStringRead{ len: 0, copied: 0, truncated: false };
+    const should_sample: bool = cstr_contains_ci(key, "token\0" as &const byte) || cstr_contains_ci(key, "special\0" as &const byte) || cstr_contains_ci(key, "added\0" as &const byte) || cstr_contains_ci(key, "chat\0" as &const byte);
+    var i: u64 = 0;
+    while i < count {
+        if should_sample {
+            if !read_gguf_string(reader, &tmp[0], @len(tmp), &info, "metadata string array element\0" as &const byte) {
+                return false;
+            }
+            audit_mark_metadata_signal(stats, key, &tmp[0] as &const byte, true);
+        } else {
+            if !read_gguf_string(reader, &tmp[0], 1, &info, "metadata string array element\0" as &const byte) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn audit_skip_array_value(reader: &BinaryReader, stats: &AuditStats, key: &const byte) bool {
+    var element_type: u32 = 0;
+    var count: u64 = 0;
+    if !binary_read_u32_le(reader, &element_type, "metadata array element type\0" as &const byte) { return false; }
+    if !binary_read_u64_le(reader, &count, "metadata array length\0" as &const byte) { return false; }
+    audit_mark_array_element_type(stats, element_type);
+
+    if cstr_contains_ci(key, "tokenizer.ggml.tokens\0" as &const byte) {
+        stats.has_tokenizer_tokens = true;
+        stats.has_tokenizer_metadata = true;
+    }
+
+    const elem_size: u64 = scalar_metadata_size(element_type);
+    if elem_size > 0 {
+        if count > ((reader.size - reader.pos) / elem_size) {
+            _ = printf("error: metadata array is truncated (type=%s, count=%llu)\n", gguf_value_type_name(element_type), count);
+            return false;
+        }
+        return binary_skip(reader, count * elem_size, "metadata scalar array\0" as &const byte);
+    }
+    if element_type == GGUF_TYPE_STRING {
+        return audit_skip_string_array(reader, stats, key, count);
+    }
+    if element_type == GGUF_TYPE_ARRAY {
+        _ = printf("error: nested metadata arrays are not supported by GGUF audit\n");
+        return false;
+    }
+    _ = printf("error: unknown metadata array element type %u\n", element_type);
+    return false;
+}
+
+fn audit_skip_metadata_value(reader: &BinaryReader, stats: &AuditStats, key: &const byte, value_type: u32, alignment: &u64) bool {
+    if value_type == GGUF_TYPE_STRING {
+        var value: [byte: 257] = [];
+        var info: GgufStringRead = GgufStringRead{ len: 0, copied: 0, truncated: false };
+        if !read_gguf_string(reader, &value[0], @len(value), &info, "metadata string value\0" as &const byte) {
+            return false;
+        }
+        audit_mark_metadata_signal(stats, key, &value[0] as &const byte, true);
+        return true;
+    }
+    if value_type == GGUF_TYPE_ARRAY {
+        return audit_skip_array_value(reader, stats, key);
+    }
+    if value_type == GGUF_TYPE_UINT32 {
+        var value: u32 = 0;
+        if !binary_read_u32_le(reader, &value, "metadata uint32 value\0" as &const byte) { return false; }
+        if strcmp(key as *const byte, "general.alignment\0" as *const byte) == 0 {
+            if value == 0 {
+                _ = printf("error: general.alignment must be non-zero\n");
+                return false;
+            }
+            *alignment = value as u64;
+        }
+        return true;
+    }
+    const elem_size: u64 = scalar_metadata_size(value_type);
+    if elem_size > 0 {
+        return binary_skip(reader, elem_size, "metadata scalar value\0" as &const byte);
+    }
+    _ = printf("error: unknown metadata value type %u\n", value_type);
+    return false;
+}
+
+fn audit_metadata_entry(reader: &BinaryReader, stats: &AuditStats, alignment: &u64) bool {
+    var key: [byte: 257] = [];
+    var key_info: GgufStringRead = GgufStringRead{ len: 0, copied: 0, truncated: false };
+    if !read_gguf_string(reader, &key[0], @len(key), &key_info, "metadata key\0" as &const byte) {
+        return false;
+    }
+    var value_type: u32 = 0;
+    if !binary_read_u32_le(reader, &value_type, "metadata value type\0" as &const byte) {
+        return false;
+    }
+    audit_mark_type(stats, value_type);
+    audit_mark_metadata_signal(stats, &key[0] as &const byte, "\0" as &const byte, false);
+    return audit_skip_metadata_value(reader, stats, &key[0] as &const byte, value_type, alignment);
+}
+
+fn audit_is_root_tensor(name: &const byte) bool {
+    if cstr_starts_with_ci(name, "token_embd\0" as &const byte) { return true; }
+    if cstr_starts_with_ci(name, "tok_embeddings\0" as &const byte) { return true; }
+    if cstr_starts_with_ci(name, "output\0" as &const byte) { return true; }
+    if cstr_starts_with_ci(name, "lm_head\0" as &const byte) { return true; }
+    if cstr_starts_with_ci(name, "rope_freqs\0" as &const byte) { return true; }
+    return false;
+}
+
+fn audit_mark_tensor_branch(stats: &AuditStats, name: &const byte) void {
+    if cstr_contains_ci(name, "token_embd\0" as &const byte) || cstr_contains_ci(name, "tok_embeddings\0" as &const byte) || cstr_contains_ci(name, "embed_tokens\0" as &const byte) {
+        stats.has_token_embd_tensor = true;
+    }
+    if cstr_contains_ci(name, "output\0" as &const byte) || cstr_contains_ci(name, "lm_head\0" as &const byte) {
+        stats.has_output_tensor = true;
+    }
+
+    if audit_is_root_tensor(name) {
+        stats.root_tensor_count = stats.root_tensor_count + 1;
+        return;
+    }
+    if cstr_starts_with_ci(name, "blk.\0" as &const byte) || cstr_contains_ci(name, "model.layers\0" as &const byte) || cstr_contains_ci(name, "language_model\0" as &const byte) || cstr_contains_ci(name, "llm\0" as &const byte) || cstr_contains_ci(name, "qwen\0" as &const byte) || cstr_contains_ci(name, "text\0" as &const byte) {
+        stats.text_tensor_count = stats.text_tensor_count + 1;
+        stats.has_text_tensor = true;
+        return;
+    }
+    if cstr_contains_ci(name, "vision\0" as &const byte) || cstr_contains_ci(name, "visual\0" as &const byte) || cstr_contains_ci(name, "siglip\0" as &const byte) || cstr_contains_ci(name, "clip\0" as &const byte) || cstr_contains_ci(name, "image\0" as &const byte) || cstr_contains_ci(name, "resampler\0" as &const byte) || cstr_contains_ci(name, "projector\0" as &const byte) {
+        stats.vision_tensor_count = stats.vision_tensor_count + 1;
+        stats.has_vision_tensor = true;
+        return;
+    }
+    if cstr_contains_ci(name, "audio\0" as &const byte) || cstr_contains_ci(name, "whisper\0" as &const byte) || cstr_contains_ci(name, "mel\0" as &const byte) {
+        stats.audio_tensor_count = stats.audio_tensor_count + 1;
+        stats.has_audio_tensor = true;
+        return;
+    }
+    if cstr_contains_ci(name, "speech\0" as &const byte) || cstr_contains_ci(name, "vocoder\0" as &const byte) || cstr_contains_ci(name, "cosy\0" as &const byte) || cstr_contains_ci(name, "codec\0" as &const byte) || cstr_contains_ci(name, "tts\0" as &const byte) {
+        stats.speech_tensor_count = stats.speech_tensor_count + 1;
+        stats.has_speech_tensor = true;
+        return;
+    }
+    if stats.unknown_tensor_count == 0 {
+        copy_cstr(&stats.first_unknown_tensor[0], @len(stats.first_unknown_tensor), name);
+    }
+    stats.unknown_tensor_count = stats.unknown_tensor_count + 1;
+}
+
+fn audit_tensor_info(reader: &BinaryReader, stats: &AuditStats, data_start: u64) bool {
+    var name: [byte: 257] = [];
+    var name_info: GgufStringRead = GgufStringRead{ len: 0, copied: 0, truncated: false };
+    if !read_gguf_string(reader, &name[0], @len(name), &name_info, "tensor name\0" as &const byte) {
+        return false;
+    }
+    var n_dims: u32 = 0;
+    if !binary_read_u32_le(reader, &n_dims, "tensor n_dims\0" as &const byte) {
+        return false;
+    }
+    if n_dims == 0 || n_dims > GGUF_MAX_DIMS {
+        _ = printf("error: tensor has unsupported n_dims=%u\n", n_dims);
+        return false;
+    }
+    var dims: [u64: 8] = [];
+    var i: u32 = 0;
+    while i < n_dims {
+        if !binary_read_u64_le(reader, &dims[i as usize], "tensor dimension\0" as &const byte) {
+            return false;
+        }
+        i = i + 1;
+    }
+    var ggml_type: u32 = 0;
+    var relative_offset: u64 = 0;
+    if !binary_read_u32_le(reader, &ggml_type, "tensor ggml_type\0" as &const byte) { return false; }
+    if !binary_read_u64_le(reader, &relative_offset, "tensor relative offset\0" as &const byte) { return false; }
+
+    if ggml_type < 64 {
+        stats.dtype_counts[ggml_type as usize] = stats.dtype_counts[ggml_type as usize] + 1;
+    } else {
+        stats.dtype_overflow_count = stats.dtype_overflow_count + 1;
+    }
+    const type_info: GgmlTypeInfo = ggml_type_info(ggml_type);
+    if !type_info.known {
+        if stats.unknown_dtype_count == 0 {
+            stats.first_unknown_dtype = ggml_type;
+        }
+        stats.unknown_dtype_count = stats.unknown_dtype_count + 1;
+    }
+    audit_mark_tensor_branch(stats, &name[0] as &const byte);
+
+    var byte_count: u64 = 0;
+    var absolute_offset: u64 = 0;
+    var end_offset: u64 = 0;
+    if tensor_byte_size(ggml_type, &dims[0], n_dims, &byte_count) && checked_add_u64(data_start, relative_offset, &absolute_offset) && checked_add_u64(absolute_offset, byte_count, &end_offset) {
+        if end_offset > reader.size {
+            stats.tensor_data_warning_count = stats.tensor_data_warning_count + 1;
+        }
+    } else {
+        stats.tensor_data_warning_count = stats.tensor_data_warning_count + 1;
+    }
+    return true;
+}
+
+fn print_present(name: &const byte, present: bool) void {
+    if present {
+        _ = printf("  %s: present\n", name);
+    } else {
+        _ = printf("  %s: missing\n", name);
+    }
+}
+
+fn audit_print_metadata_distribution(stats: &AuditStats) void {
+    _ = printf("metadata value types:\n");
+    var i: u32 = 0;
+    var printed_meta: bool = false;
+    while i < 13 {
+        const count: u64 = stats.metadata_type_counts[i as usize];
+        if count > 0 {
+            _ = printf("  %s(%u): %llu\n", gguf_value_type_name(i), i, count);
+            printed_meta = true;
+        }
+        i = i + 1;
+    }
+    if stats.metadata_unknown_type_count > 0 {
+        _ = printf("  unknown: %llu\n", stats.metadata_unknown_type_count);
+        printed_meta = true;
+    }
+    if !printed_meta {
+        _ = printf("  none\n");
+    }
+    _ = printf("metadata array element types:\n");
+    i = 0;
+    var printed: bool = false;
+    while i < 13 {
+        const count: u64 = stats.array_element_type_counts[i as usize];
+        if count > 0 {
+            _ = printf("  %s(%u): %llu\n", gguf_value_type_name(i), i, count);
+            printed = true;
+        }
+        i = i + 1;
+    }
+    if stats.array_unknown_element_type_count > 0 {
+        _ = printf("  unknown: %llu\n", stats.array_unknown_element_type_count);
+        printed = true;
+    }
+    if !printed {
+        _ = printf("  none\n");
+    }
+}
+
+fn audit_print_dtype_distribution(stats: &AuditStats) void {
+    _ = printf("tensor dtype distribution:\n");
+    var i: u32 = 0;
+    var printed: bool = false;
+    while i < 64 {
+        const count: u64 = stats.dtype_counts[i as usize];
+        if count > 0 {
+            const info: GgmlTypeInfo = ggml_type_info(i);
+            _ = printf("  %s(%u): %llu\n", info.name, i, count);
+            printed = true;
+        }
+        i = i + 1;
+    }
+    if stats.dtype_overflow_count > 0 {
+        _ = printf("  out_of_range: %llu\n", stats.dtype_overflow_count);
+        printed = true;
+    }
+    if !printed {
+        _ = printf("  none\n");
+    }
+}
+
+fn audit_print_diagnostics(stats: &AuditStats) void {
+    _ = printf("schema signals:\n");
+    print_present("tokenizer metadata\0" as &const byte, stats.has_tokenizer_metadata);
+    print_present("tokenizer tokens/model\0" as &const byte, stats.has_tokenizer_tokens);
+    print_present("special/media tokens\0" as &const byte, stats.has_special_token_metadata || stats.has_media_placeholder_metadata);
+    print_present("chat template\0" as &const byte, stats.has_chat_template);
+    print_present("Qwen3 text metadata\0" as &const byte, stats.has_qwen3_metadata);
+    print_present("Qwen-family text metadata\0" as &const byte, stats.has_qwen_metadata || stats.has_text_metadata);
+    print_present("vision tower metadata/tensors\0" as &const byte, stats.has_vision_metadata || stats.has_vision_tensor);
+    print_present("audio encoder metadata/tensors\0" as &const byte, stats.has_audio_metadata || stats.has_audio_tensor);
+    print_present("speech/vocoder metadata/tensors\0" as &const byte, stats.has_speech_metadata || stats.has_speech_tensor);
+
+    _ = printf("diagnostics:\n");
+    _ = printf("  generation_supported=false (audit only; inference is not implemented)\n");
+    if !stats.has_tokenizer_tokens {
+        _ = printf("  unsupported: missing tokenizer tokens/model metadata\n");
+    }
+    if !stats.has_token_embd_tensor {
+        _ = printf("  unsupported: missing root token embedding tensor\n");
+    }
+    if !stats.has_output_tensor {
+        _ = printf("  unsupported: missing root output/lm_head tensor\n");
+    }
+    if !stats.has_qwen3_metadata {
+        if stats.has_qwen_metadata || stats.has_text_tensor {
+            _ = printf("  warning: text backbone detected, but Qwen3 metadata is not confirmed\n");
+        } else {
+            _ = printf("  unsupported: missing Qwen3 text backbone metadata\n");
+        }
+    }
+    if !(stats.has_vision_metadata || stats.has_vision_tensor) {
+        _ = printf("  warning: vision tower not detected\n");
+    }
+    if !(stats.has_audio_metadata || stats.has_audio_tensor) {
+        _ = printf("  warning: audio encoder not detected\n");
+    }
+    if !(stats.has_speech_metadata || stats.has_speech_tensor) {
+        _ = printf("  warning: speech/vocoder path not detected\n");
+    }
+    if stats.unknown_dtype_count > 0 || stats.dtype_overflow_count > 0 {
+        _ = printf("  unsupported: unknown tensor dtype count=%llu first=%u\n", stats.unknown_dtype_count + stats.dtype_overflow_count, stats.first_unknown_dtype);
+    }
+    if stats.unknown_tensor_count > 0 {
+        _ = printf("  unsupported: unclassified tensor branch count=%llu first=%s\n", stats.unknown_tensor_count, &stats.first_unknown_tensor[0]);
+    }
+    if stats.tensor_data_warning_count > 0 {
+        _ = printf("  warning: tensor byte-size/offset issues count=%llu\n", stats.tensor_data_warning_count);
+    }
+}
+
+export fn audit_gguf(path: &const byte) i32 {
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) {
+        return 1;
+    }
+
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var tensor_count: u64 = 0;
+    var metadata_count: u64 = 0;
+    var alignment: u64 = GGUF_DEFAULT_ALIGNMENT;
+    var stats: AuditStats = audit_stats_init();
+
+    if !binary_read_u32_le(&reader, &magic, "GGUF magic\0" as &const byte) { binary_close(&reader); return 1; }
+    if magic != GGUF_MAGIC {
+        _ = printf("error: bad GGUF magic 0x%x, expected 0x%x\n", magic, GGUF_MAGIC);
+        binary_close(&reader);
+        return 1;
+    }
+    if !binary_read_u32_le(&reader, &version, "GGUF version\0" as &const byte) { binary_close(&reader); return 1; }
+    if version != 2 && version != 3 {
+        _ = printf("error: unsupported GGUF version %u (supported: 2, 3)\n", version);
+        binary_close(&reader);
+        return 1;
+    }
+    if !binary_read_u64_le(&reader, &tensor_count, "GGUF tensor_count\0" as &const byte) { binary_close(&reader); return 1; }
+    if !binary_read_u64_le(&reader, &metadata_count, "GGUF metadata_count\0" as &const byte) { binary_close(&reader); return 1; }
+
+    _ = printf("MiniCPM-o GGUF audit: %s\n", path);
+    _ = printf("header: version=%u tensor_count=%llu metadata_count=%llu file_size=%llu\n", version, tensor_count, metadata_count, reader.size);
+
+    var i: u64 = 0;
+    while i < metadata_count {
+        if !audit_metadata_entry(&reader, &stats, &alignment) {
+            binary_close(&reader);
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    const tensor_dir_start: u64 = reader.pos;
+    i = 0;
+    while i < tensor_count {
+        if !read_tensor_info(&reader, i, 0, false) {
+            binary_close(&reader);
+            return 1;
+        }
+        i = i + 1;
+    }
+    const tensor_dir_end: u64 = reader.pos;
+
+    var data_start: u64 = 0;
+    if !align_up(tensor_dir_end, alignment, &data_start) {
+        _ = printf("error: cannot compute aligned data section offset (dir_end=%llu, alignment=%llu)\n", tensor_dir_end, alignment);
+        binary_close(&reader);
+        return 1;
+    }
+
+    if !binary_seek(&reader, tensor_dir_start, "rewind tensor directory\0" as &const byte) {
+        binary_close(&reader);
+        return 1;
+    }
+    i = 0;
+    while i < tensor_count {
+        if !audit_tensor_info(&reader, &stats, data_start) {
+            binary_close(&reader);
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    _ = printf("layout: alignment=%llu tensor_dir_start=%llu tensor_dir_end=%llu data_start=%llu\n", alignment, tensor_dir_start, tensor_dir_end, data_start);
+    audit_print_metadata_distribution(&stats);
+    audit_print_dtype_distribution(&stats);
+    _ = printf("tensor branch counts:\n");
+    _ = printf("  root: %llu\n", stats.root_tensor_count);
+    _ = printf("  text: %llu\n", stats.text_tensor_count);
+    _ = printf("  vision: %llu\n", stats.vision_tensor_count);
+    _ = printf("  audio: %llu\n", stats.audio_tensor_count);
+    _ = printf("  speech: %llu\n", stats.speech_tensor_count);
+    _ = printf("  unknown: %llu\n", stats.unknown_tensor_count);
+    audit_print_diagnostics(&stats);
+
+    binary_close(&reader);
+    return 0;
+}

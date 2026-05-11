@@ -41,23 +41,23 @@
 
 ## Phase 2: MiniCPM-o schema audit
 
-- [ ] 实现 `audit <model.gguf>`。
-- [ ] 统计 metadata key/value 类型分布。
-- [ ] 统计 tensor dtype 分布。
-- [ ] 统计 root/text/vision/audio/speech tensor 命名分支。
-- [ ] 识别 Qwen3 text backbone metadata。
-- [ ] 识别 vision tower metadata。
-- [ ] 识别 audio encoder metadata。
-- [ ] 识别 speech/vocoder metadata。
-- [ ] 识别 media placeholder/special token metadata。
-- [ ] 输出 unsupported layout 诊断，不假装可生成。
-- [ ] 增加 `MINICPM_O_GGUF=/path make minicpmo-audit` 文档 target。
+- [x] 实现 `audit <model.gguf>`。
+- [x] 统计 metadata key/value 类型分布。
+- [x] 统计 tensor dtype 分布。
+- [x] 统计 root/text/vision/audio/speech tensor 命名分支。
+- [x] 识别 Qwen3 text backbone metadata。
+- [x] 识别 vision tower metadata。
+- [x] 识别 audio encoder metadata。
+- [x] 识别 speech/vocoder metadata。
+- [x] 识别 media placeholder/special token metadata。
+- [x] 输出 unsupported layout 诊断，不假装可生成。
+- [x] 增加 `MINICPM_O_GGUF=/path make minicpmo-audit` 文档 target。
 
 验收标准：
 
-- 对真实或社区 MiniCPM-o GGUF 能输出 tensor 数、dtype 分布、分支计数。
-- 能定位缺失 tokenizer、缺 root tensor、未知 dtype、未知 modality 分支。
-- `audit` 全程不 mmap/read tensor data。
+- [x] 对真实或社区 MiniCPM-o GGUF 能输出 tensor 数、dtype 分布、分支计数。
+- [x] 能定位缺失 tokenizer、缺 root tensor、未知 dtype、未知 modality 分支。
+- [x] `audit` 全程不 mmap/read tensor data。
 
 ## Phase 3: Tokenizer 与 chat template
 
