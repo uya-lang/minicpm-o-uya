@@ -1,12 +1,22 @@
 UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
+RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
+UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit clean FORCE
 
-build:
+build: build-release
+
+build-debug:
 	mkdir -p build
 	$(UYA) build $(SRC) -o $(OUT)
+
+build-release:
+	mkdir -p build
+	$(UYA) build $(SRC) -o $(OUT)
+	find .uyacache -name '*.o' -delete
+	$(MAKE) -C .uyacache UYA_OUT="$(abspath $(OUT))" CC="$(CC)" CFLAGS="$(RELEASE_CFLAGS) -I." LDFLAGS="$(LDFLAGS)" -j$(UYA_GCC_JOBS)
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
