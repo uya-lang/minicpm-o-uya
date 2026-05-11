@@ -23,12 +23,15 @@ Run `python3 tests/make_tiny_gguf.py` to generate:
 - `tests/fixtures/tiny_rgb.raw` — minimal raw RGB fixture: little-endian `UYRG` magic (`0x47525955`), version `1`, `width`, `height`, channels `3`, dtype `0` for row-major uint8 RGB bytes.
 - `tests/fixtures/tiny_image.uyim` — image manifest fixture: `UYIM`, version `1`, image count, target shape/tile shape, followed by an embedded `UYRG` payload.
 - `tests/fixtures/tiny_video.uyvm` — video frame sequence manifest: `UYVM`, version `1`, frame count, target shape/tile shape, followed by embedded `UYRG` frame payloads; no MP4 decoding is involved.
+- `tests/fixtures/tiny_audio.raw` — deterministic log-mel audio fixture: little-endian `UYAM` magic (`0x4D415955`), version `1`, frame count `1`, mel bins `4`, dtype `0` for F32, followed by four float32 bins.
 - `tests/fixtures/bad_schema.gguf` — generated unsupported schema used to verify missing tokenizer/root tensor, unknown dtype, and unknown branch diagnostics.
 - `tests/fixtures/tiny_data_truncated.gguf` — generated tensor-data truncation case used to verify weight-table bounds checks.
 
-`make test` builds the CLI, runs `inspect`, `audit`, tokenizer piece/encode/decode, `format-chat`, tensor table/mmap inspection, Qwen3 binding, tiny text-only generation, vision raw tensor smoke, vision preprocessing smoke, sampler/chat CLI, and scalar and quant kernel golden smoke tests; it also confirms truncated fixtures fail cleanly and checks unsupported-schema diagnostics without reading tensor data.
+`make test` builds the CLI, runs `inspect`, `audit`, tokenizer piece/encode/decode, `format-chat`, tensor table/mmap inspection, Qwen3 binding, tiny text-only generation, vision raw tensor smoke, vision preprocessing smoke, audio log-mel encoder smoke, sampler/chat CLI, and scalar and quant kernel golden smoke tests; it also confirms truncated fixtures fail cleanly and checks unsupported-schema diagnostics without reading tensor data.
 
 Tokenizer golden coverage includes English, Chinese punctuation, newline-capable vocabulary, and MiniCPM-o media placeholders such as `<image>` and `<audio>` so they are matched as whole tokens.
+
+Audio smoke coverage binds the tiny conv/front-end, one transformer block, output norm, projector, and `<audio>` embedding injection path. The current golden checks are raw checksum `0xbca0dcc`, embedding checksum `0x625ac595`, a non-zero logits diff, and a clear missing-branch error for `audio.conv1.weight`.
 
 Kernel smoke coverage includes F32 vector ops, F16/BF16 loads, normalization, RoPE, softmax, dense matvec, activations, Conv1D/Conv2D, and NaN/Inf/empty-length boundaries.
 

@@ -99,6 +99,30 @@ def pack_tensor_values(name: str, dims: list[int], ggml_type: int) -> bytes:
                 values.append(1.0 if row == col else 0.0)
     elif name.startswith("vision.blk.") and (name.endswith("ffn_gate.weight") or name.endswith("ffn_up.weight") or name.endswith("ffn_down.weight")):
         values = [0.0] * elements
+    elif name == "audio.conv1.weight":
+        for col in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(0.75 if row == col else 0.0)
+    elif name == "audio.conv1.bias":
+        values = [0.0] * elements
+    elif name == "audio.position_embd.weight":
+        for pos in range(dims[0]):
+            for col in range(dims[1]):
+                values.append(0.03 * (pos + 1) * (col + 1))
+    elif name == "audio.output_norm.weight":
+        values = [1.0] * elements
+    elif name == "audio.projector.weight":
+        for col in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if (col % dims[0]) == row else 0.0)
+    elif name.startswith("audio.blk.") and (name.endswith("attn_norm.weight") or name.endswith("ffn_norm.weight")):
+        values = [1.0] * elements
+    elif name.startswith("audio.blk.") and (name.endswith("attn_q.weight") or name.endswith("attn_k.weight") or name.endswith("attn_v.weight") or name.endswith("attn_output.weight")):
+        for col in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if row == col else 0.0)
+    elif name.startswith("audio.blk.") and (name.endswith("ffn_gate.weight") or name.endswith("ffn_up.weight") or name.endswith("ffn_down.weight")):
+        values = [0.0] * elements
     else:
         values = [0.0] * elements
     if ggml_type == GGML_TYPE_F32:
@@ -223,7 +247,13 @@ def main() -> None:
         metadata_u32("vision.attention.head_count", 1),
         metadata_u32("vision.feed_forward_length", 8),
         metadata_u32("vision.projector.output_length", 8),
+        metadata_u32("audio.log_mel.frame_count", 1),
+        metadata_u32("audio.log_mel.bin_count", 4),
+        metadata_u32("audio.embedding_length", 4),
         metadata_u32("audio.whisper.block_count", 1),
+        metadata_u32("audio.attention.head_count", 1),
+        metadata_u32("audio.feed_forward_length", 8),
+        metadata_u32("audio.projector.output_length", 8),
         metadata_string("speech.cosyvoice2.kind", "codec-vocoder"),
         metadata_string("tokenizer.ggml.model", "gpt2"),
         metadata_string_array("tokenizer.ggml.tokens", [
@@ -239,6 +269,7 @@ def main() -> None:
         metadata_u32("tokenizer.ggml.padding_token_id", 3),
         metadata_string("tokenizer.chat_template", "minicpmo.chatml"),
         metadata_u32("minicpmo.media.image_token_id", 12),
+        metadata_u32("minicpmo.media.audio_token_id", 13),
         metadata_i32("test.scalar_i32", -7),
         metadata_u32_array("test.array_u32", [1, 2, 3, 5, 8]),
     ]
@@ -275,7 +306,20 @@ def main() -> None:
         ("vision.output_norm.weight", [4], GGML_TYPE_F32),
         ("vision.resampler.weight", [4, 4], GGML_TYPE_F32),
         ("vision.projector.weight", [4, 8], GGML_TYPE_F32),
-        ("audio.whisper.encoder.weight", [4, 4], GGML_TYPE_F16),
+        ("audio.conv1.weight", [4, 4], GGML_TYPE_F32),
+        ("audio.conv1.bias", [4], GGML_TYPE_F32),
+        ("audio.position_embd.weight", [1, 4], GGML_TYPE_F32),
+        ("audio.blk.0.attn_norm.weight", [4], GGML_TYPE_F32),
+        ("audio.blk.0.attn_q.weight", [4, 4], GGML_TYPE_F32),
+        ("audio.blk.0.attn_k.weight", [4, 4], GGML_TYPE_F32),
+        ("audio.blk.0.attn_v.weight", [4, 4], GGML_TYPE_F32),
+        ("audio.blk.0.attn_output.weight", [4, 4], GGML_TYPE_F32),
+        ("audio.blk.0.ffn_norm.weight", [4], GGML_TYPE_F32),
+        ("audio.blk.0.ffn_gate.weight", [4, 8], GGML_TYPE_F32),
+        ("audio.blk.0.ffn_up.weight", [4, 8], GGML_TYPE_F32),
+        ("audio.blk.0.ffn_down.weight", [8, 4], GGML_TYPE_F32),
+        ("audio.output_norm.weight", [4], GGML_TYPE_F32),
+        ("audio.projector.weight", [4, 8], GGML_TYPE_F32),
         ("speech.cosyvoice2.decoder.weight", [4, 4], GGML_TYPE_F16),
         ("vocoder.proj.weight", [4, 4], GGML_TYPE_F16),
     ]
@@ -322,6 +366,9 @@ def main() -> None:
     (out_dir / "tiny_image.uyim").write_bytes(tiny_image_manifest)
     tiny_video_manifest = struct.pack("<IIIIIII", 0x4D565955, 1, 2, 2, 2, 2, 2) + tiny_rgb + tiny_rgb_b
     (out_dir / "tiny_video.uyvm").write_bytes(tiny_video_manifest)
+    tiny_audio = struct.pack("<IIIII", 0x4D415955, 1, 1, 4, 0)
+    tiny_audio += b"".join(struct.pack("<f", value) for value in [0.2, -0.4, 0.6, -0.8])
+    (out_dir / "tiny_audio.raw").write_bytes(tiny_audio)
 
     bad_tensor = tensor_info("mystery.branch.weight", [4], 63, 0)
     bad_directory = struct.pack("<IIQQ", 0x46554747, 3, 1, 0) + bad_tensor
@@ -345,6 +392,23 @@ def main() -> None:
     missing_q_data_start = align_up(len(missing_q_directory), 32)
     missing_q_fixture = missing_q_directory + (b"\x00" * (missing_q_data_start - len(missing_q_directory))) + bytes(missing_q_data)
     (out_dir / "tiny_qwen3_missing_q.gguf").write_bytes(missing_q_fixture)
+
+    missing_audio_specs = [spec for spec in tensor_specs if not spec[0].startswith("audio.")]
+    missing_audio_tensors = []
+    missing_audio_data = bytearray()
+    offset = 0
+    for index, (name, dims, ggml_type) in enumerate(missing_audio_specs):
+        offset = align_up(offset, 32)
+        if len(missing_audio_data) < offset:
+            missing_audio_data.extend(b"\x00" * (offset - len(missing_audio_data)))
+        size = tensor_size(dims, ggml_type)
+        missing_audio_tensors.append(tensor_info(name, dims, ggml_type, offset))
+        missing_audio_data.extend(pack_tensor_values(name, dims, ggml_type))
+        offset += size
+    missing_audio_directory = struct.pack("<IIQQ", 0x46554747, 3, len(missing_audio_tensors), len(metadata)) + b"".join(metadata) + b"".join(missing_audio_tensors)
+    missing_audio_data_start = align_up(len(missing_audio_directory), 32)
+    missing_audio_fixture = missing_audio_directory + (b"\x00" * (missing_audio_data_start - len(missing_audio_directory))) + bytes(missing_audio_data)
+    (out_dir / "tiny_audio_missing.gguf").write_bytes(missing_audio_fixture)
 
 
 if __name__ == "__main__":

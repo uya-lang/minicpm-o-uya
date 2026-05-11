@@ -240,22 +240,22 @@
 
 ## Phase 12: Audio log-mel/encoder smoke
 
-- [ ] 定义 log-mel fixture 格式。
-- [ ] 定义 `AudioConfig`。
-- [ ] 绑定 audio conv/front-end tensors。
-- [ ] 绑定 audio transformer encoder tensors。
-- [ ] 绑定 audio projector tensors。
-- [ ] 实现 conv front-end。
-- [ ] 实现 audio transformer block。
-- [ ] 实现 projector 到 LLM hidden。
-- [ ] 实现 audio embedding span 注入 LLM prefill。
-- [ ] 实现 `audio-smoke <model.gguf> <audio.raw>`。
+- [x] 定义 log-mel fixture 格式。
+- [x] 定义 `AudioConfig`。
+- [x] 绑定 audio conv/front-end tensors。
+- [x] 绑定 audio transformer encoder tensors。
+- [x] 绑定 audio projector tensors。
+- [x] 实现 conv front-end。
+- [x] 实现 audio transformer block。
+- [x] 实现 projector 到 LLM hidden。
+- [x] 实现 audio embedding span 注入 LLM prefill。
+- [x] 实现 `audio-smoke <model.gguf> <audio.raw>`。
 
 验收标准：
 
-- tiny log-mel fixture checksum 稳定。
-- 固定音频 prompt 可影响 logits。
-- 缺 audio 分支时错误明确。
+- [x] tiny log-mel fixture checksum 稳定。
+- [x] 固定音频 prompt 可影响 logits。
+- [x] 缺 audio 分支时错误明确。
 
 ## Phase 13: Audio preprocessing 与 streaming cache
 

@@ -874,14 +874,14 @@ fn audit_mark_tensor_branch(stats: &AuditStats, name: &const byte) void {
         stats.has_text_tensor = true;
         return;
     }
-    if cstr_contains_ci(name, "vision\0" as &const byte) || cstr_contains_ci(name, "visual\0" as &const byte) || cstr_contains_ci(name, "siglip\0" as &const byte) || cstr_contains_ci(name, "clip\0" as &const byte) || cstr_contains_ci(name, "image\0" as &const byte) || cstr_contains_ci(name, "resampler\0" as &const byte) || cstr_contains_ci(name, "projector\0" as &const byte) {
-        stats.vision_tensor_count = stats.vision_tensor_count + 1;
-        stats.has_vision_tensor = true;
-        return;
-    }
     if cstr_contains_ci(name, "audio\0" as &const byte) || cstr_contains_ci(name, "whisper\0" as &const byte) || cstr_contains_ci(name, "mel\0" as &const byte) {
         stats.audio_tensor_count = stats.audio_tensor_count + 1;
         stats.has_audio_tensor = true;
+        return;
+    }
+    if cstr_contains_ci(name, "vision\0" as &const byte) || cstr_contains_ci(name, "visual\0" as &const byte) || cstr_contains_ci(name, "siglip\0" as &const byte) || cstr_contains_ci(name, "clip\0" as &const byte) || cstr_contains_ci(name, "image\0" as &const byte) || cstr_contains_ci(name, "resampler\0" as &const byte) || cstr_contains_ci(name, "projector\0" as &const byte) {
+        stats.vision_tensor_count = stats.vision_tensor_count + 1;
+        stats.has_vision_tensor = true;
         return;
     }
     if cstr_contains_ci(name, "speech\0" as &const byte) || cstr_contains_ci(name, "vocoder\0" as &const byte) || cstr_contains_ci(name, "cosy\0" as &const byte) || cstr_contains_ci(name, "codec\0" as &const byte) || cstr_contains_ci(name, "tts\0" as &const byte) {

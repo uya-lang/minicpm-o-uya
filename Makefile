@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture chat-fixture minicpmo-audit clean FORCE
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture chat-fixture minicpmo-audit clean FORCE
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture chat-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture chat-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -28,7 +28,7 @@ audit-fixture: build fixtures
 	$(OUT) audit tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-audit.out
 	grep -q "tensor dtype distribution" /tmp/minicpm-o-uya-audit.out
 	grep -q "  vision: 15" /tmp/minicpm-o-uya-audit.out
-	grep -q "  audio: 1" /tmp/minicpm-o-uya-audit.out
+	grep -q "  audio: 14" /tmp/minicpm-o-uya-audit.out
 	grep -q "  speech: 2" /tmp/minicpm-o-uya-audit.out
 	grep -q "Qwen3 text metadata: present" /tmp/minicpm-o-uya-audit.out
 	grep -q "generation_supported=false" /tmp/minicpm-o-uya-audit.out
@@ -57,7 +57,7 @@ tokenizer-fixture: build fixtures
 
 tensor-fixture: build fixtures
 	$(OUT) tensors tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-tensors.out
-	grep -q "tensor table: count=32" /tmp/minicpm-o-uya-tensors.out
+	grep -q "tensor table: count=45" /tmp/minicpm-o-uya-tensors.out
 	grep -q "root token_embd=token_embd.weight root output=output.weight" /tmp/minicpm-o-uya-tensors.out
 	grep -q "cache skeleton: llm_bytes=" /tmp/minicpm-o-uya-tensors.out
 	$(OUT) tensors tests/fixtures/tiny.gguf --mmap >/tmp/minicpm-o-uya-tensors-mmap.out
@@ -116,6 +116,20 @@ vision-fixture: FORCE build fixtures
 	grep -q "placeholders=1 span=1" /tmp/minicpm-o-uya-vision.out
 	grep -q "vision embedding checksum: 0xb5a01b45" /tmp/minicpm-o-uya-vision.out
 	grep -q "diff_l1=" /tmp/minicpm-o-uya-vision.out
+
+audio-fixture: FORCE build fixtures
+	$(OUT) audio-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_audio.raw >/tmp/minicpm-o-uya-audio.out
+	grep -q "audio-smoke: PASS" /tmp/minicpm-o-uya-audio.out
+	grep -q "audio raw: frames=1 mel_bins=4 dtype=f32 elements=4 checksum=0xbca0dcc" /tmp/minicpm-o-uya-audio.out
+	grep -q "placeholders=1 span=1" /tmp/minicpm-o-uya-audio.out
+	grep -q "audio embedding checksum: 0x625ac595" /tmp/minicpm-o-uya-audio.out
+	grep -q "diff_l1=" /tmp/minicpm-o-uya-audio.out
+	@if $(OUT) audio-smoke tests/fixtures/tiny_audio_missing.gguf tests/fixtures/tiny_audio.raw >/tmp/minicpm-o-uya-audio-missing.out 2>&1; then \
+		echo "expected missing audio branch to fail"; \
+		exit 1; \
+	else \
+		grep -q "missing tensor audio.conv1.weight" /tmp/minicpm-o-uya-audio-missing.out; \
+	fi
 
 minicpmo-audit: build
 	@if [ -z "$(MINICPM_O_GGUF)" ]; then \

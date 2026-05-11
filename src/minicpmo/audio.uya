@@ -1,0 +1,694 @@
+use libc.printf;
+use libc.sqrtf;
+use libc.strcmp;
+use minicpmo.binary.BinaryReader;
+use minicpmo.binary.binary_close;
+use minicpmo.binary.binary_open;
+use minicpmo.binary.binary_read_exact;
+use minicpmo.binary.binary_read_u32_le;
+use minicpmo.binary.binary_read_u64_le;
+use minicpmo.binary.binary_reader_init;
+use minicpmo.binary.binary_skip;
+use minicpmo.kernels.silu;
+use minicpmo.kernels.softmax;
+use minicpmo.qwen3.Qwen3Config;
+use minicpmo.qwen3.Qwen3Weights;
+use minicpmo.qwen3.qwen3_bind_weights;
+use minicpmo.qwen3.qwen3_check_forward_caps;
+use minicpmo.qwen3.qwen3_complete_config_from_tensors;
+use minicpmo.qwen3.qwen3_config_init;
+use minicpmo.qwen3.qwen3_config_load_metadata;
+use minicpmo.qwen3.qwen3_forward_embedding;
+use minicpmo.qwen3.qwen3_forward_token;
+use minicpmo.qwen3.qwen3_tensor_get;
+use minicpmo.qwen3.qwen3_weights_init;
+use minicpmo.tensor.TensorDType;
+use minicpmo.tensor.TensorView;
+use minicpmo.tensor.TensorWeightTable;
+use minicpmo.tensor.tensor_dtype_name;
+use minicpmo.tensor.tensor_lookup;
+use minicpmo.tensor.tensor_table_init;
+use minicpmo.tensor.tensor_weight_table_attach_mmap;
+use minicpmo.tensor.tensor_weight_table_detach_mmap;
+use minicpmo.tensor.tensor_weight_table_load;
+use minicpmo.tokenizer.Tokenizer;
+use minicpmo.tokenizer.tokenizer_encode_to_ids;
+use minicpmo.tokenizer.tokenizer_init;
+use minicpmo.tokenizer.tokenizer_load;
+
+const AUDIO_GGUF_MAGIC: u32 = 0x46554747;
+const AUDIO_RAW_MAGIC: u32 = 0x4d415955;
+const AUDIO_RAW_VERSION: u32 = 1;
+const AUDIO_RAW_DTYPE_F32: u32 = 0;
+const AUDIO_GGUF_TYPE_UINT32: u32 = 4;
+const AUDIO_GGUF_TYPE_INT32: u32 = 5;
+const AUDIO_GGUF_TYPE_FLOAT32: u32 = 6;
+const AUDIO_GGUF_TYPE_STRING: u32 = 8;
+const AUDIO_GGUF_TYPE_ARRAY: u32 = 9;
+const AUDIO_GGUF_TYPE_UINT64: u32 = 10;
+const AUDIO_GGUF_TYPE_INT64: u32 = 11;
+const AUDIO_GGUF_TYPE_FLOAT64: u32 = 12;
+const AUDIO_MAX_LAYERS: usize = 4;
+const AUDIO_MAX_FRAMES: usize = 16;
+const AUDIO_MAX_BINS: usize = 64;
+const AUDIO_MAX_VALUES: usize = 1024;
+const AUDIO_MAX_HIDDEN: usize = 64;
+const AUDIO_MAX_FFN: usize = 128;
+const AUDIO_MAX_LLM_HIDDEN: usize = 64;
+const AUDIO_MAX_PROMPT: usize = 64;
+const AUDIO_EPS: f32 = 0.000001;
+
+export struct AudioConfig {
+    frame_count: u32,
+    mel_bin_count: u32,
+    hidden_size: u32,
+    layer_count: u32,
+    head_count: u32,
+    head_dim: u32,
+    intermediate_size: u32,
+    llm_hidden_size: u32,
+    audio_token_id: u32,
+    has_audio_token_id: bool,
+}
+
+export struct AudioLayerWeights {
+    attn_norm: &TensorView,
+    q_proj: &TensorView,
+    k_proj: &TensorView,
+    v_proj: &TensorView,
+    o_proj: &TensorView,
+    ffn_norm: &TensorView,
+    gate_proj: &TensorView,
+    up_proj: &TensorView,
+    down_proj: &TensorView,
+}
+
+export struct AudioWeights {
+    conv_weight: &TensorView,
+    conv_bias: &TensorView,
+    position_embd: &TensorView,
+    output_norm: &TensorView,
+    projector: &TensorView,
+    layers: [AudioLayerWeights: 4],
+    layer_count: u32,
+}
+
+struct AudioRawMel {
+    frame_count: u32,
+    mel_bin_count: u32,
+    values: [f32: 1024],
+    element_count: usize,
+}
+
+struct AudioStringRead {
+    len: u64,
+    copied: usize,
+    truncated: bool,
+}
+
+export fn audio_config_init() AudioConfig {
+    return AudioConfig{ frame_count: 0, mel_bin_count: 0, hidden_size: 0, layer_count: 0, head_count: 0, head_dim: 0, intermediate_size: 0, llm_hidden_size: 0, audio_token_id: 0, has_audio_token_id: false };
+}
+
+export fn audio_weights_init() AudioWeights {
+    return AudioWeights{ conv_weight: null, conv_bias: null, position_embd: null, output_norm: null, projector: null, layers: [], layer_count: 0 };
+}
+
+fn audio_cstr_eq(a: &const byte, b: &const byte) bool {
+    return strcmp(a as *const byte, b as *const byte) == 0;
+}
+
+fn audio_scalar_metadata_size(value_type: u32) u64 {
+    if value_type == 0 || value_type == 1 || value_type == 7 { return 1; }
+    if value_type == 2 || value_type == 3 { return 2; }
+    if value_type == AUDIO_GGUF_TYPE_UINT32 || value_type == AUDIO_GGUF_TYPE_INT32 || value_type == AUDIO_GGUF_TYPE_FLOAT32 { return 4; }
+    if value_type == AUDIO_GGUF_TYPE_UINT64 || value_type == AUDIO_GGUF_TYPE_INT64 || value_type == AUDIO_GGUF_TYPE_FLOAT64 { return 8; }
+    return 0;
+}
+
+fn audio_read_string(reader: &BinaryReader, dest: &byte, dest_cap: usize, info: &AudioStringRead, context: &const byte) bool {
+    info.len = 0;
+    info.copied = 0;
+    info.truncated = false;
+    if !binary_read_u64_le(reader, &info.len, context) { return false; }
+    if dest_cap == 0 { return binary_skip(reader, info.len, context); }
+    var copy_len: usize = 0;
+    if info.len > 0 {
+        if info.len >= dest_cap as u64 { copy_len = dest_cap - 1; info.truncated = true; } else { copy_len = info.len as usize; }
+        if copy_len > 0 {
+            if !binary_read_exact(reader, dest, copy_len, context) { return false; }
+        }
+    }
+    dest[copy_len] = 0;
+    info.copied = copy_len;
+    if info.len > copy_len as u64 { return binary_skip(reader, info.len - (copy_len as u64), context); }
+    return true;
+}
+
+fn audio_skip_array(reader: &BinaryReader, element_type: u32, count: u64) bool {
+    const elem_size: u64 = audio_scalar_metadata_size(element_type);
+    if elem_size > 0 { return binary_skip(reader, elem_size * count, "metadata scalar array\0" as &const byte); }
+    if element_type == AUDIO_GGUF_TYPE_STRING {
+        var tmp: [byte: 1] = [];
+        var info: AudioStringRead = AudioStringRead{ len: 0, copied: 0, truncated: false };
+        var array_index: u64 = 0;
+        while array_index < count {
+            if !audio_read_string(reader, &tmp[0], 1, &info, "metadata string array element\0" as &const byte) { return false; }
+            array_index = array_index + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn audio_apply_u32_metadata(config: &AudioConfig, key: &const byte, value: u32) void {
+    if audio_cstr_eq(key, "audio.frame_count\0" as &const byte) { config.frame_count = value; return; }
+    if audio_cstr_eq(key, "audio.log_mel.frame_count\0" as &const byte) { config.frame_count = value; return; }
+    if audio_cstr_eq(key, "audio.mel_bin_count\0" as &const byte) { config.mel_bin_count = value; return; }
+    if audio_cstr_eq(key, "audio.log_mel.bin_count\0" as &const byte) { config.mel_bin_count = value; return; }
+    if audio_cstr_eq(key, "audio.embedding_length\0" as &const byte) { config.hidden_size = value; return; }
+    if audio_cstr_eq(key, "audio.block_count\0" as &const byte) { config.layer_count = value; return; }
+    if audio_cstr_eq(key, "audio.whisper.block_count\0" as &const byte) { config.layer_count = value; return; }
+    if audio_cstr_eq(key, "audio.attention.head_count\0" as &const byte) { config.head_count = value; return; }
+    if audio_cstr_eq(key, "audio.feed_forward_length\0" as &const byte) { config.intermediate_size = value; return; }
+    if audio_cstr_eq(key, "audio.projector.output_length\0" as &const byte) { config.llm_hidden_size = value; return; }
+    if audio_cstr_eq(key, "minicpmo.media.audio_token_id\0" as &const byte) { config.audio_token_id = value; config.has_audio_token_id = true; return; }
+}
+
+fn audio_skip_metadata_value(reader: &BinaryReader, config: &AudioConfig, key: &const byte, value_type: u32) bool {
+    if value_type == AUDIO_GGUF_TYPE_STRING {
+        var tmp: [byte: 1] = [];
+        var info: AudioStringRead = AudioStringRead{ len: 0, copied: 0, truncated: false };
+        return audio_read_string(reader, &tmp[0], 1, &info, "metadata string value\0" as &const byte);
+    }
+    if value_type == AUDIO_GGUF_TYPE_ARRAY {
+        var element_type: u32 = 0;
+        var count: u64 = 0;
+        if !binary_read_u32_le(reader, &element_type, "metadata array type\0" as &const byte) { return false; }
+        if !binary_read_u64_le(reader, &count, "metadata array length\0" as &const byte) { return false; }
+        return audio_skip_array(reader, element_type, count);
+    }
+    if value_type == AUDIO_GGUF_TYPE_UINT32 || value_type == AUDIO_GGUF_TYPE_INT32 {
+        var value: u32 = 0;
+        if !binary_read_u32_le(reader, &value, "metadata int/uint32 value\0" as &const byte) { return false; }
+        audio_apply_u32_metadata(config, key, value);
+        return true;
+    }
+    const elem_size: u64 = audio_scalar_metadata_size(value_type);
+    if elem_size > 0 { return binary_skip(reader, elem_size, "metadata scalar value\0" as &const byte); }
+    _ = printf("error: audio config unsupported metadata type=%u key=%s\n", value_type, key);
+    return false;
+}
+
+export fn audio_config_load_metadata(path: &const byte, config: &AudioConfig) bool {
+    config[0] = audio_config_init();
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var tensor_count: u64 = 0;
+    var metadata_count: u64 = 0;
+    if !binary_read_u32_le(&reader, &magic, "GGUF magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != AUDIO_GGUF_MAGIC { _ = printf("error: audio config bad GGUF magic\n"); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &version, "GGUF version\0" as &const byte) { binary_close(&reader); return false; }
+    if version != 2 && version != 3 { _ = printf("error: audio config unsupported GGUF version=%u\n", version); binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &tensor_count, "GGUF tensor_count\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &metadata_count, "GGUF metadata_count\0" as &const byte) { binary_close(&reader); return false; }
+    var metadata_index: u64 = 0;
+    while metadata_index < metadata_count {
+        var key: [byte: 128] = [];
+        var info: AudioStringRead = AudioStringRead{ len: 0, copied: 0, truncated: false };
+        if !audio_read_string(&reader, &key[0], @len(key), &info, "metadata key\0" as &const byte) { binary_close(&reader); return false; }
+        if info.truncated { _ = printf("error: audio config metadata key too long\n"); binary_close(&reader); return false; }
+        var value_type: u32 = 0;
+        if !binary_read_u32_le(&reader, &value_type, "metadata value type\0" as &const byte) { binary_close(&reader); return false; }
+        if !audio_skip_metadata_value(&reader, config, &key[0] as &const byte, value_type) { binary_close(&reader); return false; }
+        metadata_index = metadata_index + 1;
+    }
+    binary_close(&reader);
+    return true;
+}
+
+fn audio_raw_init() AudioRawMel {
+    return AudioRawMel{ frame_count: 0, mel_bin_count: 0, values: [], element_count: 0 };
+}
+
+fn audio_read_f32(reader: &BinaryReader, out: &f32) bool {
+    var bits: u32 = 0;
+    if !binary_read_u32_le(reader, &bits, "audio raw f32\0" as &const byte) { return false; }
+    const ptr: &const f32 = &bits as &const f32;
+    *out = ptr[0];
+    return true;
+}
+
+fn audio_raw_load(path: &const byte, raw: &AudioRawMel) bool {
+    raw[0] = audio_raw_init();
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var dtype: u32 = 0;
+    if !binary_read_u32_le(&reader, &magic, "audio raw magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != AUDIO_RAW_MAGIC { _ = printf("error: audio raw bad magic; expected UYAM\n"); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &version, "audio raw version\0" as &const byte) { binary_close(&reader); return false; }
+    if version != AUDIO_RAW_VERSION { _ = printf("error: audio raw unsupported version=%u\n", version); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &raw.frame_count, "audio raw frame count\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &raw.mel_bin_count, "audio raw mel bins\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &dtype, "audio raw dtype\0" as &const byte) { binary_close(&reader); return false; }
+    if dtype != AUDIO_RAW_DTYPE_F32 { _ = printf("error: audio raw dtype=%u unsupported; only f32 log-mel is supported\n", dtype); binary_close(&reader); return false; }
+    const element_count_u64: u64 = (raw.frame_count as u64) * (raw.mel_bin_count as u64);
+    if raw.frame_count == 0 || raw.mel_bin_count == 0 || element_count_u64 > AUDIO_MAX_VALUES as u64 { _ = printf("error: audio raw shape=%ux%u exceeds cap=%zu\n", raw.frame_count, raw.mel_bin_count, AUDIO_MAX_VALUES); binary_close(&reader); return false; }
+    raw.element_count = element_count_u64 as usize;
+    var value_index: usize = 0;
+    while value_index < raw.element_count {
+        if !audio_read_f32(&reader, &raw.values[value_index]) { binary_close(&reader); return false; }
+        value_index = value_index + 1;
+    }
+    if reader.pos != reader.size { _ = printf("error: audio raw has trailing bytes=%llu\n", reader.size - reader.pos); binary_close(&reader); return false; }
+    binary_close(&reader);
+    return true;
+}
+
+extern "libc" fn sprintf(str: *byte, format: *const byte, ...) i32;
+
+fn audio_build_layer_name(layer: u32, suffix: &const byte, dest: &byte, dest_cap: usize) bool {
+    if dest_cap < 40 { return false; }
+    _ = sprintf(dest as *byte, "audio.blk.%u.%s", layer, suffix);
+    return true;
+}
+
+fn audio_lookup_layer(table: &TensorWeightTable, layer: u32, suffix: &const byte) &TensorView {
+    var name: [byte: 96] = [];
+    if !audio_build_layer_name(layer, suffix, &name[0], @len(name)) { return null; }
+    return tensor_lookup(table, &name[0] as &const byte);
+}
+
+fn audio_count_layers_from_tensors(table: &TensorWeightTable) u32 {
+    var layer_count: u32 = 0;
+    while layer_count < AUDIO_MAX_LAYERS as u32 {
+        if audio_lookup_layer(table, layer_count, "attn_q.weight\0" as &const byte) == null { return layer_count; }
+        layer_count = layer_count + 1;
+    }
+    return layer_count;
+}
+
+fn audio_check_dtype(view: &TensorView, label: &const byte) bool {
+    if view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 || view.dtype == TensorDType.BF16 { return true; }
+    _ = printf("error: audio bind tensor=%s label=%s unsupported dtype=%s\n", &view.name[0], label, tensor_dtype_name(view.dtype));
+    return false;
+}
+
+fn audio_print_shape(view: &TensorView) void {
+    _ = printf("[");
+    var dim_index: u32 = 0;
+    while dim_index < view.n_dims {
+        if dim_index > 0 { _ = printf("x"); }
+        _ = printf("%llu", view.shape[dim_index as usize]);
+        dim_index = dim_index + 1;
+    }
+    _ = printf("]");
+}
+
+fn audio_check_vec(view: &TensorView, len: u32, label: &const byte) bool {
+    if !audio_check_dtype(view, label) { return false; }
+    if view.n_dims == 1 && view.shape[0] == len as u64 { return true; }
+    _ = printf("error: audio bind tensor=%s label=%s bad shape got=", &view.name[0], label);
+    audio_print_shape(view);
+    _ = printf(" expected=[%u]\n", len);
+    return false;
+}
+
+fn audio_check_matrix(view: &TensorView, in_dim: u32, out_dim: u32, label: &const byte) bool {
+    if !audio_check_dtype(view, label) { return false; }
+    if view.n_dims == 2 && view.shape[0] == in_dim as u64 && view.shape[1] == out_dim as u64 { return true; }
+    _ = printf("error: audio bind tensor=%s label=%s bad shape got=", &view.name[0], label);
+    audio_print_shape(view);
+    _ = printf(" expected=[%u,%u]\n", in_dim, out_dim);
+    return false;
+}
+
+fn audio_check_position_embedding(view: &TensorView, hidden: u32, label: &const byte) bool {
+    if !audio_check_dtype(view, label) { return false; }
+    if view.n_dims == 2 && view.shape[0] > 0 && view.shape[0] <= AUDIO_MAX_FRAMES as u64 && view.shape[1] == hidden as u64 { return true; }
+    _ = printf("error: audio bind tensor=%s label=%s bad shape got=", &view.name[0], label);
+    audio_print_shape(view);
+    _ = printf(" expected=[1..%zu,%u]\n", AUDIO_MAX_FRAMES, hidden);
+    return false;
+}
+
+fn audio_sqrt_floor_u32(value: u32) u32 {
+    var root: u32 = 0;
+    while (root + 1) * (root + 1) <= value { root = root + 1; }
+    return root;
+}
+
+fn audio_position_value(config: &AudioConfig, weights: &AudioWeights, frame_index: usize, hidden_index: usize) f32 {
+    const source_count: usize = weights.position_embd.shape[0] as usize;
+    const target_count: usize = config.frame_count as usize;
+    var source_index: usize = frame_index;
+    if source_count != target_count {
+        const source_grid: u32 = audio_sqrt_floor_u32(source_count as u32);
+        const target_grid: u32 = audio_sqrt_floor_u32(target_count as u32);
+        if source_grid * source_grid == source_count as u32 && target_grid * target_grid == target_count as u32 && target_grid > 0 {
+            const target_row: u32 = (frame_index as u32) / target_grid;
+            const target_col: u32 = (frame_index as u32) % target_grid;
+            const source_row: u32 = (target_row * source_grid) / target_grid;
+            const source_col: u32 = (target_col * source_grid) / target_grid;
+            source_index = (source_row * source_grid + source_col) as usize;
+        } else {
+            source_index = (frame_index * source_count) / target_count;
+        }
+    }
+    return qwen3_tensor_get(weights.position_embd, source_index * (config.hidden_size as usize) + hidden_index);
+}
+
+export fn audio_complete_config(config: &AudioConfig, table: &TensorWeightTable, raw: &AudioRawMel) bool {
+    if config.frame_count == 0 { config.frame_count = raw.frame_count; }
+    if config.mel_bin_count == 0 { config.mel_bin_count = raw.mel_bin_count; }
+    if config.head_count == 0 { config.head_count = 1; }
+    if !config.has_audio_token_id { config.audio_token_id = 13; }
+    if config.frame_count != raw.frame_count || config.mel_bin_count != raw.mel_bin_count {
+        _ = printf("error: audio raw shape %ux%u does not match audio config %ux%u\n", raw.frame_count, raw.mel_bin_count, config.frame_count, config.mel_bin_count);
+        return false;
+    }
+    const conv: &TensorView = tensor_lookup(table, "audio.conv1.weight\0" as &const byte);
+    if conv == null { _ = printf("error: audio bind missing tensor audio.conv1.weight\n"); return false; }
+    if conv.n_dims == 2 && config.hidden_size == 0 { config.hidden_size = conv.shape[1] as u32; }
+    const projector: &TensorView = tensor_lookup(table, "audio.projector.weight\0" as &const byte);
+    if projector == null { _ = printf("error: audio bind missing tensor audio.projector.weight\n"); return false; }
+    if projector.n_dims == 2 && config.llm_hidden_size == 0 { config.llm_hidden_size = projector.shape[1] as u32; }
+    if config.layer_count == 0 { config.layer_count = audio_count_layers_from_tensors(table); }
+    const gate: &TensorView = audio_lookup_layer(table, 0, "ffn_gate.weight\0" as &const byte);
+    if gate != null && gate.n_dims == 2 && config.intermediate_size == 0 { config.intermediate_size = gate.shape[1] as u32; }
+    if config.hidden_size == 0 || config.layer_count == 0 || config.head_count == 0 || config.llm_hidden_size == 0 || config.intermediate_size == 0 {
+        _ = printf("error: audio config incomplete frames=%u mel_bins=%u hidden=%u layers=%u heads=%u ffn=%u llm_hidden=%u\n", config.frame_count, config.mel_bin_count, config.hidden_size, config.layer_count, config.head_count, config.intermediate_size, config.llm_hidden_size);
+        return false;
+    }
+    if config.hidden_size % config.head_count != 0 { _ = printf("error: audio hidden_size=%u not divisible by head_count=%u\n", config.hidden_size, config.head_count); return false; }
+    config.head_dim = config.hidden_size / config.head_count;
+    if config.frame_count > AUDIO_MAX_FRAMES as u32 || config.mel_bin_count > AUDIO_MAX_BINS as u32 || config.hidden_size > AUDIO_MAX_HIDDEN as u32 || config.intermediate_size > AUDIO_MAX_FFN as u32 || config.llm_hidden_size > AUDIO_MAX_LLM_HIDDEN as u32 || config.layer_count > AUDIO_MAX_LAYERS as u32 {
+        _ = printf("error: audio config exceeds smoke caps frames=%u mel_bins=%u hidden=%u ffn=%u llm_hidden=%u layers=%u\n", config.frame_count, config.mel_bin_count, config.hidden_size, config.intermediate_size, config.llm_hidden_size, config.layer_count);
+        return false;
+    }
+    return true;
+}
+
+export fn audio_bind_weights(table: &TensorWeightTable, config: &AudioConfig, weights: &AudioWeights) bool {
+    weights[0] = audio_weights_init();
+    weights.conv_weight = tensor_lookup(table, "audio.conv1.weight\0" as &const byte);
+    if weights.conv_weight == null || !audio_check_matrix(weights.conv_weight, config.mel_bin_count, config.hidden_size, "conv front-end\0" as &const byte) { return false; }
+    weights.conv_bias = tensor_lookup(table, "audio.conv1.bias\0" as &const byte);
+    if weights.conv_bias != null && !audio_check_vec(weights.conv_bias, config.hidden_size, "conv bias\0" as &const byte) { return false; }
+    weights.position_embd = tensor_lookup(table, "audio.position_embd.weight\0" as &const byte);
+    if weights.position_embd == null || !audio_check_position_embedding(weights.position_embd, config.hidden_size, "position embedding\0" as &const byte) { return false; }
+    weights.output_norm = tensor_lookup(table, "audio.output_norm.weight\0" as &const byte);
+    if weights.output_norm == null || !audio_check_vec(weights.output_norm, config.hidden_size, "output norm\0" as &const byte) { return false; }
+    weights.projector = tensor_lookup(table, "audio.projector.weight\0" as &const byte);
+    if weights.projector == null || !audio_check_matrix(weights.projector, config.hidden_size, config.llm_hidden_size, "projector\0" as &const byte) { return false; }
+    weights.layer_count = config.layer_count;
+    var layer_index: u32 = 0;
+    while layer_index < config.layer_count {
+        var layer: &AudioLayerWeights = &weights.layers[layer_index as usize];
+        layer.attn_norm = audio_lookup_layer(table, layer_index, "attn_norm.weight\0" as &const byte);
+        if layer.attn_norm == null || !audio_check_vec(layer.attn_norm, config.hidden_size, "attention norm\0" as &const byte) { return false; }
+        layer.q_proj = audio_lookup_layer(table, layer_index, "attn_q.weight\0" as &const byte);
+        if layer.q_proj == null || !audio_check_matrix(layer.q_proj, config.hidden_size, config.hidden_size, "q projection\0" as &const byte) { return false; }
+        layer.k_proj = audio_lookup_layer(table, layer_index, "attn_k.weight\0" as &const byte);
+        if layer.k_proj == null || !audio_check_matrix(layer.k_proj, config.hidden_size, config.hidden_size, "k projection\0" as &const byte) { return false; }
+        layer.v_proj = audio_lookup_layer(table, layer_index, "attn_v.weight\0" as &const byte);
+        if layer.v_proj == null || !audio_check_matrix(layer.v_proj, config.hidden_size, config.hidden_size, "v projection\0" as &const byte) { return false; }
+        layer.o_proj = audio_lookup_layer(table, layer_index, "attn_output.weight\0" as &const byte);
+        if layer.o_proj == null || !audio_check_matrix(layer.o_proj, config.hidden_size, config.hidden_size, "o projection\0" as &const byte) { return false; }
+        layer.ffn_norm = audio_lookup_layer(table, layer_index, "ffn_norm.weight\0" as &const byte);
+        if layer.ffn_norm == null || !audio_check_vec(layer.ffn_norm, config.hidden_size, "ffn norm\0" as &const byte) { return false; }
+        layer.gate_proj = audio_lookup_layer(table, layer_index, "ffn_gate.weight\0" as &const byte);
+        if layer.gate_proj == null || !audio_check_matrix(layer.gate_proj, config.hidden_size, config.intermediate_size, "ffn gate\0" as &const byte) { return false; }
+        layer.up_proj = audio_lookup_layer(table, layer_index, "ffn_up.weight\0" as &const byte);
+        if layer.up_proj == null || !audio_check_matrix(layer.up_proj, config.hidden_size, config.intermediate_size, "ffn up\0" as &const byte) { return false; }
+        layer.down_proj = audio_lookup_layer(table, layer_index, "ffn_down.weight\0" as &const byte);
+        if layer.down_proj == null || !audio_check_matrix(layer.down_proj, config.intermediate_size, config.hidden_size, "ffn down\0" as &const byte) { return false; }
+        layer_index = layer_index + 1;
+    }
+    return true;
+}
+
+fn audio_matvec_view(dst: &f32, matrix: &TensorView, src: &const f32, in_dim: usize, out_dim: usize) void {
+    var out_index: usize = 0;
+    while out_index < out_dim {
+        var sum: f32 = 0.0;
+        var in_index: usize = 0;
+        while in_index < in_dim {
+            sum = sum + src[in_index] * qwen3_tensor_get(matrix, in_index * out_dim + out_index);
+            in_index = in_index + 1;
+        }
+        dst[out_index] = sum;
+        out_index = out_index + 1;
+    }
+}
+
+fn audio_rms_norm_view(dst: &f32, src: &const f32, weight: &TensorView, len: usize) void {
+    var sum: f32 = 0.0;
+    var value_index: usize = 0;
+    while value_index < len { sum = sum + src[value_index] * src[value_index]; value_index = value_index + 1; }
+    const inv: f32 = 1.0 / sqrtf(sum / (len as f32) + AUDIO_EPS);
+    value_index = 0;
+    while value_index < len {
+        dst[value_index] = src[value_index] * inv * qwen3_tensor_get(weight, value_index);
+        value_index = value_index + 1;
+    }
+}
+
+fn audio_frontend(config: &AudioConfig, weights: &AudioWeights, raw: &AudioRawMel, states: &f32) void {
+    const hidden: usize = config.hidden_size as usize;
+    const mel_bins: usize = config.mel_bin_count as usize;
+    var frame_index: usize = 0;
+    while frame_index < config.frame_count as usize {
+        audio_matvec_view(&states[frame_index * AUDIO_MAX_HIDDEN], weights.conv_weight, &raw.values[frame_index * mel_bins] as &const f32, mel_bins, hidden);
+        var hidden_index: usize = 0;
+        while hidden_index < hidden {
+            if weights.conv_bias != null { states[frame_index * AUDIO_MAX_HIDDEN + hidden_index] = states[frame_index * AUDIO_MAX_HIDDEN + hidden_index] + qwen3_tensor_get(weights.conv_bias, hidden_index); }
+            states[frame_index * AUDIO_MAX_HIDDEN + hidden_index] = states[frame_index * AUDIO_MAX_HIDDEN + hidden_index] + audio_position_value(config, weights, frame_index, hidden_index);
+            hidden_index = hidden_index + 1;
+        }
+        frame_index = frame_index + 1;
+    }
+}
+
+fn audio_attention(out: &f32, q_values: &const f32, k_values: &const f32, v_values: &const f32, token_count: usize, head_count: usize, head_dim: usize, token_index: usize) void {
+    var hidden_index: usize = 0;
+    while hidden_index < head_count * head_dim { out[hidden_index] = 0.0; hidden_index = hidden_index + 1; }
+    var scores: [f32: 16] = [];
+    var probs: [f32: 16] = [];
+    const scale: f32 = 1.0 / sqrtf(head_dim as f32);
+    var head_index: usize = 0;
+    while head_index < head_count {
+        var key_token: usize = 0;
+        while key_token < token_count {
+            var dot: f32 = 0.0;
+            var dim_index: usize = 0;
+            while dim_index < head_dim {
+                dot = dot + q_values[token_index * AUDIO_MAX_HIDDEN + head_index * head_dim + dim_index] * k_values[key_token * AUDIO_MAX_HIDDEN + head_index * head_dim + dim_index];
+                dim_index = dim_index + 1;
+            }
+            scores[key_token] = dot * scale;
+            key_token = key_token + 1;
+        }
+        softmax(&probs[0], &scores[0], token_count);
+        var out_dim: usize = 0;
+        while out_dim < head_dim {
+            var sum: f32 = 0.0;
+            var value_token: usize = 0;
+            while value_token < token_count {
+                sum = sum + probs[value_token] * v_values[value_token * AUDIO_MAX_HIDDEN + head_index * head_dim + out_dim];
+                value_token = value_token + 1;
+            }
+            out[head_index * head_dim + out_dim] = sum;
+            out_dim = out_dim + 1;
+        }
+        head_index = head_index + 1;
+    }
+}
+
+fn audio_transformer(config: &AudioConfig, weights: &AudioWeights, states: &f32) void {
+    var normed: [f32: 1024] = [];
+    var q_values: [f32: 1024] = [];
+    var k_values: [f32: 1024] = [];
+    var v_values: [f32: 1024] = [];
+    var attn_ctx: [f32: 1024] = [];
+    var attn_out: [f32: 1024] = [];
+    var gate: [f32: 2048] = [];
+    var up: [f32: 2048] = [];
+    var fused: [f32: 2048] = [];
+    var down: [f32: 1024] = [];
+    const token_count: usize = config.frame_count as usize;
+    const hidden: usize = config.hidden_size as usize;
+    const ffn: usize = config.intermediate_size as usize;
+    var layer_index: usize = 0;
+    while layer_index < config.layer_count as usize {
+        const layer: &AudioLayerWeights = &weights.layers[layer_index];
+        var token_index: usize = 0;
+        while token_index < token_count {
+            audio_rms_norm_view(&normed[token_index * AUDIO_MAX_HIDDEN], &states[token_index * AUDIO_MAX_HIDDEN] as &const f32, layer.attn_norm, hidden);
+            audio_matvec_view(&q_values[token_index * AUDIO_MAX_HIDDEN], layer.q_proj, &normed[token_index * AUDIO_MAX_HIDDEN] as &const f32, hidden, hidden);
+            audio_matvec_view(&k_values[token_index * AUDIO_MAX_HIDDEN], layer.k_proj, &normed[token_index * AUDIO_MAX_HIDDEN] as &const f32, hidden, hidden);
+            audio_matvec_view(&v_values[token_index * AUDIO_MAX_HIDDEN], layer.v_proj, &normed[token_index * AUDIO_MAX_HIDDEN] as &const f32, hidden, hidden);
+            token_index = token_index + 1;
+        }
+        token_index = 0;
+        while token_index < token_count {
+            audio_attention(&attn_ctx[token_index * AUDIO_MAX_HIDDEN], &q_values[0], &k_values[0], &v_values[0], token_count, config.head_count as usize, config.head_dim as usize, token_index);
+            audio_matvec_view(&attn_out[token_index * AUDIO_MAX_HIDDEN], layer.o_proj, &attn_ctx[token_index * AUDIO_MAX_HIDDEN] as &const f32, hidden, hidden);
+            var hidden_index: usize = 0;
+            while hidden_index < hidden { states[token_index * AUDIO_MAX_HIDDEN + hidden_index] = states[token_index * AUDIO_MAX_HIDDEN + hidden_index] + attn_out[token_index * AUDIO_MAX_HIDDEN + hidden_index]; hidden_index = hidden_index + 1; }
+            token_index = token_index + 1;
+        }
+        token_index = 0;
+        while token_index < token_count {
+            audio_rms_norm_view(&normed[token_index * AUDIO_MAX_HIDDEN], &states[token_index * AUDIO_MAX_HIDDEN] as &const f32, layer.ffn_norm, hidden);
+            audio_matvec_view(&gate[token_index * AUDIO_MAX_FFN], layer.gate_proj, &normed[token_index * AUDIO_MAX_HIDDEN] as &const f32, hidden, ffn);
+            audio_matvec_view(&up[token_index * AUDIO_MAX_FFN], layer.up_proj, &normed[token_index * AUDIO_MAX_HIDDEN] as &const f32, hidden, ffn);
+            var ffn_index: usize = 0;
+            while ffn_index < ffn { fused[token_index * AUDIO_MAX_FFN + ffn_index] = silu(gate[token_index * AUDIO_MAX_FFN + ffn_index]) * up[token_index * AUDIO_MAX_FFN + ffn_index]; ffn_index = ffn_index + 1; }
+            audio_matvec_view(&down[token_index * AUDIO_MAX_HIDDEN], layer.down_proj, &fused[token_index * AUDIO_MAX_FFN] as &const f32, ffn, hidden);
+            var hidden_index2: usize = 0;
+            while hidden_index2 < hidden { states[token_index * AUDIO_MAX_HIDDEN + hidden_index2] = states[token_index * AUDIO_MAX_HIDDEN + hidden_index2] + down[token_index * AUDIO_MAX_HIDDEN + hidden_index2]; hidden_index2 = hidden_index2 + 1; }
+            token_index = token_index + 1;
+        }
+        layer_index = layer_index + 1;
+    }
+}
+
+export fn audio_encode(config: &AudioConfig, weights: &AudioWeights, raw: &AudioRawMel, embeddings: &f32, span_count: &usize) bool {
+    var states: [f32: 1024] = [];
+    audio_frontend(config, weights, raw, &states[0]);
+    audio_transformer(config, weights, &states[0]);
+    const token_count: usize = config.frame_count as usize;
+    const hidden: usize = config.hidden_size as usize;
+    const llm_hidden: usize = config.llm_hidden_size as usize;
+    var normed: [f32: 64] = [];
+    var token_index: usize = 0;
+    while token_index < token_count {
+        audio_rms_norm_view(&normed[0], &states[token_index * AUDIO_MAX_HIDDEN] as &const f32, weights.output_norm, hidden);
+        audio_matvec_view(&embeddings[token_index * AUDIO_MAX_LLM_HIDDEN], weights.projector, &normed[0], hidden, llm_hidden);
+        token_index = token_index + 1;
+    }
+    *span_count = token_count;
+    return true;
+}
+
+fn audio_f32_bits(value: f32) u32 {
+    const ptr: &const u32 = &value as &const u32;
+    return ptr[0];
+}
+
+fn audio_checksum(values: &const f32, count: usize) u32 {
+    var hash: u32 = 2166136261;
+    var value_index: usize = 0;
+    while value_index < count {
+        const bits: u32 = audio_f32_bits(values[value_index]);
+        var byte_index: u32 = 0;
+        while byte_index < 4 {
+            hash = hash ^ ((bits >> ((byte_index * 8) as i32)) & (255 as u32));
+            hash = hash * (16777619 as u32);
+            byte_index = byte_index + 1;
+        }
+        value_index = value_index + 1;
+    }
+    return hash;
+}
+
+fn audio_count_placeholders(ids: &const u32, id_count: usize, audio_token_id: u32) usize {
+    var placeholder_count: usize = 0;
+    var token_index: usize = 0;
+    while token_index < id_count {
+        if ids[token_index] == audio_token_id { placeholder_count = placeholder_count + 1; }
+        token_index = token_index + 1;
+    }
+    return placeholder_count;
+}
+
+fn audio_prefill_prompt(qwen_config: &Qwen3Config, qwen_weights: &Qwen3Weights, ids: &const u32, id_count: usize, audio_token_id: u32, embeddings: &const f32, span_count: usize, use_audio: bool, logits: &f32) bool {
+    var k_cache: [f32: 16384] = [];
+    var v_cache: [f32: 16384] = [];
+    var token_index: usize = 0;
+    var span_index: usize = 0;
+    while token_index < id_count {
+        if ids[token_index] == audio_token_id && use_audio {
+            if span_index >= span_count { _ = printf("error: audio embedding span underflow span=%zu\n", span_count); return false; }
+            if !qwen3_forward_embedding(qwen_config, qwen_weights, &embeddings[span_index * AUDIO_MAX_LLM_HIDDEN] as &const f32, token_index, &k_cache[0], &v_cache[0], logits) { return false; }
+            span_index = span_index + 1;
+        } else {
+            if !qwen3_forward_token(qwen_config, qwen_weights, ids[token_index], token_index, &k_cache[0], &v_cache[0], logits) { return false; }
+        }
+        token_index = token_index + 1;
+    }
+    if use_audio && span_index != span_count { _ = printf("error: audio embedding span overflow used=%zu span=%zu\n", span_index, span_count); return false; }
+    return true;
+}
+
+fn audio_logits_l1(a: &const f32, b: &const f32, count: usize) f32 {
+    var sum: f32 = 0.0;
+    var value_index: usize = 0;
+    while value_index < count {
+        if a[value_index] > b[value_index] { sum = sum + (a[value_index] - b[value_index]); } else { sum = sum + (b[value_index] - a[value_index]); }
+        value_index = value_index + 1;
+    }
+    return sum;
+}
+
+export fn audio_smoke_cli(model_path: &const byte, audio_path: &const byte) i32 {
+    var audio_config: AudioConfig = audio_config_init();
+    if !audio_config_load_metadata(model_path, &audio_config) { return 1; }
+    var raw: AudioRawMel = audio_raw_init();
+    if !audio_raw_load(audio_path, &raw) { return 1; }
+    var qwen_config: Qwen3Config = qwen3_config_init();
+    if !qwen3_config_load_metadata(model_path, &qwen_config) { return 1; }
+    var table: TensorWeightTable = tensor_table_init();
+    if !tensor_weight_table_load(model_path, &table) { return 1; }
+    if !audio_complete_config(&audio_config, &table, &raw) { return 1; }
+    if !qwen3_complete_config_from_tensors(&qwen_config, &table) { return 1; }
+    if qwen_config.hidden_size != audio_config.llm_hidden_size { _ = printf("error: audio projector output=%u does not match qwen hidden=%u\n", audio_config.llm_hidden_size, qwen_config.hidden_size); return 1; }
+    if !qwen3_check_forward_caps(&qwen_config) { return 1; }
+    if !tensor_weight_table_attach_mmap(model_path, &table) { return 1; }
+    var audio_weights: AudioWeights = audio_weights_init();
+    if !audio_bind_weights(&table, &audio_config, &audio_weights) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var qwen_weights: Qwen3Weights = qwen3_weights_init();
+    if !qwen3_bind_weights(&table, &qwen_config, &qwen_weights) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var tok: Tokenizer = tokenizer_init();
+    if !tokenizer_load(model_path, &tok) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var embeddings: [f32: 1024] = [];
+    var span_count: usize = 0;
+    if !audio_encode(&audio_config, &audio_weights, &raw, &embeddings[0], &span_count) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var prompt_ids: [u32: 64] = [];
+    var prompt_count: usize = 0;
+    if !tokenizer_encode_to_ids(&tok, "<audio> hello\0" as &const byte, &prompt_ids[0], AUDIO_MAX_PROMPT, &prompt_count) { tensor_weight_table_detach_mmap(&table); return 1; }
+    const placeholder_count: usize = audio_count_placeholders(&prompt_ids[0], prompt_count, audio_config.audio_token_id);
+    if placeholder_count != span_count {
+        _ = printf("error: audio placeholder count=%zu does not match embedding span=%zu\n", placeholder_count, span_count);
+        tensor_weight_table_detach_mmap(&table);
+        return 1;
+    }
+    var logits_audio: [f32: 256] = [];
+    var logits_text: [f32: 256] = [];
+    if !audio_prefill_prompt(&qwen_config, &qwen_weights, &prompt_ids[0], prompt_count, audio_config.audio_token_id, &embeddings[0], span_count, true, &logits_audio[0]) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !audio_prefill_prompt(&qwen_config, &qwen_weights, &prompt_ids[0], prompt_count, audio_config.audio_token_id, &embeddings[0], span_count, false, &logits_text[0]) { tensor_weight_table_detach_mmap(&table); return 1; }
+    const diff_l1: f32 = audio_logits_l1(&logits_audio[0], &logits_text[0], qwen_config.vocab_size as usize);
+    if diff_l1 <= 0.000001 { _ = printf("error: audio logits are not observably different diff_l1=%.9f\n", diff_l1 as f64); tensor_weight_table_detach_mmap(&table); return 1; }
+    const raw_checksum: u32 = audio_checksum(&raw.values[0], raw.element_count);
+    const embed_checksum: u32 = audio_checksum(&embeddings[0], span_count * (audio_config.llm_hidden_size as usize));
+    const audio_logits_checksum: u32 = audio_checksum(&logits_audio[0], qwen_config.vocab_size as usize);
+    const text_logits_checksum: u32 = audio_checksum(&logits_text[0], qwen_config.vocab_size as usize);
+    _ = printf("audio raw: frames=%u mel_bins=%u dtype=f32 elements=%zu checksum=0x%x\n", raw.frame_count, raw.mel_bin_count, raw.element_count, raw_checksum);
+    _ = printf("audio config: frames=%u mel_bins=%u hidden=%u layers=%u heads=%u ffn=%u llm_hidden=%u audio_token=%u\n", audio_config.frame_count, audio_config.mel_bin_count, audio_config.hidden_size, audio_config.layer_count, audio_config.head_count, audio_config.intermediate_size, audio_config.llm_hidden_size, audio_config.audio_token_id);
+    _ = printf("audio bind: conv=%s pos=%s projector=%s layers=%u\n", &audio_weights.conv_weight.name[0], &audio_weights.position_embd.name[0], &audio_weights.projector.name[0], audio_weights.layer_count);
+    _ = printf("audio-smoke prompt_tokens:");
+    var prompt_index: usize = 0;
+    while prompt_index < prompt_count { _ = printf(" %u", prompt_ids[prompt_index]); prompt_index = prompt_index + 1; }
+    _ = printf(" placeholders=%zu span=%zu\n", placeholder_count, span_count);
+    _ = printf("audio embedding checksum: 0x%x\n", embed_checksum);
+    _ = printf("audio logits checksum: audio=0x%x text=0x%x diff_l1=%.9f\n", audio_logits_checksum, text_logits_checksum, diff_l1 as f64);
+    _ = printf("audio logits[0..4]: %.6f %.6f %.6f %.6f %.6f\n", logits_audio[0] as f64, logits_audio[1] as f64, logits_audio[2] as f64, logits_audio[3] as f64, logits_audio[4] as f64);
+    _ = printf("audio-smoke: PASS\n");
+    tensor_weight_table_detach_mmap(&table);
+    return 0;
+}
