@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture minicpmo-audit clean
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture minicpmo-audit clean
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -57,7 +57,7 @@ tokenizer-fixture: build fixtures
 
 tensor-fixture: build fixtures
 	$(OUT) tensors tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-tensors.out
-	grep -q "tensor table: count=7" /tmp/minicpm-o-uya-tensors.out
+	grep -q "tensor table: count=18" /tmp/minicpm-o-uya-tensors.out
 	grep -q "root token_embd=token_embd.weight root output=output.weight" /tmp/minicpm-o-uya-tensors.out
 	grep -q "cache skeleton: llm_bytes=" /tmp/minicpm-o-uya-tensors.out
 	$(OUT) tensors tests/fixtures/tiny.gguf --mmap >/tmp/minicpm-o-uya-tensors-mmap.out
@@ -74,6 +74,17 @@ quant-fixture: build
 	$(OUT) quant-smoke >/tmp/minicpm-o-uya-quant.out
 	grep -q "quant smoke: PASS" /tmp/minicpm-o-uya-quant.out
 	grep -q "unsupported quant dtype: tensor=blk.0.bad.weight dtype=IQ_UNKNOWN" /tmp/minicpm-o-uya-quant.out
+
+qwen3-fixture: build fixtures
+	$(OUT) qwen3-bind tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-qwen3.out
+	grep -q "qwen3 bind: PASS" /tmp/minicpm-o-uya-qwen3.out
+	grep -q "q_norm=yes k_norm=yes" /tmp/minicpm-o-uya-qwen3.out
+	@if $(OUT) qwen3-bind tests/fixtures/tiny_qwen3_missing_q.gguf >/tmp/minicpm-o-uya-qwen3-missing.out 2>&1; then \
+		echo "expected missing q projection binding to fail"; \
+		exit 1; \
+	else \
+		grep -q "missing tensor blk.0.attn_q.weight" /tmp/minicpm-o-uya-qwen3-missing.out; \
+	fi
 
 minicpmo-audit: build
 	@if [ -z "$(MINICPM_O_GGUF)" ]; then \

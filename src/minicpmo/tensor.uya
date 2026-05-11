@@ -115,7 +115,7 @@ struct TensorStringRead {
     truncated: bool,
 }
 
-fn tensor_table_init() TensorWeightTable {
+export fn tensor_table_init() TensorWeightTable {
     return TensorWeightTable{
         count: 0,
         alignment: TENSOR_GGUF_DEFAULT_ALIGNMENT,
@@ -188,7 +188,7 @@ fn tensor_dtype_from_ggml(ggml_type: u32) TensorDType {
     return TensorDType.Unknown;
 }
 
-fn tensor_dtype_name(dtype: TensorDType) &const byte {
+export fn tensor_dtype_name(dtype: TensorDType) &const byte {
     if dtype == TensorDType.F32 { return "F32\0" as &const byte; }
     if dtype == TensorDType.F16 { return "F16\0" as &const byte; }
     if dtype == TensorDType.Q4_0 { return "Q4_0\0" as &const byte; }

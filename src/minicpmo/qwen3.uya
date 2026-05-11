@@ -1,0 +1,376 @@
+use libc.printf;
+use libc.strcmp;
+use minicpmo.binary.BinaryReader;
+use minicpmo.binary.binary_close;
+use minicpmo.binary.binary_open;
+use minicpmo.binary.binary_read_exact;
+use minicpmo.binary.binary_read_u32_le;
+use minicpmo.binary.binary_read_u64_le;
+use minicpmo.binary.binary_reader_init;
+use minicpmo.binary.binary_skip;
+use minicpmo.tensor.TensorDType;
+use minicpmo.tensor.TensorView;
+use minicpmo.tensor.TensorWeightTable;
+use minicpmo.tensor.tensor_build_layer_name;
+use minicpmo.tensor.tensor_dtype_name;
+use minicpmo.tensor.tensor_lookup;
+use minicpmo.tensor.tensor_lookup_root_output;
+use minicpmo.tensor.tensor_lookup_root_token_embedding;
+use minicpmo.tensor.tensor_table_init;
+use minicpmo.tensor.tensor_weight_table_load;
+
+const QWEN3_GGUF_MAGIC: u32 = 0x46554747;
+const QWEN3_GGUF_TYPE_UINT32: u32 = 4;
+const QWEN3_GGUF_TYPE_INT32: u32 = 5;
+const QWEN3_GGUF_TYPE_FLOAT32: u32 = 6;
+const QWEN3_GGUF_TYPE_STRING: u32 = 8;
+const QWEN3_GGUF_TYPE_ARRAY: u32 = 9;
+const QWEN3_GGUF_TYPE_UINT64: u32 = 10;
+const QWEN3_GGUF_TYPE_INT64: u32 = 11;
+const QWEN3_GGUF_TYPE_FLOAT64: u32 = 12;
+const QWEN3_MAX_LAYERS: usize = 64;
+
+export struct Qwen3Config {
+    vocab_size: u32,
+    context_length: u32,
+    hidden_size: u32,
+    intermediate_size: u32,
+    layer_count: u32,
+    head_count: u32,
+    kv_head_count: u32,
+    head_dim: u32,
+    norm_eps_bits: u32,
+    rope_freq_base_bits: u32,
+    has_norm_eps: bool,
+    has_rope_freq_base: bool,
+}
+
+export struct Qwen3LayerWeights {
+    attn_norm: &TensorView,
+    q_proj: &TensorView,
+    k_proj: &TensorView,
+    v_proj: &TensorView,
+    o_proj: &TensorView,
+    q_norm: &TensorView,
+    k_norm: &TensorView,
+    ffn_norm: &TensorView,
+    gate_proj: &TensorView,
+    up_proj: &TensorView,
+    down_proj: &TensorView,
+}
+
+export struct Qwen3Weights {
+    token_embedding: &TensorView,
+    output_norm: &TensorView,
+    output: &TensorView,
+    layers: [Qwen3LayerWeights: 64],
+    layer_count: u32,
+}
+
+struct Qwen3StringRead {
+    len: u64,
+    copied: usize,
+    truncated: bool,
+}
+
+fn qwen3_config_init() Qwen3Config {
+    return Qwen3Config{ vocab_size: 0, context_length: 0, hidden_size: 0, intermediate_size: 0, layer_count: 0, head_count: 0, kv_head_count: 0, head_dim: 0, norm_eps_bits: 0, rope_freq_base_bits: 0, has_norm_eps: false, has_rope_freq_base: false };
+}
+
+fn qwen3_weights_init() Qwen3Weights {
+    return Qwen3Weights{ token_embedding: null, output_norm: null, output: null, layers: [], layer_count: 0 };
+}
+
+fn qwen3_cstr_eq(a: &const byte, b: &const byte) bool {
+    return strcmp(a as *const byte, b as *const byte) == 0;
+}
+
+fn qwen3_scalar_metadata_size(value_type: u32) u64 {
+    if value_type == 0 || value_type == 1 || value_type == 7 { return 1; }
+    if value_type == 2 || value_type == 3 { return 2; }
+    if value_type == QWEN3_GGUF_TYPE_UINT32 || value_type == QWEN3_GGUF_TYPE_INT32 || value_type == QWEN3_GGUF_TYPE_FLOAT32 { return 4; }
+    if value_type == QWEN3_GGUF_TYPE_UINT64 || value_type == QWEN3_GGUF_TYPE_INT64 || value_type == QWEN3_GGUF_TYPE_FLOAT64 { return 8; }
+    return 0;
+}
+
+fn qwen3_read_string(reader: &BinaryReader, dest: &byte, dest_cap: usize, info: &Qwen3StringRead, context: &const byte) bool {
+    info.len = 0;
+    info.copied = 0;
+    info.truncated = false;
+    if !binary_read_u64_le(reader, &info.len, context) { return false; }
+    if dest_cap == 0 { return binary_skip(reader, info.len, context); }
+    var copy_len: usize = 0;
+    if info.len > 0 {
+        if info.len >= dest_cap as u64 {
+            copy_len = dest_cap - 1;
+            info.truncated = true;
+        } else {
+            copy_len = info.len as usize;
+        }
+        if copy_len > 0 {
+            if !binary_read_exact(reader, dest, copy_len, context) { return false; }
+        }
+    }
+    dest[copy_len] = 0;
+    info.copied = copy_len;
+    if info.len > copy_len as u64 {
+        return binary_skip(reader, info.len - (copy_len as u64), context);
+    }
+    return true;
+}
+
+fn qwen3_skip_array(reader: &BinaryReader, element_type: u32, count: u64) bool {
+    const elem_size: u64 = qwen3_scalar_metadata_size(element_type);
+    if elem_size > 0 { return binary_skip(reader, elem_size * count, "metadata scalar array\0" as &const byte); }
+    if element_type == QWEN3_GGUF_TYPE_STRING {
+        var tmp: [byte: 1] = [];
+        var info: Qwen3StringRead = Qwen3StringRead{ len: 0, copied: 0, truncated: false };
+        var i: u64 = 0;
+        while i < count {
+            if !qwen3_read_string(reader, &tmp[0], 1, &info, "metadata string array element\0" as &const byte) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn qwen3_apply_u32_metadata(config: &Qwen3Config, key: &const byte, value: u32) void {
+    if qwen3_cstr_eq(key, "qwen3.context_length\0" as &const byte) { config.context_length = value; return; }
+    if qwen3_cstr_eq(key, "qwen3.embedding_length\0" as &const byte) { config.hidden_size = value; return; }
+    if qwen3_cstr_eq(key, "qwen3.feed_forward_length\0" as &const byte) { config.intermediate_size = value; return; }
+    if qwen3_cstr_eq(key, "qwen3.block_count\0" as &const byte) { config.layer_count = value; return; }
+    if qwen3_cstr_eq(key, "qwen3.attention.head_count\0" as &const byte) { config.head_count = value; return; }
+    if qwen3_cstr_eq(key, "qwen3.attention.head_count_kv\0" as &const byte) { config.kv_head_count = value; return; }
+    if qwen3_cstr_eq(key, "qwen3.rope.dimension_count\0" as &const byte) { config.head_dim = value; return; }
+}
+
+fn qwen3_skip_metadata_value(reader: &BinaryReader, config: &Qwen3Config, key: &const byte, value_type: u32) bool {
+    if value_type == QWEN3_GGUF_TYPE_STRING {
+        var tmp: [byte: 1] = [];
+        var info: Qwen3StringRead = Qwen3StringRead{ len: 0, copied: 0, truncated: false };
+        return qwen3_read_string(reader, &tmp[0], 1, &info, "metadata string value\0" as &const byte);
+    }
+    if value_type == QWEN3_GGUF_TYPE_ARRAY {
+        var element_type: u32 = 0;
+        var count: u64 = 0;
+        if !binary_read_u32_le(reader, &element_type, "metadata array type\0" as &const byte) { return false; }
+        if !binary_read_u64_le(reader, &count, "metadata array length\0" as &const byte) { return false; }
+        if qwen3_cstr_eq(key, "tokenizer.ggml.tokens\0" as &const byte) && count <= 4294967295 { config.vocab_size = count as u32; }
+        return qwen3_skip_array(reader, element_type, count);
+    }
+    if value_type == QWEN3_GGUF_TYPE_UINT32 || value_type == QWEN3_GGUF_TYPE_INT32 {
+        var value: u32 = 0;
+        if !binary_read_u32_le(reader, &value, "metadata int/uint32 value\0" as &const byte) { return false; }
+        qwen3_apply_u32_metadata(config, key, value);
+        return true;
+    }
+    if value_type == QWEN3_GGUF_TYPE_FLOAT32 {
+        var bits: u32 = 0;
+        if !binary_read_u32_le(reader, &bits, "metadata float32 value\0" as &const byte) { return false; }
+        if qwen3_cstr_eq(key, "qwen3.attention.layer_norm_rms_epsilon\0" as &const byte) { config.norm_eps_bits = bits; config.has_norm_eps = true; }
+        if qwen3_cstr_eq(key, "qwen3.rope.freq_base\0" as &const byte) { config.rope_freq_base_bits = bits; config.has_rope_freq_base = true; }
+        return true;
+    }
+    const size: u64 = qwen3_scalar_metadata_size(value_type);
+    if size > 0 { return binary_skip(reader, size, "metadata scalar value\0" as &const byte); }
+    _ = printf("error: qwen3 config unsupported metadata type=%u key=%s\n", value_type, key);
+    return false;
+}
+
+export fn qwen3_config_load_metadata(path: &const byte, config: &Qwen3Config) bool {
+    config[0] = qwen3_config_init();
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var tensor_count: u64 = 0;
+    var metadata_count: u64 = 0;
+    if !binary_read_u32_le(&reader, &magic, "GGUF magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != QWEN3_GGUF_MAGIC { _ = printf("error: qwen3 config bad GGUF magic\n"); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &version, "GGUF version\0" as &const byte) { binary_close(&reader); return false; }
+    if version != 2 && version != 3 { _ = printf("error: qwen3 config unsupported GGUF version=%u\n", version); binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &tensor_count, "GGUF tensor_count\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &metadata_count, "GGUF metadata_count\0" as &const byte) { binary_close(&reader); return false; }
+    var i: u64 = 0;
+    while i < metadata_count {
+        var key: [byte: 128] = [];
+        var info: Qwen3StringRead = Qwen3StringRead{ len: 0, copied: 0, truncated: false };
+        if !qwen3_read_string(&reader, &key[0], @len(key), &info, "metadata key\0" as &const byte) { binary_close(&reader); return false; }
+        if info.truncated { _ = printf("error: qwen3 config metadata key too long\n"); binary_close(&reader); return false; }
+        var value_type: u32 = 0;
+        if !binary_read_u32_le(&reader, &value_type, "metadata value type\0" as &const byte) { binary_close(&reader); return false; }
+        if !qwen3_skip_metadata_value(&reader, config, &key[0] as &const byte, value_type) { binary_close(&reader); return false; }
+        i = i + 1;
+    }
+    binary_close(&reader);
+    return true;
+}
+
+fn qwen3_dtype_supported(dtype: TensorDType) bool {
+    if dtype == TensorDType.F32 || dtype == TensorDType.F16 || dtype == TensorDType.BF16 { return true; }
+    if dtype == TensorDType.Q8_0 || dtype == TensorDType.Q4_K || dtype == TensorDType.Q5_K || dtype == TensorDType.Q6_K || dtype == TensorDType.IQ4_NL { return true; }
+    return false;
+}
+
+fn qwen3_print_shape(view: &TensorView) void {
+    _ = printf("[");
+    var i: u32 = 0;
+    while i < view.n_dims {
+        if i > 0 { _ = printf("x"); }
+        _ = printf("%llu", view.shape[i as usize]);
+        i = i + 1;
+    }
+    _ = printf("]");
+}
+
+fn qwen3_check_dtype(view: &TensorView, layer: u32) bool {
+    if qwen3_dtype_supported(view.dtype) { return true; }
+    _ = printf("error: qwen3 bind layer=%u tensor=%s unsupported dtype=%s\n", layer, &view.name[0], tensor_dtype_name(view.dtype));
+    return false;
+}
+
+fn qwen3_check_vec(view: &TensorView, hidden: u32, layer: u32, role: &const byte) bool {
+    if !qwen3_check_dtype(view, layer) { return false; }
+    if view.n_dims == 1 && view.shape[0] == hidden as u64 { return true; }
+    _ = printf("error: qwen3 bind layer=%u tensor=%s bad shape for %s expected=[%u] got=", layer, &view.name[0], role, hidden);
+    qwen3_print_shape(view);
+    _ = printf("\n");
+    return false;
+}
+
+fn qwen3_check_matrix_first(view: &TensorView, first_dim: u32, layer: u32, role: &const byte) bool {
+    if !qwen3_check_dtype(view, layer) { return false; }
+    if view.n_dims == 2 && view.shape[0] == first_dim as u64 && view.shape[1] > 0 { return true; }
+    _ = printf("error: qwen3 bind layer=%u tensor=%s bad shape for %s expected_first=%u got=", layer, &view.name[0], role, first_dim);
+    qwen3_print_shape(view);
+    _ = printf("\n");
+    return false;
+}
+
+fn qwen3_check_matrix_exact(view: &TensorView, first_dim: u32, second_dim: u32, layer: u32, role: &const byte) bool {
+    if !qwen3_check_dtype(view, layer) { return false; }
+    if view.n_dims == 2 && view.shape[0] == first_dim as u64 && view.shape[1] == second_dim as u64 { return true; }
+    _ = printf("error: qwen3 bind layer=%u tensor=%s bad shape for %s expected=[%u,%u] got=", layer, &view.name[0], role, first_dim, second_dim);
+    qwen3_print_shape(view);
+    _ = printf("\n");
+    return false;
+}
+
+fn qwen3_lookup_required(table: &TensorWeightTable, name: &const byte, layer: u32) &TensorView {
+    const view: &TensorView = tensor_lookup(table, name);
+    if view == null { _ = printf("error: qwen3 bind layer=%u missing tensor %s\n", layer, name); }
+    return view;
+}
+
+fn qwen3_lookup_layer_required(table: &TensorWeightTable, layer: u32, suffix: &const byte) &TensorView {
+    var name: [byte: 96] = [];
+    if !tensor_build_layer_name(layer, suffix, &name[0], @len(name)) { _ = printf("error: qwen3 bind layer=%u cannot build tensor name\n", layer); return null; }
+    return qwen3_lookup_required(table, &name[0] as &const byte, layer);
+}
+
+fn qwen3_lookup_layer_optional(table: &TensorWeightTable, layer: u32, suffix: &const byte) &TensorView {
+    var name: [byte: 96] = [];
+    if !tensor_build_layer_name(layer, suffix, &name[0], @len(name)) { return null; }
+    return tensor_lookup(table, &name[0] as &const byte);
+}
+
+fn qwen3_count_layers_from_tensors(table: &TensorWeightTable) u32 {
+    var count: u32 = 0;
+    while count < QWEN3_MAX_LAYERS as u32 {
+        if qwen3_lookup_layer_optional(table, count, "attn_q.weight\0" as &const byte) == null { return count; }
+        count = count + 1;
+    }
+    return count;
+}
+
+fn qwen3_complete_config_from_tensors(config: &Qwen3Config, table: &TensorWeightTable) bool {
+    const emb: &TensorView = tensor_lookup_root_token_embedding(table);
+    if emb == null { _ = printf("error: qwen3 bind layer=0 missing tensor token_embd.weight\n"); return false; }
+    if emb.n_dims != 2 { _ = printf("error: qwen3 bind tensor=%s bad embedding shape got=", &emb.name[0]); qwen3_print_shape(emb); _ = printf("\n"); return false; }
+    if config.hidden_size == 0 { config.hidden_size = emb.shape[0] as u32; }
+    if config.vocab_size == 0 { config.vocab_size = emb.shape[1] as u32; }
+    if config.layer_count == 0 { config.layer_count = qwen3_count_layers_from_tensors(table); }
+    if config.head_count > 0 && config.hidden_size > 0 && config.head_dim == 0 {
+        if config.hidden_size % config.head_count != 0 { _ = printf("error: qwen3 config hidden_size=%u not divisible by head_count=%u\n", config.hidden_size, config.head_count); return false; }
+        config.head_dim = config.hidden_size / config.head_count;
+    }
+    if config.kv_head_count == 0 && config.head_count > 0 { config.kv_head_count = config.head_count; }
+    if config.intermediate_size == 0 {
+        const gate: &TensorView = qwen3_lookup_layer_optional(table, 0, "ffn_gate.weight\0" as &const byte);
+        if gate != null && gate.n_dims == 2 { config.intermediate_size = gate.shape[1] as u32; }
+    }
+    if config.context_length == 0 { _ = printf("error: qwen3 config missing qwen3.context_length\n"); return false; }
+    if config.hidden_size == 0 || config.vocab_size == 0 || config.layer_count == 0 || config.head_count == 0 || config.kv_head_count == 0 || config.head_dim == 0 || config.intermediate_size == 0 {
+        _ = printf("error: qwen3 config incomplete vocab=%u hidden=%u layers=%u heads=%u kv_heads=%u head_dim=%u ffn=%u\n", config.vocab_size, config.hidden_size, config.layer_count, config.head_count, config.kv_head_count, config.head_dim, config.intermediate_size);
+        return false;
+    }
+    if config.layer_count > QWEN3_MAX_LAYERS as u32 { _ = printf("error: qwen3 layer_count=%u exceeds max=%zu\n", config.layer_count, QWEN3_MAX_LAYERS); return false; }
+    return true;
+}
+
+export fn qwen3_bind_weights(table: &TensorWeightTable, config: &Qwen3Config, weights: &Qwen3Weights) bool {
+    weights[0] = qwen3_weights_init();
+    weights.token_embedding = tensor_lookup_root_token_embedding(table);
+    if weights.token_embedding == null { _ = printf("error: qwen3 bind layer=0 missing tensor token_embd.weight\n"); return false; }
+    if !qwen3_check_matrix_exact(weights.token_embedding, config.hidden_size, config.vocab_size, 0, "token embedding\0" as &const byte) { return false; }
+    weights.output_norm = tensor_lookup(table, "output_norm.weight\0" as &const byte);
+    if weights.output_norm == null { weights.output_norm = tensor_lookup(table, "norm.weight\0" as &const byte); }
+    if weights.output_norm == null { _ = printf("error: qwen3 bind layer=%u missing tensor output_norm.weight\n", config.layer_count); return false; }
+    if !qwen3_check_vec(weights.output_norm, config.hidden_size, config.layer_count, "output norm\0" as &const byte) { return false; }
+    weights.output = tensor_lookup_root_output(table);
+    if weights.output == null { _ = printf("error: qwen3 bind layer=%u missing tensor output.weight\n", config.layer_count); return false; }
+    if !qwen3_check_matrix_exact(weights.output, config.hidden_size, config.vocab_size, config.layer_count, "lm head/output\0" as &const byte) { return false; }
+    weights.layer_count = config.layer_count;
+    const q_dim: u32 = config.head_count * config.head_dim;
+    const kv_dim: u32 = config.kv_head_count * config.head_dim;
+    var layer: u32 = 0;
+    while layer < config.layer_count {
+        var lw: &Qwen3LayerWeights = &weights.layers[layer as usize];
+        lw.attn_norm = qwen3_lookup_layer_required(table, layer, "attn_norm.weight\0" as &const byte);
+        if lw.attn_norm == null || !qwen3_check_vec(lw.attn_norm, config.hidden_size, layer, "attention norm\0" as &const byte) { return false; }
+        lw.q_proj = qwen3_lookup_layer_required(table, layer, "attn_q.weight\0" as &const byte);
+        if lw.q_proj == null || !qwen3_check_matrix_exact(lw.q_proj, config.hidden_size, q_dim, layer, "q projection\0" as &const byte) { return false; }
+        lw.k_proj = qwen3_lookup_layer_required(table, layer, "attn_k.weight\0" as &const byte);
+        if lw.k_proj == null || !qwen3_check_matrix_exact(lw.k_proj, config.hidden_size, kv_dim, layer, "k projection\0" as &const byte) { return false; }
+        lw.v_proj = qwen3_lookup_layer_required(table, layer, "attn_v.weight\0" as &const byte);
+        if lw.v_proj == null || !qwen3_check_matrix_exact(lw.v_proj, config.hidden_size, kv_dim, layer, "v projection\0" as &const byte) { return false; }
+        lw.o_proj = qwen3_lookup_layer_required(table, layer, "attn_output.weight\0" as &const byte);
+        if lw.o_proj == null || !qwen3_check_matrix_exact(lw.o_proj, q_dim, config.hidden_size, layer, "o projection\0" as &const byte) { return false; }
+        lw.q_norm = qwen3_lookup_layer_optional(table, layer, "attn_q_norm.weight\0" as &const byte);
+        if lw.q_norm == null { lw.q_norm = qwen3_lookup_layer_optional(table, layer, "attn_q_a_norm.weight\0" as &const byte); }
+        if lw.q_norm != null && !qwen3_check_vec(lw.q_norm, config.head_dim, layer, "q norm\0" as &const byte) { return false; }
+        lw.k_norm = qwen3_lookup_layer_optional(table, layer, "attn_k_norm.weight\0" as &const byte);
+        if lw.k_norm == null { lw.k_norm = qwen3_lookup_layer_optional(table, layer, "attn_k_a_norm.weight\0" as &const byte); }
+        if lw.k_norm != null && !qwen3_check_vec(lw.k_norm, config.head_dim, layer, "k norm\0" as &const byte) { return false; }
+        lw.ffn_norm = qwen3_lookup_layer_required(table, layer, "ffn_norm.weight\0" as &const byte);
+        if lw.ffn_norm == null || !qwen3_check_vec(lw.ffn_norm, config.hidden_size, layer, "ffn norm\0" as &const byte) { return false; }
+        lw.gate_proj = qwen3_lookup_layer_required(table, layer, "ffn_gate.weight\0" as &const byte);
+        if lw.gate_proj == null || !qwen3_check_matrix_exact(lw.gate_proj, config.hidden_size, config.intermediate_size, layer, "ffn gate\0" as &const byte) { return false; }
+        lw.up_proj = qwen3_lookup_layer_required(table, layer, "ffn_up.weight\0" as &const byte);
+        if lw.up_proj == null || !qwen3_check_matrix_exact(lw.up_proj, config.hidden_size, config.intermediate_size, layer, "ffn up\0" as &const byte) { return false; }
+        lw.down_proj = qwen3_lookup_layer_required(table, layer, "ffn_down.weight\0" as &const byte);
+        if lw.down_proj == null || !qwen3_check_matrix_exact(lw.down_proj, config.intermediate_size, config.hidden_size, layer, "ffn down\0" as &const byte) { return false; }
+        layer = layer + 1;
+    }
+    return true;
+}
+
+export fn qwen3_bind_cli(path: &const byte) i32 {
+    var config: Qwen3Config = qwen3_config_init();
+    if !qwen3_config_load_metadata(path, &config) { return 1; }
+    var table: TensorWeightTable = tensor_table_init();
+    if !tensor_weight_table_load(path, &table) { return 1; }
+    if !qwen3_complete_config_from_tensors(&config, &table) { return 1; }
+    var weights: Qwen3Weights = qwen3_weights_init();
+    if !qwen3_bind_weights(&table, &config, &weights) { return 1; }
+    var q_norm_label: &const byte = "no\0" as &const byte;
+    if weights.layers[0].q_norm != null { q_norm_label = "yes\0" as &const byte; }
+    var k_norm_label: &const byte = "no\0" as &const byte;
+    if weights.layers[0].k_norm != null { k_norm_label = "yes\0" as &const byte; }
+    _ = printf("qwen3 config: vocab=%u context=%u hidden=%u layers=%u heads=%u kv_heads=%u head_dim=%u ffn=%u norm_eps_bits=0x%x rope_freq_base_bits=0x%x\n", config.vocab_size, config.context_length, config.hidden_size, config.layer_count, config.head_count, config.kv_head_count, config.head_dim, config.intermediate_size, config.norm_eps_bits, config.rope_freq_base_bits);
+    _ = printf("qwen3 bind: token_embd=%s output_norm=%s output=%s layers=%u q_norm=%s k_norm=%s\n", &weights.token_embedding.name[0], &weights.output_norm.name[0], &weights.output.name[0], weights.layer_count, q_norm_label, k_norm_label);
+    _ = printf("qwen3 layer[0]: attn_norm=%s q=%s k=%s v=%s o=%s ffn_norm=%s gate=%s up=%s down=%s\n", &weights.layers[0].attn_norm.name[0], &weights.layers[0].q_proj.name[0], &weights.layers[0].k_proj.name[0], &weights.layers[0].v_proj.name[0], &weights.layers[0].o_proj.name[0], &weights.layers[0].ffn_norm.name[0], &weights.layers[0].gate_proj.name[0], &weights.layers[0].up_proj.name[0], &weights.layers[0].down_proj.name[0]);
+    _ = printf("qwen3 bind: PASS\n");
+    return 0;
+}

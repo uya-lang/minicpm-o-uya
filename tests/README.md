@@ -22,10 +22,12 @@ Run `python3 tests/make_tiny_gguf.py` to generate:
 - `tests/fixtures/bad_schema.gguf` — generated unsupported schema used to verify missing tokenizer/root tensor, unknown dtype, and unknown branch diagnostics.
 - `tests/fixtures/tiny_data_truncated.gguf` — generated tensor-data truncation case used to verify weight-table bounds checks.
 
-`make test` builds the CLI, runs `inspect`, `audit`, tokenizer piece/encode/decode, `format-chat`, tensor table/mmap inspection, and scalar and quant kernel golden smoke tests; it also confirms truncated fixtures fail cleanly and checks unsupported-schema diagnostics without reading tensor data.
+`make test` builds the CLI, runs `inspect`, `audit`, tokenizer piece/encode/decode, `format-chat`, tensor table/mmap inspection, Qwen3 binding, and scalar and quant kernel golden smoke tests; it also confirms truncated fixtures fail cleanly and checks unsupported-schema diagnostics without reading tensor data.
 
 Tokenizer golden coverage includes English, Chinese punctuation, newline-capable vocabulary, and MiniCPM-o media placeholders such as `<image>` and `<audio>` so they are matched as whole tokens.
 
 Kernel smoke coverage includes F32 vector ops, F16/BF16 loads, normalization, RoPE, softmax, dense matvec, activations, Conv1D/Conv2D, and NaN/Inf/empty-length boundaries.
 
 Quant smoke coverage includes Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL fused dequant+dot checks, row-stride Q8_0 matvec, and unsupported dtype diagnostics with tensor name plus dtype.
+
+Qwen3 binding coverage uses a tiny one-layer Qwen3-like GGUF with token embedding, output norm/head, attention projections, optional q/k norms, and FFN projections; it also checks missing tensor diagnostics include layer and tensor name.

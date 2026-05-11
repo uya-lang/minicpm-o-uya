@@ -142,24 +142,24 @@
 
 ## Phase 7: Qwen3 text config 与权重绑定
 
-- [ ] 建立 `Qwen3Config`。
-- [ ] 从 GGUF metadata 推导 vocab/context/heads/layers/norm/rope。
-- [ ] 从 tensor shape fallback 推导必要 config。
-- [ ] 识别 token embedding。
-- [ ] 识别 output norm。
-- [ ] 识别 lm_head/output。
-- [ ] 识别每层 attention norm。
-- [ ] 识别 q/k/v/o projection。
-- [ ] 识别 FFN norm。
-- [ ] 识别 gate/up/down projection。
-- [ ] 支持 Qwen3 特有 q/k norm 或 rope 变体。
-- [ ] 对缺 tensor/坏 shape/坏 dtype 报 layer 和 tensor name。
+- [x] 建立 `Qwen3Config`。
+- [x] 从 GGUF metadata 推导 vocab/context/heads/layers/norm/rope。
+- [x] 从 tensor shape fallback 推导必要 config。
+- [x] 识别 token embedding。
+- [x] 识别 output norm。
+- [x] 识别 lm_head/output。
+- [x] 识别每层 attention norm。
+- [x] 识别 q/k/v/o projection。
+- [x] 识别 FFN norm。
+- [x] 识别 gate/up/down projection。
+- [x] 支持 Qwen3 特有 q/k norm 或 rope 变体。
+- [x] 对缺 tensor/坏 shape/坏 dtype 报 layer 和 tensor name。
 
 验收标准：
 
-- tiny Qwen3-like GGUF 可完整绑定。
-- 真实 text-only GGUF 若 unsupported，可输出具体原因。
-- 不再只返回笼统 rc=9。
+- [x] tiny Qwen3-like GGUF 可完整绑定。
+- [x] 真实 text-only GGUF 若 unsupported，可输出具体原因。
+- [x] 不再只返回笼统 rc=9。
 
 ## Phase 8: Qwen3 text-only forward
 

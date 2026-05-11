@@ -29,6 +29,10 @@ def metadata_i32(key: str, value: int) -> bytes:
     return gguf_string(key) + struct.pack("<Ii", GGUF_TYPE_INT32, value)
 
 
+def metadata_f32(key: str, value: float) -> bytes:
+    return gguf_string(key) + struct.pack("<If", GGUF_TYPE_FLOAT32, value)
+
+
 def metadata_u32_array(key: str, values: list[int]) -> bytes:
     payload = gguf_string(key)
     payload += struct.pack("<IIQ", GGUF_TYPE_ARRAY, GGUF_TYPE_UINT32, len(values))
@@ -93,8 +97,15 @@ def main() -> None:
         metadata_string("general.architecture", "minicpmo-qwen3"),
         metadata_string("general.name", "tiny phase2 audit fixture"),
         metadata_u32("general.alignment", 32),
+        metadata_u32("qwen3.context_length", 32),
+        metadata_u32("qwen3.embedding_length", 8),
+        metadata_u32("qwen3.feed_forward_length", 16),
         metadata_u32("qwen3.block_count", 1),
         metadata_u32("qwen3.attention.head_count", 2),
+        metadata_u32("qwen3.attention.head_count_kv", 1),
+        metadata_u32("qwen3.rope.dimension_count", 4),
+        metadata_f32("qwen3.attention.layer_norm_rms_epsilon", 0.000001),
+        metadata_f32("qwen3.rope.freq_base", 1000000.0),
         metadata_u32("vision.siglip2.block_count", 1),
         metadata_u32("audio.whisper.block_count", 1),
         metadata_string("speech.cosyvoice2.kind", "codec-vocoder"),
@@ -116,15 +127,29 @@ def main() -> None:
         metadata_u32_array("test.array_u32", [1, 2, 3, 5, 8]),
     ]
 
-    tensor_specs = [
-        ("token_embd.weight", [8, 4], GGML_TYPE_F16),
-        ("output.weight", [4, 8], GGML_TYPE_F16),
-        ("blk.0.attn_q.weight", [4, 2], GGML_TYPE_F32),
+    text_tensor_specs = [
+        ("token_embd.weight", [8, 19], GGML_TYPE_F16),
+        ("output_norm.weight", [8], GGML_TYPE_F32),
+        ("output.weight", [8, 19], GGML_TYPE_F16),
+        ("blk.0.attn_norm.weight", [8], GGML_TYPE_F32),
+        ("blk.0.attn_q.weight", [8, 8], GGML_TYPE_F32),
+        ("blk.0.attn_k.weight", [8, 4], GGML_TYPE_F32),
+        ("blk.0.attn_v.weight", [8, 4], GGML_TYPE_F32),
+        ("blk.0.attn_output.weight", [8, 8], GGML_TYPE_F32),
+        ("blk.0.attn_q_norm.weight", [4], GGML_TYPE_F32),
+        ("blk.0.attn_k_norm.weight", [4], GGML_TYPE_F32),
+        ("blk.0.ffn_norm.weight", [8], GGML_TYPE_F32),
+        ("blk.0.ffn_gate.weight", [8, 16], GGML_TYPE_F16),
+        ("blk.0.ffn_up.weight", [8, 16], GGML_TYPE_F16),
+        ("blk.0.ffn_down.weight", [16, 8], GGML_TYPE_F16),
+    ]
+    branch_tensor_specs = [
         ("vision.patch_embd.weight", [4, 4], GGML_TYPE_F16),
         ("audio.whisper.encoder.weight", [4, 4], GGML_TYPE_F16),
         ("speech.cosyvoice2.decoder.weight", [4, 4], GGML_TYPE_F16),
         ("vocoder.proj.weight", [4, 4], GGML_TYPE_F16),
     ]
+    tensor_specs = text_tensor_specs + branch_tensor_specs
 
     tensors = []
     tensor_data = bytearray()
@@ -153,6 +178,23 @@ def main() -> None:
     bad_data_start = align_up(len(bad_directory), 32)
     bad_fixture = bad_directory + (b"\x00" * (bad_data_start - len(bad_directory))) + b"bad!"
     (out_dir / "bad_schema.gguf").write_bytes(bad_fixture)
+
+    missing_q_specs = [spec for spec in text_tensor_specs if spec[0] != "blk.0.attn_q.weight"]
+    missing_q_tensors = []
+    missing_q_data = bytearray()
+    offset = 0
+    for index, (name, dims, ggml_type) in enumerate(missing_q_specs):
+        offset = align_up(offset, 32)
+        if len(missing_q_data) < offset:
+            missing_q_data.extend(b"\x00" * (offset - len(missing_q_data)))
+        size = tensor_size(dims, ggml_type)
+        missing_q_tensors.append(tensor_info(name, dims, ggml_type, offset))
+        missing_q_data.extend(((index * 19 + i) & 0xFF) for i in range(size))
+        offset += size
+    missing_q_directory = struct.pack("<IIQQ", 0x46554747, 3, len(missing_q_tensors), len(metadata)) + b"".join(metadata) + b"".join(missing_q_tensors)
+    missing_q_data_start = align_up(len(missing_q_directory), 32)
+    missing_q_fixture = missing_q_directory + (b"\x00" * (missing_q_data_start - len(missing_q_directory))) + bytes(missing_q_data)
+    (out_dir / "tiny_qwen3_missing_q.gguf").write_bytes(missing_q_fixture)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ audio input, speech output, and finally streaming omni chat.
 
 ## Status
 
-Phase 6 is implemented: `inspect`, `audit`, tokenizer CLI, tensor weight-table/mmap inspection, scalar reference kernel smoke tests, and first-pass quant kernel smoke tests are available. No real MiniCPM-o inference is implemented yet.
+Phase 7 is implemented: `inspect`, `audit`, tokenizer CLI, tensor weight-table/mmap inspection, Qwen3 config/weight binding, scalar reference kernel smoke tests, and first-pass quant kernel smoke tests are available. No real MiniCPM-o inference is implemented yet.
 
 ## Goals
 
@@ -30,6 +30,7 @@ build/minicpm-o-uya encode /path/to/model.gguf "hello"
 build/minicpm-o-uya decode /path/to/model.gguf 1 2 3
 build/minicpm-o-uya format-chat /path/to/model.gguf "<image> hello"
 build/minicpm-o-uya tensors /path/to/model.gguf --mmap
+build/minicpm-o-uya qwen3-bind /path/to/model.gguf
 build/minicpm-o-uya kernels-smoke
 build/minicpm-o-uya quant-smoke
 MINICPM_O_GGUF=/path/to/model.gguf make minicpmo-audit
@@ -54,6 +55,7 @@ build/minicpm-o-uya audit tests/fixtures/tiny.gguf
 build/minicpm-o-uya encode tests/fixtures/tiny.gguf "<image> hello <audio>"
 build/minicpm-o-uya format-chat tests/fixtures/tiny.gguf "<image> hello"
 build/minicpm-o-uya tensors tests/fixtures/tiny.gguf --mmap
+build/minicpm-o-uya qwen3-bind tests/fixtures/tiny.gguf
 build/minicpm-o-uya kernels-smoke
 build/minicpm-o-uya quant-smoke
 ```
