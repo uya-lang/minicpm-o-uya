@@ -23,7 +23,7 @@ const TENSOR_GGUF_TYPE_UINT32: u32 = 4;
 const TENSOR_GGUF_TYPE_STRING: u32 = 8;
 const TENSOR_GGUF_TYPE_ARRAY: u32 = 9;
 const TENSOR_MAX_DIMS: u32 = 8;
-const TENSOR_MAX_WEIGHTS: usize = 256;
+const TENSOR_MAX_WEIGHTS: usize = 1024;
 const TENSOR_NAME_CAP: usize = 128;
 const TENSOR_U64_MAX: u64 = 18446744073709551615;
 const TENSOR_MAP_FAILED: usize = 18446744073709551615;
@@ -73,7 +73,7 @@ export struct TensorWeightTable {
     tensor_dir_end: u64,
     data_start: u64,
     file_size: u64,
-    weights: [TensorView: 256],
+    weights: [TensorView: 1024],
     mapped_base: &const byte,
     mapped_size: usize,
     fd: i32,
@@ -503,7 +503,9 @@ export fn tensor_lookup_root_token_embedding(table: &TensorWeightTable) &TensorV
 export fn tensor_lookup_root_output(table: &TensorWeightTable) &TensorView {
     var view: &TensorView = tensor_lookup(table, "output.weight\0" as &const byte);
     if view != null { return view; }
-    return tensor_lookup(table, "lm_head.weight\0" as &const byte);
+    view = tensor_lookup(table, "lm_head.weight\0" as &const byte);
+    if view != null { return view; }
+    return tensor_lookup_root_token_embedding(table);
 }
 
 export fn tensor_build_layer_name(layer: u32, suffix: &const byte, dest: &byte, dest_cap: usize) bool {

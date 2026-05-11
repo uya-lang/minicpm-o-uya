@@ -194,6 +194,7 @@ fn qwen3_apply_u32_metadata(config: &Qwen3Config, key: &const byte, value: u32) 
     if qwen3_cstr_eq(key, "qwen3.attention.head_count\0" as &const byte) { config.head_count = value; return; }
     if qwen3_cstr_eq(key, "qwen3.attention.head_count_kv\0" as &const byte) { config.kv_head_count = value; return; }
     if qwen3_cstr_eq(key, "qwen3.rope.dimension_count\0" as &const byte) { config.head_dim = value; return; }
+    if qwen3_cstr_eq(key, "qwen3.attention.key_length\0" as &const byte) { config.head_dim = value; return; }
 }
 
 fn qwen3_skip_metadata_value(reader: &BinaryReader, config: &Qwen3Config, key: &const byte, value_type: u32) bool {
