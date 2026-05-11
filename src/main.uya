@@ -2,6 +2,10 @@ use libc.printf;
 use libc.strcmp;
 use minicpmo.gguf.audit_gguf;
 use minicpmo.gguf.inspect_gguf;
+use minicpmo.tokenizer.tokenizer_decode_cli;
+use minicpmo.tokenizer.tokenizer_encode_cli;
+use minicpmo.tokenizer.tokenizer_format_chat_cli;
+use minicpmo.tokenizer.tokenizer_piece_cli;
 
 fn print_help() void {
     _ = printf("minicpm-o-uya - pure Uya MiniCPM-o runtime scaffold\n");
@@ -10,8 +14,12 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya --help\n");
     _ = printf("  minicpm-o-uya inspect <model.gguf>\n");
     _ = printf("  minicpm-o-uya audit <model.gguf>\n");
+    _ = printf("  minicpm-o-uya piece <model.gguf> <token-id>\n");
+    _ = printf("  minicpm-o-uya encode <model.gguf> <text>\n");
+    _ = printf("  minicpm-o-uya decode <model.gguf> <token-id>...\n");
+    _ = printf("  minicpm-o-uya format-chat <model.gguf> <user-text>\n");
     _ = printf("\n");
-    _ = printf("Status: GGUF inspect/audit are implemented; inference is not implemented yet.\n");
+    _ = printf("Status: GGUF inspect/audit and tokenizer CLI are implemented; inference is not implemented yet.\n");
 }
 
 export extern fn main(argc: i32, argv: & &byte) i32 {
@@ -32,6 +40,34 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
             return 1;
         }
         return audit_gguf(argv[2] as &const byte);
+    }
+    if strcmp(argv[1] as *const byte, "piece\0" as *const byte) == 0 {
+        if argc != 4 {
+            _ = printf("usage: minicpm-o-uya piece <model.gguf> <token-id>\n");
+            return 1;
+        }
+        return tokenizer_piece_cli(argv[2] as &const byte, argv[3] as &const byte);
+    }
+    if strcmp(argv[1] as *const byte, "encode\0" as *const byte) == 0 {
+        if argc != 4 {
+            _ = printf("usage: minicpm-o-uya encode <model.gguf> <text>\n");
+            return 1;
+        }
+        return tokenizer_encode_cli(argv[2] as &const byte, argv[3] as &const byte);
+    }
+    if strcmp(argv[1] as *const byte, "decode\0" as *const byte) == 0 {
+        if argc < 4 {
+            _ = printf("usage: minicpm-o-uya decode <model.gguf> <token-id>...\n");
+            return 1;
+        }
+        return tokenizer_decode_cli(argv[2] as &const byte, argc, argv as & &byte, 3);
+    }
+    if strcmp(argv[1] as *const byte, "format-chat\0" as *const byte) == 0 {
+        if argc != 4 {
+            _ = printf("usage: minicpm-o-uya format-chat <model.gguf> <user-text>\n");
+            return 1;
+        }
+        return tokenizer_format_chat_cli(argv[2] as &const byte, argv[3] as &const byte);
     }
     _ = printf("minicpm-o-uya: command not implemented yet: %s\n", argv[1]);
     return 1;

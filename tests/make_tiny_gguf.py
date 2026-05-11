@@ -6,6 +6,7 @@ from pathlib import Path
 GGUF_TYPE_UINT32 = 4
 GGUF_TYPE_INT32 = 5
 GGUF_TYPE_STRING = 8
+GGUF_TYPE_FLOAT32 = 6
 GGUF_TYPE_ARRAY = 9
 GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
@@ -33,6 +34,22 @@ def metadata_u32_array(key: str, values: list[int]) -> bytes:
     payload += struct.pack("<IIQ", GGUF_TYPE_ARRAY, GGUF_TYPE_UINT32, len(values))
     for value in values:
         payload += struct.pack("<I", value)
+    return payload
+
+
+def metadata_i32_array(key: str, values: list[int]) -> bytes:
+    payload = gguf_string(key)
+    payload += struct.pack("<IIQ", GGUF_TYPE_ARRAY, GGUF_TYPE_INT32, len(values))
+    for value in values:
+        payload += struct.pack("<i", value)
+    return payload
+
+
+def metadata_f32_array(key: str, values: list[float]) -> bytes:
+    payload = gguf_string(key)
+    payload += struct.pack("<IIQ", GGUF_TYPE_ARRAY, GGUF_TYPE_FLOAT32, len(values))
+    for value in values:
+        payload += struct.pack("<f", value)
     return payload
 
 
@@ -82,9 +99,19 @@ def main() -> None:
         metadata_u32("audio.whisper.block_count", 1),
         metadata_string("speech.cosyvoice2.kind", "codec-vocoder"),
         metadata_string("tokenizer.ggml.model", "gpt2"),
-        metadata_string_array("tokenizer.ggml.tokens", ["<unk>", "hello", "<image>", "<audio>", "<video>"]),
-        metadata_string("tokenizer.chat_template", "<|im_start|>user <image> <audio><|im_end|>"),
-        metadata_u32("minicpmo.media.image_token_id", 2),
+        metadata_string_array("tokenizer.ggml.tokens", [
+            "<unk>", "<s>", "</s>", "<pad>", "hello", " ", "world", "!",
+            "你好", "，", "世界", "\n", "<image>", "<audio>", "<video>", "<|im_start|>", "<|im_end|>", "user", "assistant",
+        ]),
+        metadata_f32_array("tokenizer.ggml.scores", [0.0, 0.0, 0.0, 0.0, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6, -0.7, -0.8, 0.0, 0.0, 0.0, 0.0, 0.0, -0.9, -1.0]),
+        metadata_i32_array("tokenizer.ggml.token_type", [3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 1, 1]),
+        metadata_string_array("tokenizer.ggml.merges", ["h e", "he l", "hel lo", "w o", "wo r", "wor ld"]),
+        metadata_u32("tokenizer.ggml.unknown_token_id", 0),
+        metadata_u32("tokenizer.ggml.bos_token_id", 1),
+        metadata_u32("tokenizer.ggml.eos_token_id", 2),
+        metadata_u32("tokenizer.ggml.padding_token_id", 3),
+        metadata_string("tokenizer.chat_template", "minicpmo.chatml"),
+        metadata_u32("minicpmo.media.image_token_id", 12),
         metadata_i32("test.scalar_i32", -7),
         metadata_u32_array("test.array_u32", [1, 2, 3, 5, 8]),
     ]

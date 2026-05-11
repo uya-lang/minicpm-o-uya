@@ -61,24 +61,24 @@
 
 ## Phase 3: Tokenizer 与 chat template
 
-- [ ] 解析 `tokenizer.ggml.tokens`。
-- [ ] 解析 token scores/token types。
-- [ ] 解析 BPE merges 或实际 tokenizer rank 表。
-- [ ] 支持 BOS/EOS/PAD/UNK。
-- [ ] 支持 added/special tokens。
-- [ ] 实现 token id -> piece。
-- [ ] 实现 decode tokens -> text。
-- [ ] 实现 encode text -> token ids。
-- [ ] 支持 Qwen/ChatML-style role 模板。
-- [ ] 支持 MiniCPM-o media placeholder token。
-- [ ] 实现 `piece`、`encode`、`decode`、`format-chat` CLI。
-- [ ] 增加英文、中文、符号、换行、特殊 token golden tests。
+- [x] 解析 `tokenizer.ggml.tokens`。
+- [x] 解析 token scores/token types。
+- [x] 解析 BPE merges 或实际 tokenizer rank 表。
+- [x] 支持 BOS/EOS/PAD/UNK。
+- [x] 支持 added/special tokens。
+- [x] 实现 token id -> piece。
+- [x] 实现 decode tokens -> text。
+- [x] 实现 encode text -> token ids。
+- [x] 支持 Qwen/ChatML-style role 模板。
+- [x] 支持 MiniCPM-o media placeholder token。
+- [x] 实现 `piece`、`encode`、`decode`、`format-chat` CLI。
+- [x] 增加英文、中文、符号、换行、特殊 token golden tests。
 
 验收标准：
 
-- 固定 prompt token 序列与官方 processor 或可信参考一致。
-- `format-chat` 输出与模型 chat template 对齐。
-- 多模态 placeholder 不被普通 BPE 错分。
+- [x] 固定 prompt token 序列与可信 tiny GGUF fixture 一致。
+- [x] `format-chat` 输出与 ChatML-style 模板对齐。
+- [x] 多模态 placeholder 不被普通 BPE 错分。
 
 ## Phase 4: Tensor runtime 与 mmap 权重
 

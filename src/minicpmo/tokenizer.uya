@@ -1,0 +1,583 @@
+use libc.printf;
+use libc.strcmp;
+use minicpmo.binary.BinaryReader;
+use minicpmo.binary.binary_close;
+use minicpmo.binary.binary_open;
+use minicpmo.binary.binary_read_exact;
+use minicpmo.binary.binary_read_u32_le;
+use minicpmo.binary.binary_read_u64_le;
+use minicpmo.binary.binary_read_u8;
+use minicpmo.binary.binary_reader_init;
+use minicpmo.binary.binary_skip;
+
+const TOK_GGUF_MAGIC: u32 = 0x46554747;
+const TOK_GGUF_DEFAULT_ALIGNMENT: u64 = 32;
+const TOK_GGUF_TYPE_UINT32: u32 = 4;
+const TOK_GGUF_TYPE_INT32: u32 = 5;
+const TOK_GGUF_TYPE_FLOAT32: u32 = 6;
+const TOK_GGUF_TYPE_STRING: u32 = 8;
+const TOK_GGUF_TYPE_ARRAY: u32 = 9;
+const TOKENIZER_MAX_TOKENS: usize = 4096;
+const TOKENIZER_PIECE_CAP: usize = 64;
+const TOKENIZER_MAX_MERGES: usize = 4096;
+const TOKENIZER_CHAT_TEMPLATE_CAP: usize = 512;
+const TOKENIZER_UNKNOWN_ID: u32 = 4294967295;
+
+struct TokGgufStringRead {
+    len: u64,
+    copied: usize,
+    truncated: bool,
+}
+
+struct Tokenizer {
+    token_count: usize,
+    tokens: [byte: 262144],
+    scores: [u32: 4096],
+    types: [u32: 4096],
+    merge_count: usize,
+    merges: [byte: 262144],
+    bos_id: u32,
+    eos_id: u32,
+    pad_id: u32,
+    unk_id: u32,
+    chat_template: [byte: 512],
+    has_chat_template: bool,
+}
+
+fn tokenizer_init() Tokenizer {
+    return Tokenizer{
+        token_count: 0,
+        tokens: [],
+        scores: [],
+        types: [],
+        merge_count: 0,
+        merges: [],
+        bos_id: TOKENIZER_UNKNOWN_ID,
+        eos_id: TOKENIZER_UNKNOWN_ID,
+        pad_id: TOKENIZER_UNKNOWN_ID,
+        unk_id: TOKENIZER_UNKNOWN_ID,
+        chat_template: [],
+        has_chat_template: false,
+    };
+}
+
+fn tok_cstr_len(s: &const byte) usize {
+    var len: usize = 0;
+    while s[len] != 0 {
+        len = len + 1;
+    }
+    return len;
+}
+
+fn tok_cstr_eq(a: &const byte, b: &const byte) bool {
+    return strcmp(a as *const byte, b as *const byte) == 0;
+}
+
+fn tok_cstr_starts_with(value: &const byte, prefix: &const byte) bool {
+    var i: usize = 0;
+    while prefix[i] != 0 {
+        if value[i] != prefix[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn tok_copy_cstr(dest: &byte, dest_cap: usize, src: &const byte) void {
+    if dest_cap == 0 {
+        return;
+    }
+    var i: usize = 0;
+    while i + 1 < dest_cap && src[i] != 0 {
+        dest[i] = src[i];
+        i = i + 1;
+    }
+    dest[i] = 0;
+}
+
+fn token_ptr(tok: &Tokenizer, id: usize) &const byte {
+    return &tok.tokens[id * TOKENIZER_PIECE_CAP] as &const byte;
+}
+
+fn token_mut_ptr(tok: &Tokenizer, id: usize) &byte {
+    return &tok.tokens[id * TOKENIZER_PIECE_CAP];
+}
+
+fn merge_ptr(tok: &Tokenizer, id: usize) &const byte {
+    return &tok.merges[id * TOKENIZER_PIECE_CAP] as &const byte;
+}
+
+fn merge_mut_ptr(tok: &Tokenizer, id: usize) &byte {
+    return &tok.merges[id * TOKENIZER_PIECE_CAP];
+}
+
+fn tok_read_gguf_string(reader: &BinaryReader, dest: &byte, dest_cap: usize, out: &TokGgufStringRead, context: &const byte) bool {
+    var len: u64 = 0;
+    if !binary_read_u64_le(reader, &len, context) {
+        return false;
+    }
+    out.len = len;
+    out.copied = 0;
+    out.truncated = false;
+    if dest_cap > 0 {
+        dest[0] = 0;
+    }
+    var copy_len: usize = 0;
+    if dest_cap > 1 {
+        const max_copy: u64 = (dest_cap - 1) as u64;
+        if len > max_copy {
+            copy_len = max_copy as usize;
+            out.truncated = true;
+        } else {
+            copy_len = len as usize;
+        }
+    } else if len > 0 {
+        out.truncated = true;
+    }
+    if copy_len > 0 {
+        if !binary_read_exact(reader, dest, copy_len, context) {
+            return false;
+        }
+        dest[copy_len] = 0;
+        out.copied = copy_len;
+    }
+    const remaining: u64 = len - (copy_len as u64);
+    if remaining > 0 {
+        if !binary_skip(reader, remaining, context) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn tok_scalar_metadata_size(value_type: u32) u64 {
+    if value_type == 0 { return 1; }
+    if value_type == 1 { return 1; }
+    if value_type == 7 { return 1; }
+    if value_type == 2 { return 2; }
+    if value_type == 3 { return 2; }
+    if value_type == 4 { return 4; }
+    if value_type == 5 { return 4; }
+    if value_type == 6 { return 4; }
+    if value_type == 10 { return 8; }
+    if value_type == 11 { return 8; }
+    if value_type == 12 { return 8; }
+    return 0;
+}
+
+fn tok_skip_metadata_array(reader: &BinaryReader, element_type: u32, count: u64) bool {
+    const elem_size: u64 = tok_scalar_metadata_size(element_type);
+    if elem_size > 0 {
+        if count > ((reader.size - reader.pos) / elem_size) {
+            _ = printf("error: tokenizer metadata array truncated\n");
+            return false;
+        }
+        return binary_skip(reader, count * elem_size, "metadata scalar array\0" as &const byte);
+    }
+    if element_type == TOK_GGUF_TYPE_STRING {
+        var tmp: [byte: 1] = [];
+        var info: TokGgufStringRead = TokGgufStringRead{ len: 0, copied: 0, truncated: false };
+        var i: u64 = 0;
+        while i < count {
+            if !tok_read_gguf_string(reader, &tmp[0], 1, &info, "metadata string array element\0" as &const byte) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    _ = printf("error: unsupported tokenizer metadata array element type %u\n", element_type);
+    return false;
+}
+
+fn read_token_array(reader: &BinaryReader, tok: &Tokenizer, count: u64) bool {
+    if count > TOKENIZER_MAX_TOKENS as u64 {
+        _ = printf("error: tokenizer has too many tokens (%llu > %zu)\n", count, TOKENIZER_MAX_TOKENS);
+        return false;
+    }
+    var info: TokGgufStringRead = TokGgufStringRead{ len: 0, copied: 0, truncated: false };
+    var i: u64 = 0;
+    while i < count {
+        if !tok_read_gguf_string(reader, token_mut_ptr(tok, i as usize), TOKENIZER_PIECE_CAP, &info, "tokenizer token\0" as &const byte) {
+            return false;
+        }
+        if info.truncated {
+            _ = printf("error: tokenizer token %llu exceeds local piece cap\n", i);
+            return false;
+        }
+        i = i + 1;
+    }
+    tok.token_count = count as usize;
+    return true;
+}
+
+fn read_merge_array(reader: &BinaryReader, tok: &Tokenizer, count: u64) bool {
+    if count > TOKENIZER_MAX_MERGES as u64 {
+        _ = printf("error: tokenizer has too many merges (%llu > %zu)\n", count, TOKENIZER_MAX_MERGES);
+        return false;
+    }
+    var info: TokGgufStringRead = TokGgufStringRead{ len: 0, copied: 0, truncated: false };
+    var i: u64 = 0;
+    while i < count {
+        if !tok_read_gguf_string(reader, merge_mut_ptr(tok, i as usize), TOKENIZER_PIECE_CAP, &info, "tokenizer merge\0" as &const byte) {
+            return false;
+        }
+        if info.truncated {
+            _ = printf("error: tokenizer merge %llu exceeds local piece cap\n", i);
+            return false;
+        }
+        i = i + 1;
+    }
+    tok.merge_count = count as usize;
+    return true;
+}
+
+fn read_u32_array(reader: &BinaryReader, dest: &u32, dest_cap: usize, count: u64, context: &const byte) bool {
+    if count > dest_cap as u64 {
+        _ = printf("error: %s has too many entries (%llu > %zu)\n", context, count, dest_cap);
+        return false;
+    }
+    var i: u64 = 0;
+    while i < count {
+        if !binary_read_u32_le(reader, &dest[i as usize], context) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn handle_array_metadata(reader: &BinaryReader, tok: &Tokenizer, key: &const byte) bool {
+    var element_type: u32 = 0;
+    var count: u64 = 0;
+    if !binary_read_u32_le(reader, &element_type, "metadata array element type\0" as &const byte) { return false; }
+    if !binary_read_u64_le(reader, &count, "metadata array length\0" as &const byte) { return false; }
+
+    if tok_cstr_eq(key, "tokenizer.ggml.tokens\0" as &const byte) {
+        if element_type != TOK_GGUF_TYPE_STRING {
+            _ = printf("error: tokenizer.ggml.tokens must be string array\n");
+            return false;
+        }
+        return read_token_array(reader, tok, count);
+    }
+    if tok_cstr_eq(key, "tokenizer.ggml.merges\0" as &const byte) {
+        if element_type != TOK_GGUF_TYPE_STRING {
+            _ = printf("error: tokenizer.ggml.merges must be string array\n");
+            return false;
+        }
+        return read_merge_array(reader, tok, count);
+    }
+    if tok_cstr_eq(key, "tokenizer.ggml.scores\0" as &const byte) {
+        if element_type != TOK_GGUF_TYPE_FLOAT32 {
+            _ = printf("error: tokenizer.ggml.scores must be float32 array\n");
+            return false;
+        }
+        return read_u32_array(reader, &tok.scores[0], TOKENIZER_MAX_TOKENS, count, "tokenizer scores\0" as &const byte);
+    }
+    if tok_cstr_eq(key, "tokenizer.ggml.token_type\0" as &const byte) || tok_cstr_eq(key, "tokenizer.ggml.token_types\0" as &const byte) {
+        if element_type != TOK_GGUF_TYPE_INT32 && element_type != TOK_GGUF_TYPE_UINT32 {
+            _ = printf("error: tokenizer token types must be int32/uint32 array\n");
+            return false;
+        }
+        return read_u32_array(reader, &tok.types[0], TOKENIZER_MAX_TOKENS, count, "tokenizer token types\0" as &const byte);
+    }
+    return tok_skip_metadata_array(reader, element_type, count);
+}
+
+fn skip_metadata_value(reader: &BinaryReader, tok: &Tokenizer, key: &const byte, value_type: u32, alignment: &u64) bool {
+    if value_type == TOK_GGUF_TYPE_STRING {
+        var value: [byte: 512] = [];
+        var info: TokGgufStringRead = TokGgufStringRead{ len: 0, copied: 0, truncated: false };
+        if !tok_read_gguf_string(reader, &value[0], @len(value), &info, "metadata string value\0" as &const byte) {
+            return false;
+        }
+        if tok_cstr_eq(key, "tokenizer.chat_template\0" as &const byte) || tok_cstr_eq(key, "tokenizer.ggml.chat_template\0" as &const byte) {
+            tok_copy_cstr(&tok.chat_template[0], TOKENIZER_CHAT_TEMPLATE_CAP, &value[0] as &const byte);
+            tok.has_chat_template = true;
+        }
+        return true;
+    }
+    if value_type == TOK_GGUF_TYPE_ARRAY {
+        return handle_array_metadata(reader, tok, key);
+    }
+    if value_type == TOK_GGUF_TYPE_UINT32 {
+        var value: u32 = 0;
+        if !binary_read_u32_le(reader, &value, "metadata uint32 value\0" as &const byte) { return false; }
+        if tok_cstr_eq(key, "general.alignment\0" as &const byte) {
+            if value == 0 { return false; }
+            *alignment = value as u64;
+        } else if tok_cstr_eq(key, "tokenizer.ggml.bos_token_id\0" as &const byte) {
+            tok.bos_id = value;
+        } else if tok_cstr_eq(key, "tokenizer.ggml.eos_token_id\0" as &const byte) {
+            tok.eos_id = value;
+        } else if tok_cstr_eq(key, "tokenizer.ggml.padding_token_id\0" as &const byte) || tok_cstr_eq(key, "tokenizer.ggml.pad_token_id\0" as &const byte) {
+            tok.pad_id = value;
+        } else if tok_cstr_eq(key, "tokenizer.ggml.unknown_token_id\0" as &const byte) || tok_cstr_eq(key, "tokenizer.ggml.unk_token_id\0" as &const byte) {
+            tok.unk_id = value;
+        }
+        return true;
+    }
+    if value_type == TOK_GGUF_TYPE_INT32 {
+        var signed_bits: u32 = 0;
+        if !binary_read_u32_le(reader, &signed_bits, "metadata int32 value\0" as &const byte) { return false; }
+        const value: u32 = signed_bits;
+        if tok_cstr_eq(key, "tokenizer.ggml.bos_token_id\0" as &const byte) {
+            tok.bos_id = value;
+        } else if tok_cstr_eq(key, "tokenizer.ggml.eos_token_id\0" as &const byte) {
+            tok.eos_id = value;
+        } else if tok_cstr_eq(key, "tokenizer.ggml.padding_token_id\0" as &const byte) || tok_cstr_eq(key, "tokenizer.ggml.pad_token_id\0" as &const byte) {
+            tok.pad_id = value;
+        } else if tok_cstr_eq(key, "tokenizer.ggml.unknown_token_id\0" as &const byte) || tok_cstr_eq(key, "tokenizer.ggml.unk_token_id\0" as &const byte) {
+            tok.unk_id = value;
+        }
+        return true;
+    }
+    const size: u64 = tok_scalar_metadata_size(value_type);
+    if size > 0 {
+        return binary_skip(reader, size, "metadata scalar value\0" as &const byte);
+    }
+    _ = printf("error: unsupported metadata type while loading tokenizer: %u\n", value_type);
+    return false;
+}
+
+fn tokenizer_load(path: &const byte, tok: &Tokenizer) bool {
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) {
+        return false;
+    }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var tensor_count: u64 = 0;
+    var metadata_count: u64 = 0;
+    var alignment: u64 = TOK_GGUF_DEFAULT_ALIGNMENT;
+    if !binary_read_u32_le(&reader, &magic, "GGUF magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != TOK_GGUF_MAGIC {
+        _ = printf("error: bad GGUF magic 0x%x\n", magic);
+        binary_close(&reader);
+        return false;
+    }
+    if !binary_read_u32_le(&reader, &version, "GGUF version\0" as &const byte) { binary_close(&reader); return false; }
+    if version != 2 && version != 3 {
+        _ = printf("error: unsupported GGUF version %u\n", version);
+        binary_close(&reader);
+        return false;
+    }
+    if !binary_read_u64_le(&reader, &tensor_count, "GGUF tensor_count\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &metadata_count, "GGUF metadata_count\0" as &const byte) { binary_close(&reader); return false; }
+
+    var i: u64 = 0;
+    while i < metadata_count {
+        var key: [byte: 257] = [];
+        var key_info: TokGgufStringRead = TokGgufStringRead{ len: 0, copied: 0, truncated: false };
+        if !tok_read_gguf_string(&reader, &key[0], @len(key), &key_info, "metadata key\0" as &const byte) { binary_close(&reader); return false; }
+        var value_type: u32 = 0;
+        if !binary_read_u32_le(&reader, &value_type, "metadata value type\0" as &const byte) { binary_close(&reader); return false; }
+        if !skip_metadata_value(&reader, tok, &key[0] as &const byte, value_type, &alignment) { binary_close(&reader); return false; }
+        i = i + 1;
+    }
+    binary_close(&reader);
+
+    if tok.token_count == 0 {
+        _ = printf("error: tokenizer.ggml.tokens not found\n");
+        return false;
+    }
+    return true;
+}
+
+fn find_token(tok: &Tokenizer, piece: &const byte) u32 {
+    var i: usize = 0;
+    while i < tok.token_count {
+        if tok_cstr_eq(token_ptr(tok, i), piece) {
+            return i as u32;
+        }
+        i = i + 1;
+    }
+    return TOKENIZER_UNKNOWN_ID;
+}
+
+fn is_special_piece(piece: &const byte) bool {
+    if piece[0] == 60 {
+        return true;
+    }
+    if tok_cstr_starts_with(piece, "<|\0" as &const byte) {
+        return true;
+    }
+    return false;
+}
+
+fn try_match_special(tok: &Tokenizer, text: &const byte, pos: usize, out_id: &u32, out_len: &usize) bool {
+    var best_len: usize = 0;
+    var best_id: u32 = TOKENIZER_UNKNOWN_ID;
+    var i: usize = 0;
+    while i < tok.token_count {
+        const piece: &const byte = token_ptr(tok, i);
+        if is_special_piece(piece) {
+            var j: usize = 0;
+            var matched: bool = true;
+            while piece[j] != 0 {
+                if text[pos + j] == 0 || text[pos + j] != piece[j] {
+                    matched = false;
+                    break;
+                }
+                j = j + 1;
+            }
+            if matched && j > best_len {
+                best_len = j;
+                best_id = i as u32;
+            }
+        }
+        i = i + 1;
+    }
+    if best_id != TOKENIZER_UNKNOWN_ID {
+        *out_id = best_id;
+        *out_len = best_len;
+        return true;
+    }
+    return false;
+}
+
+fn try_match_plain_token(tok: &Tokenizer, text: &const byte, pos: usize, out_id: &u32, out_len: &usize) bool {
+    var best_len: usize = 0;
+    var best_id: u32 = TOKENIZER_UNKNOWN_ID;
+    var i: usize = 0;
+    while i < tok.token_count {
+        const piece: &const byte = token_ptr(tok, i);
+        if !is_special_piece(piece) {
+            var j: usize = 0;
+            var matched: bool = true;
+            while piece[j] != 0 {
+                if text[pos + j] == 0 || text[pos + j] != piece[j] {
+                    matched = false;
+                    break;
+                }
+                j = j + 1;
+            }
+            if matched && j > best_len {
+                best_len = j;
+                best_id = i as u32;
+            }
+        }
+        i = i + 1;
+    }
+    if best_id != TOKENIZER_UNKNOWN_ID {
+        *out_id = best_id;
+        *out_len = best_len;
+        return true;
+    }
+    return false;
+}
+
+fn parse_u32(s: &const byte, out: &u32) bool {
+    var i: usize = 0;
+    var value: u32 = 0;
+    if s[0] == 0 {
+        return false;
+    }
+    while s[i] != 0 {
+        if s[i] < 48 || s[i] > 57 {
+            return false;
+        }
+        value = value * 10 + ((s[i] - 48) as u32);
+        i = i + 1;
+    }
+    *out = value;
+    return true;
+}
+
+fn print_token_id(id: u32, first: bool) void {
+    if !first {
+        _ = printf(" ");
+    }
+    _ = printf("%u", id);
+}
+
+export fn tokenizer_piece_cli(path: &const byte, id_text: &const byte) i32 {
+    var tok: Tokenizer = tokenizer_init();
+    if !tokenizer_load(path, &tok) { return 1; }
+    var id: u32 = 0;
+    if !parse_u32(id_text, &id) {
+        _ = printf("error: invalid token id: %s\n", id_text);
+        return 1;
+    }
+    if id >= tok.token_count as u32 {
+        _ = printf("error: token id out of range: %u (vocab=%zu)\n", id, tok.token_count);
+        return 1;
+    }
+    _ = printf("%s\n", token_ptr(&tok, id as usize));
+    return 0;
+}
+
+export fn tokenizer_decode_cli(path: &const byte, argc: i32, argv: & &byte, start_index: i32) i32 {
+    var tok: Tokenizer = tokenizer_init();
+    if !tokenizer_load(path, &tok) { return 1; }
+    var i: i32 = start_index;
+    while i < argc {
+        var id: u32 = 0;
+        if !parse_u32(argv[i] as &const byte, &id) {
+            _ = printf("error: invalid token id: %s\n", argv[i]);
+            return 1;
+        }
+        if id >= tok.token_count as u32 {
+            _ = printf("error: token id out of range: %u (vocab=%zu)\n", id, tok.token_count);
+            return 1;
+        }
+        _ = printf("%s", token_ptr(&tok, id as usize));
+        i = i + 1;
+    }
+    _ = printf("\n");
+    return 0;
+}
+
+export fn tokenizer_encode_cli(path: &const byte, text: &const byte) i32 {
+    var tok: Tokenizer = tokenizer_init();
+    if !tokenizer_load(path, &tok) { return 1; }
+    var pos: usize = 0;
+    var first: bool = true;
+    while text[pos] != 0 {
+        var id: u32 = TOKENIZER_UNKNOWN_ID;
+        var match_len: usize = 0;
+        if try_match_special(&tok, text, pos, &id, &match_len) || try_match_plain_token(&tok, text, pos, &id, &match_len) {
+            print_token_id(id, first);
+            first = false;
+            pos = pos + match_len;
+        } else {
+            var piece: [byte: 2] = [];
+            piece[0] = text[pos];
+            piece[1] = 0;
+            id = find_token(&tok, &piece[0] as &const byte);
+            if id == TOKENIZER_UNKNOWN_ID {
+                if tok.unk_id != TOKENIZER_UNKNOWN_ID {
+                    id = tok.unk_id;
+                } else {
+                    _ = printf("\nerror: no token for byte at offset %zu\n", pos);
+                    return 1;
+                }
+            }
+            print_token_id(id, first);
+            first = false;
+            pos = pos + 1;
+        }
+    }
+    _ = printf("\n");
+    return 0;
+}
+
+fn print_chat_default(user_text: &const byte) void {
+    _ = printf("<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user_text);
+}
+
+export fn tokenizer_format_chat_cli(path: &const byte, user_text: &const byte) i32 {
+    var tok: Tokenizer = tokenizer_init();
+    if !tokenizer_load(path, &tok) { return 1; }
+    if !tok.has_chat_template {
+        print_chat_default(user_text);
+        return 0;
+    }
+    if tok_cstr_eq(&tok.chat_template[0] as &const byte, "minicpmo.chatml\0" as &const byte) || tok_cstr_starts_with(&tok.chat_template[0] as &const byte, "<|im_start|>\0" as &const byte) {
+        print_chat_default(user_text);
+        return 0;
+    }
+    _ = printf("%s\n", &tok.chat_template[0]);
+    return 0;
+}

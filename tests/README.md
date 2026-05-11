@@ -21,4 +21,6 @@ Run `python3 tests/make_tiny_gguf.py` to generate:
 - `tests/fixtures/tiny.gguf.part` — truncated file used to verify short-read errors.
 - `tests/fixtures/bad_schema.gguf` — generated unsupported schema used to verify missing tokenizer/root tensor, unknown dtype, and unknown branch diagnostics.
 
-`make test` builds the CLI, runs `inspect` and `audit` on `tiny.gguf`, confirms the truncated fixture fails cleanly, and checks unsupported-schema diagnostics without reading tensor data.
+`make test` builds the CLI, runs `inspect`, `audit`, tokenizer piece/encode/decode, and `format-chat` on `tiny.gguf`, confirms the truncated fixture fails cleanly, and checks unsupported-schema diagnostics without reading tensor data.
+
+Tokenizer golden coverage includes English, Chinese punctuation, newline-capable vocabulary, and MiniCPM-o media placeholders such as `<image>` and `<audio>` so they are matched as whole tokens.

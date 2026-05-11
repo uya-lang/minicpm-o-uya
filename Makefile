@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture minicpmo-audit clean
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture minicpmo-audit clean
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -37,6 +37,22 @@ audit-fixture: build fixtures
 	grep -q "unsupported: missing root token embedding tensor" /tmp/minicpm-o-uya-audit-bad.out
 	grep -q "unsupported: unknown tensor dtype" /tmp/minicpm-o-uya-audit-bad.out
 	grep -q "unsupported: unclassified tensor branch" /tmp/minicpm-o-uya-audit-bad.out
+
+
+tokenizer-fixture: build fixtures
+	$(OUT) piece tests/fixtures/tiny.gguf 4 >/tmp/minicpm-o-uya-piece.out
+	grep -qx "hello" /tmp/minicpm-o-uya-piece.out
+	$(OUT) decode tests/fixtures/tiny.gguf 4 5 6 7 >/tmp/minicpm-o-uya-decode.out
+	grep -qx "hello world!" /tmp/minicpm-o-uya-decode.out
+	$(OUT) encode tests/fixtures/tiny.gguf "hello world!" >/tmp/minicpm-o-uya-encode-en.out
+	grep -qx "4 5 6 7" /tmp/minicpm-o-uya-encode-en.out
+	$(OUT) encode tests/fixtures/tiny.gguf "你好，世界" >/tmp/minicpm-o-uya-encode-zh.out
+	grep -qx "8 9 10" /tmp/minicpm-o-uya-encode-zh.out
+	$(OUT) encode tests/fixtures/tiny.gguf "<image> hello <audio>" >/tmp/minicpm-o-uya-encode-media.out
+	grep -qx "12 5 4 5 13" /tmp/minicpm-o-uya-encode-media.out
+	$(OUT) format-chat tests/fixtures/tiny.gguf "<image> hello" >/tmp/minicpm-o-uya-chat.out
+	grep -q "<|im_start|>user" /tmp/minicpm-o-uya-chat.out
+	grep -q "<image> hello<|im_end|>" /tmp/minicpm-o-uya-chat.out
 
 minicpmo-audit: build
 	@if [ -z "$(MINICPM_O_GGUF)" ]; then \
