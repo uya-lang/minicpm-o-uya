@@ -12,6 +12,74 @@ GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
 
 
+def f16_bits(value: float) -> int:
+    if value == 0.0:
+        return 0
+    sign = 0
+    if value < 0:
+        sign = 1
+        value = -value
+    exp = 0
+    while value >= 2.0:
+        value *= 0.5
+        exp += 1
+    while value < 1.0:
+        value *= 2.0
+        exp -= 1
+    exp_bits = exp + 15
+    frac = int((value - 1.0) * 1024.0 + 0.5)
+    if frac >= 1024:
+        frac = 0
+        exp_bits += 1
+    return (sign << 15) | (exp_bits << 10) | frac
+
+
+def pack_tensor_values(name: str, dims: list[int], ggml_type: int) -> bytes:
+    elements = 1
+    for dim in dims:
+        elements *= dim
+    values = []
+    if name == "token_embd.weight":
+        for token in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if row == (token % dims[0]) else 0.0)
+    elif name == "output_norm.weight":
+        values = [1.0] * elements
+    elif name == "output.weight":
+        for vocab in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if row == (vocab % dims[0]) else 0.0)
+    elif name.endswith("attn_norm.weight") or name.endswith("ffn_norm.weight"):
+        values = [1.0] * elements
+    elif name.endswith("attn_q.weight"):
+        for col in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if row == col else 0.0)
+    elif name.endswith("attn_k.weight") or name.endswith("attn_v.weight"):
+        for col in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if row == col else 0.0)
+    elif name.endswith("attn_output.weight"):
+        for col in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if row == col else 0.0)
+    elif name.endswith("attn_q_norm.weight") or name.endswith("attn_k_norm.weight"):
+        values = [1.0] * elements
+    elif name.endswith("ffn_gate.weight"):
+        values = [0.0] * elements
+    elif name.endswith("ffn_up.weight"):
+        values = [0.0] * elements
+    elif name.endswith("ffn_down.weight"):
+        values = [0.0] * elements
+    else:
+        values = [0.0] * elements
+    if ggml_type == GGML_TYPE_F32:
+        return b"".join(struct.pack("<f", value) for value in values)
+    if ggml_type == GGML_TYPE_F16:
+        return b"".join(struct.pack("<H", f16_bits(value)) for value in values)
+    raise ValueError(f"unsupported ggml type {ggml_type}")
+
+
 def gguf_string(value: str) -> bytes:
     raw = value.encode("utf-8")
     return struct.pack("<Q", len(raw)) + raw
@@ -160,7 +228,7 @@ def main() -> None:
             tensor_data.extend(b"\x00" * (offset - len(tensor_data)))
         size = tensor_size(dims, ggml_type)
         tensors.append(tensor_info(name, dims, ggml_type, offset))
-        tensor_data.extend(((index * 37 + i) & 0xFF) for i in range(size))
+        tensor_data.extend(pack_tensor_values(name, dims, ggml_type))
         offset += size
 
     header = struct.pack("<IIQQ", 0x46554747, 3, len(tensors), len(metadata))
@@ -189,7 +257,7 @@ def main() -> None:
             missing_q_data.extend(b"\x00" * (offset - len(missing_q_data)))
         size = tensor_size(dims, ggml_type)
         missing_q_tensors.append(tensor_info(name, dims, ggml_type, offset))
-        missing_q_data.extend(((index * 19 + i) & 0xFF) for i in range(size))
+        missing_q_data.extend(pack_tensor_values(name, dims, ggml_type))
         offset += size
     missing_q_directory = struct.pack("<IIQQ", 0x46554747, 3, len(missing_q_tensors), len(metadata)) + b"".join(metadata) + b"".join(missing_q_tensors)
     missing_q_data_start = align_up(len(missing_q_directory), 32)

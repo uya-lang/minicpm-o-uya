@@ -29,7 +29,7 @@ struct TokGgufStringRead {
     truncated: bool,
 }
 
-struct Tokenizer {
+export struct Tokenizer {
     token_count: usize,
     tokens: [byte: 262144],
     scores: [u32: 4096],
@@ -44,7 +44,7 @@ struct Tokenizer {
     has_chat_template: bool,
 }
 
-fn tokenizer_init() Tokenizer {
+export fn tokenizer_init() Tokenizer {
     return Tokenizer{
         token_count: 0,
         tokens: [],
@@ -341,7 +341,7 @@ fn skip_metadata_value(reader: &BinaryReader, tok: &Tokenizer, key: &const byte,
     return false;
 }
 
-fn tokenizer_load(path: &const byte, tok: &Tokenizer) bool {
+export fn tokenizer_load(path: &const byte, tok: &Tokenizer) bool {
     var reader: BinaryReader = binary_reader_init();
     if !binary_open(path, &reader) {
         return false;
@@ -490,6 +490,49 @@ fn print_token_id(id: u32, first: bool) void {
         _ = printf(" ");
     }
     _ = printf("%u", id);
+}
+
+
+export fn tokenizer_encode_to_ids(tok: &Tokenizer, text: &const byte, out_ids: &u32, out_cap: usize, out_count: &usize) bool {
+    *out_count = 0;
+    var pos: usize = 0;
+    while text[pos] != 0 {
+        if *out_count >= out_cap {
+            _ = printf("error: encoded prompt exceeds token buffer cap=%zu
+", out_cap);
+            return false;
+        }
+        var id: u32 = TOKENIZER_UNKNOWN_ID;
+        var match_len: usize = 0;
+        if try_match_special(tok, text, pos, &id, &match_len) || try_match_plain_token(tok, text, pos, &id, &match_len) {
+            out_ids[*out_count] = id;
+            *out_count = *out_count + 1;
+            pos = pos + match_len;
+        } else {
+            var piece: [byte: 2] = [];
+            piece[0] = text[pos];
+            piece[1] = 0;
+            id = find_token(tok, &piece[0] as &const byte);
+            if id == TOKENIZER_UNKNOWN_ID {
+                if tok.unk_id != TOKENIZER_UNKNOWN_ID {
+                    id = tok.unk_id;
+                } else {
+                    _ = printf("error: no token for byte at offset %zu
+", pos);
+                    return false;
+                }
+            }
+            out_ids[*out_count] = id;
+            *out_count = *out_count + 1;
+            pos = pos + 1;
+        }
+    }
+    return true;
+}
+
+export fn tokenizer_piece(tok: &Tokenizer, id: u32) &const byte {
+    if id >= tok.token_count as u32 { return " " as &const byte; }
+    return token_ptr(tok, id as usize);
 }
 
 export fn tokenizer_piece_cli(path: &const byte, id_text: &const byte) i32 {

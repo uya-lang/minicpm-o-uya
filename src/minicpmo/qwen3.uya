@@ -1,4 +1,5 @@
 use libc.printf;
+use libc.sqrtf;
 use libc.strcmp;
 use minicpmo.binary.BinaryReader;
 use minicpmo.binary.binary_close;
@@ -8,6 +9,11 @@ use minicpmo.binary.binary_read_u32_le;
 use minicpmo.binary.binary_read_u64_le;
 use minicpmo.binary.binary_reader_init;
 use minicpmo.binary.binary_skip;
+use minicpmo.kernels.bf16_load_f32;
+use minicpmo.kernels.f16_load_f32;
+use minicpmo.kernels.rope_rotate_pair;
+use minicpmo.kernels.silu;
+use minicpmo.kernels.softmax;
 use minicpmo.tensor.TensorDType;
 use minicpmo.tensor.TensorView;
 use minicpmo.tensor.TensorWeightTable;
@@ -17,7 +23,14 @@ use minicpmo.tensor.tensor_lookup;
 use minicpmo.tensor.tensor_lookup_root_output;
 use minicpmo.tensor.tensor_lookup_root_token_embedding;
 use minicpmo.tensor.tensor_table_init;
+use minicpmo.tensor.tensor_weight_table_attach_mmap;
+use minicpmo.tensor.tensor_weight_table_detach_mmap;
 use minicpmo.tensor.tensor_weight_table_load;
+use minicpmo.tokenizer.Tokenizer;
+use minicpmo.tokenizer.tokenizer_encode_to_ids;
+use minicpmo.tokenizer.tokenizer_init;
+use minicpmo.tokenizer.tokenizer_load;
+use minicpmo.tokenizer.tokenizer_piece;
 
 const QWEN3_GGUF_MAGIC: u32 = 0x46554747;
 const QWEN3_GGUF_TYPE_UINT32: u32 = 4;
@@ -29,6 +42,15 @@ const QWEN3_GGUF_TYPE_UINT64: u32 = 10;
 const QWEN3_GGUF_TYPE_INT64: u32 = 11;
 const QWEN3_GGUF_TYPE_FLOAT64: u32 = 12;
 const QWEN3_MAX_LAYERS: usize = 64;
+const QWEN3_FORWARD_MAX_LAYERS: usize = 4;
+const QWEN3_FORWARD_MAX_CONTEXT: usize = 64;
+const QWEN3_FORWARD_MAX_HIDDEN: usize = 64;
+const QWEN3_FORWARD_MAX_FFN: usize = 256;
+const QWEN3_FORWARD_MAX_QDIM: usize = 64;
+const QWEN3_FORWARD_MAX_KVDIM: usize = 64;
+const QWEN3_FORWARD_MAX_VOCAB: usize = 256;
+const QWEN3_FORWARD_MAX_PROMPT: usize = 64;
+const QWEN3_FORWARD_EPS: f32 = 0.000001;
 
 export struct Qwen3Config {
     vocab_size: u32,
@@ -372,5 +394,252 @@ export fn qwen3_bind_cli(path: &const byte) i32 {
     _ = printf("qwen3 bind: token_embd=%s output_norm=%s output=%s layers=%u q_norm=%s k_norm=%s\n", &weights.token_embedding.name[0], &weights.output_norm.name[0], &weights.output.name[0], weights.layer_count, q_norm_label, k_norm_label);
     _ = printf("qwen3 layer[0]: attn_norm=%s q=%s k=%s v=%s o=%s ffn_norm=%s gate=%s up=%s down=%s\n", &weights.layers[0].attn_norm.name[0], &weights.layers[0].q_proj.name[0], &weights.layers[0].k_proj.name[0], &weights.layers[0].v_proj.name[0], &weights.layers[0].o_proj.name[0], &weights.layers[0].ffn_norm.name[0], &weights.layers[0].gate_proj.name[0], &weights.layers[0].up_proj.name[0], &weights.layers[0].down_proj.name[0]);
     _ = printf("qwen3 bind: PASS\n");
+    return 0;
+}
+
+
+fn qwen3_read_u16_at(data: &const byte, byte_offset: usize) u16 {
+    return (data[byte_offset] as u16) | ((data[byte_offset + (1 as usize)] as u16) << 8);
+}
+
+fn qwen3_tensor_get(view: &TensorView, index: usize) f32 {
+    if view.dtype == TensorDType.F16 {
+        return f16_load_f32(qwen3_read_u16_at(view.data, index * (2 as usize)));
+    }
+    if view.dtype == TensorDType.BF16 {
+        return bf16_load_f32(qwen3_read_u16_at(view.data, index * (2 as usize)));
+    }
+    if view.dtype == TensorDType.F32 {
+        const ptr: &const f32 = &view.data[index * (4 as usize)] as &const f32;
+        return ptr[0];
+    }
+    return 0.0 as f32;
+}
+
+fn qwen3_check_forward_caps(config: &Qwen3Config) bool {
+    const q_dim: u32 = config.head_count * config.head_dim;
+    const kv_dim: u32 = config.kv_head_count * config.head_dim;
+    if config.layer_count == 0 || config.layer_count > QWEN3_FORWARD_MAX_LAYERS as u32 { _ = printf("error: qwen3 forward layer_count=%u exceeds cap=%zu\n", config.layer_count, QWEN3_FORWARD_MAX_LAYERS); return false; }
+    if config.context_length == 0 || config.context_length > QWEN3_FORWARD_MAX_CONTEXT as u32 { _ = printf("error: qwen3 forward context_length=%u exceeds cap=%zu\n", config.context_length, QWEN3_FORWARD_MAX_CONTEXT); return false; }
+    if config.hidden_size == 0 || config.hidden_size > QWEN3_FORWARD_MAX_HIDDEN as u32 { _ = printf("error: qwen3 forward hidden_size=%u exceeds cap=%zu\n", config.hidden_size, QWEN3_FORWARD_MAX_HIDDEN); return false; }
+    if config.intermediate_size == 0 || config.intermediate_size > QWEN3_FORWARD_MAX_FFN as u32 { _ = printf("error: qwen3 forward intermediate_size=%u exceeds cap=%zu\n", config.intermediate_size, QWEN3_FORWARD_MAX_FFN); return false; }
+    if q_dim == 0 || q_dim > QWEN3_FORWARD_MAX_QDIM as u32 { _ = printf("error: qwen3 forward q_dim=%u exceeds cap=%zu\n", q_dim, QWEN3_FORWARD_MAX_QDIM); return false; }
+    if kv_dim == 0 || kv_dim > QWEN3_FORWARD_MAX_KVDIM as u32 { _ = printf("error: qwen3 forward kv_dim=%u exceeds cap=%zu\n", kv_dim, QWEN3_FORWARD_MAX_KVDIM); return false; }
+    if config.vocab_size == 0 || config.vocab_size > QWEN3_FORWARD_MAX_VOCAB as u32 { _ = printf("error: qwen3 forward vocab_size=%u exceeds cap=%zu\n", config.vocab_size, QWEN3_FORWARD_MAX_VOCAB); return false; }
+    return true;
+}
+
+fn qwen3_copy_embedding(dst: &f32, emb: &TensorView, token_id: u32, hidden: usize, vocab: usize) void {
+    var i: usize = 0;
+    while i < hidden {
+        dst[i] = qwen3_tensor_get(emb, i * vocab + token_id as usize);
+        i = i + 1;
+    }
+}
+
+fn qwen3_rms_norm_view(dst: &f32, src: &const f32, weight: &TensorView, n: usize) void {
+    var sum: f32 = 0.0;
+    var i: usize = 0;
+    while i < n { sum = sum + src[i] * src[i]; i = i + 1; }
+    const inv: f32 = 1.0 / sqrtf(sum / (n as f32) + QWEN3_FORWARD_EPS);
+    i = 0;
+    while i < n {
+        dst[i] = src[i] * inv * qwen3_tensor_get(weight, i);
+        i = i + 1;
+    }
+}
+
+fn qwen3_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) void {
+    var j: usize = 0;
+    while j < out_dim {
+        var sum: f32 = 0.0;
+        var i: usize = 0;
+        while i < in_dim {
+            sum = sum + x[i] * qwen3_tensor_get(matrix, i * out_dim + j);
+            i = i + 1;
+        }
+        dst[j] = sum;
+        j = j + 1;
+    }
+}
+
+fn qwen3_apply_head_norm(vec: &f32, norm: &TensorView, head_count: usize, head_dim: usize) void {
+    var h: usize = 0;
+    while h < head_count {
+        const base: usize = h * head_dim;
+        var sum: f32 = 0.0;
+        var d: usize = 0;
+        while d < head_dim { sum = sum + vec[base + d] * vec[base + d]; d = d + 1; }
+        const inv: f32 = 1.0 / sqrtf(sum / (head_dim as f32) + QWEN3_FORWARD_EPS);
+        d = 0;
+        while d < head_dim {
+            vec[base + d] = vec[base + d] * inv * qwen3_tensor_get(norm, d);
+            d = d + 1;
+        }
+        h = h + 1;
+    }
+}
+
+fn qwen3_apply_rope(vec: &f32, head_count: usize, head_dim: usize, pos: usize) void {
+    var h: usize = 0;
+    while h < head_count {
+        const base: usize = h * head_dim;
+        var d: usize = 0;
+        while d + (1 as usize) < head_dim {
+            const theta: f32 = (pos as f32) * (((d / (2 as usize)) + (1 as usize)) as f32) * 0.01;
+            rope_rotate_pair(&vec[base + d], &vec[base + d + (1 as usize)], theta);
+            d = d + (2 as usize);
+        }
+        h = h + 1;
+    }
+}
+
+fn qwen3_cache_index(layer: usize, pos: usize, dim: usize) usize {
+    return (layer * QWEN3_FORWARD_MAX_CONTEXT + pos) * QWEN3_FORWARD_MAX_KVDIM + dim;
+}
+
+fn qwen3_write_kv_cache(k_cache: &f32, v_cache: &f32, layer: usize, pos: usize, k: &const f32, v: &const f32, kv_dim: usize) void {
+    var d: usize = 0;
+    while d < kv_dim {
+        const idx: usize = qwen3_cache_index(layer, pos, d);
+        k_cache[idx] = k[d];
+        v_cache[idx] = v[d];
+        d = d + 1;
+    }
+}
+
+fn qwen3_attention(out: &f32, q: &const f32, k_cache: &const f32, v_cache: &const f32, layer: usize, pos: usize, head_count: usize, kv_head_count: usize, head_dim: usize) void {
+    var i: usize = 0;
+    const q_dim: usize = head_count * head_dim;
+    while i < q_dim { out[i] = 0.0; i = i + 1; }
+    var scores: [f32: 64] = [];
+    var probs: [f32: 64] = [];
+    const scale: f32 = 1.0 / sqrtf(head_dim as f32);
+    var h: usize = 0;
+    while h < head_count {
+        const kvh: usize = (h * kv_head_count) / head_count;
+        var t: usize = 0;
+        while t <= pos {
+            var dot: f32 = 0.0;
+            var d: usize = 0;
+            while d < head_dim {
+                dot = dot + q[h * head_dim + d] * k_cache[qwen3_cache_index(layer, t, kvh * head_dim + d)];
+                d = d + 1;
+            }
+            scores[t] = dot * scale;
+            t = t + 1;
+        }
+        softmax(&probs[0], &scores[0], pos + (1 as usize));
+        var d2: usize = 0;
+        while d2 < head_dim {
+            var sum: f32 = 0.0;
+            t = 0;
+            while t <= pos {
+                sum = sum + probs[t] * v_cache[qwen3_cache_index(layer, t, kvh * head_dim + d2)];
+                t = t + 1;
+            }
+            out[h * head_dim + d2] = sum;
+            d2 = d2 + 1;
+        }
+        h = h + 1;
+    }
+}
+
+fn qwen3_argmax(values: &const f32, n: usize) u32 {
+    var best: usize = 0;
+    var i: usize = 1;
+    while i < n {
+        if values[i] > values[best] { best = i; }
+        i = i + 1;
+    }
+    return best as u32;
+}
+
+fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32) bool {
+    const hidden_n: usize = config.hidden_size as usize;
+    const vocab_n: usize = config.vocab_size as usize;
+    const ffn_n: usize = config.intermediate_size as usize;
+    const head_count: usize = config.head_count as usize;
+    const kv_head_count: usize = config.kv_head_count as usize;
+    const head_dim: usize = config.head_dim as usize;
+    const q_dim: usize = head_count * head_dim;
+    const kv_dim: usize = kv_head_count * head_dim;
+    var hidden: [f32: 64] = [];
+    var normed: [f32: 64] = [];
+    var q: [f32: 64] = [];
+    var k: [f32: 64] = [];
+    var v: [f32: 64] = [];
+    var attn_ctx: [f32: 64] = [];
+    var attn_out: [f32: 64] = [];
+    var gate: [f32: 256] = [];
+    var up: [f32: 256] = [];
+    var fused: [f32: 256] = [];
+    var down: [f32: 64] = [];
+    qwen3_copy_embedding(&hidden[0], weights.token_embedding, token_id, hidden_n, vocab_n);
+    var layer: usize = 0;
+    while layer < config.layer_count as usize {
+        const lw: &Qwen3LayerWeights = &weights.layers[layer];
+        qwen3_rms_norm_view(&normed[0], &hidden[0], lw.attn_norm, hidden_n);
+        qwen3_matvec_view(&q[0], lw.q_proj, &normed[0], hidden_n, q_dim);
+        qwen3_matvec_view(&k[0], lw.k_proj, &normed[0], hidden_n, kv_dim);
+        qwen3_matvec_view(&v[0], lw.v_proj, &normed[0], hidden_n, kv_dim);
+        if lw.q_norm != null { qwen3_apply_head_norm(&q[0], lw.q_norm, head_count, head_dim); }
+        if lw.k_norm != null { qwen3_apply_head_norm(&k[0], lw.k_norm, kv_head_count, head_dim); }
+        qwen3_apply_rope(&q[0], head_count, head_dim, pos);
+        qwen3_apply_rope(&k[0], kv_head_count, head_dim, pos);
+        qwen3_write_kv_cache(k_cache, v_cache, layer, pos, &k[0], &v[0], kv_dim);
+        qwen3_attention(&attn_ctx[0], &q[0], k_cache, v_cache, layer, pos, head_count, kv_head_count, head_dim);
+        qwen3_matvec_view(&attn_out[0], lw.o_proj, &attn_ctx[0], q_dim, hidden_n);
+        var i: usize = 0;
+        while i < hidden_n { hidden[i] = hidden[i] + attn_out[i]; i = i + 1; }
+        qwen3_rms_norm_view(&normed[0], &hidden[0], lw.ffn_norm, hidden_n);
+        qwen3_matvec_view(&gate[0], lw.gate_proj, &normed[0], hidden_n, ffn_n);
+        qwen3_matvec_view(&up[0], lw.up_proj, &normed[0], hidden_n, ffn_n);
+        i = 0;
+        while i < ffn_n { fused[i] = silu(gate[i]) * up[i]; i = i + 1; }
+        qwen3_matvec_view(&down[0], lw.down_proj, &fused[0], ffn_n, hidden_n);
+        i = 0;
+        while i < hidden_n { hidden[i] = hidden[i] + down[i]; i = i + 1; }
+        layer = layer + 1;
+    }
+    qwen3_rms_norm_view(&normed[0], &hidden[0], weights.output_norm, hidden_n);
+    qwen3_matvec_view(logits, weights.output, &normed[0], hidden_n, vocab_n);
+    return true;
+}
+
+export fn qwen3_generate_cli(path: &const byte, prompt: &const byte) i32 {
+    var config: Qwen3Config = qwen3_config_init();
+    if !qwen3_config_load_metadata(path, &config) { return 1; }
+    var table: TensorWeightTable = tensor_table_init();
+    if !tensor_weight_table_load(path, &table) { return 1; }
+    if !qwen3_complete_config_from_tensors(&config, &table) { return 1; }
+    if !qwen3_check_forward_caps(&config) { return 1; }
+    if !tensor_weight_table_attach_mmap(path, &table) { return 1; }
+    var weights: Qwen3Weights = qwen3_weights_init();
+    if !qwen3_bind_weights(&table, &config, &weights) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var tok: Tokenizer = tokenizer_init();
+    if !tokenizer_load(path, &tok) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var ids: [u32: 64] = [];
+    var id_count: usize = 0;
+    if !tokenizer_encode_to_ids(&tok, prompt, &ids[0], QWEN3_FORWARD_MAX_PROMPT, &id_count) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if id_count == 0 { _ = printf("error: empty prompt\n"); tensor_weight_table_detach_mmap(&table); return 1; }
+    if id_count > config.context_length as usize || id_count > QWEN3_FORWARD_MAX_CONTEXT { _ = printf("error: prompt token count=%zu exceeds context=%u\n", id_count, config.context_length); tensor_weight_table_detach_mmap(&table); return 1; }
+    var k_cache: [f32: 16384] = [];
+    var v_cache: [f32: 16384] = [];
+    var logits: [f32: 256] = [];
+    var pos: usize = 0;
+    while pos < id_count {
+        if !qwen3_forward_token(&config, &weights, ids[pos], pos, &k_cache[0], &v_cache[0], &logits[0]) { tensor_weight_table_detach_mmap(&table); return 1; }
+        pos = pos + 1;
+    }
+    const greedy: u32 = qwen3_argmax(&logits[0], config.vocab_size as usize);
+    _ = printf("generate prompt_tokens:");
+    var i: usize = 0;
+    while i < id_count { _ = printf(" %u", ids[i]); i = i + 1; }
+    _ = printf("\n");
+    _ = printf("logits[0..4]: %.6f %.6f %.6f %.6f %.6f\n", logits[0] as f64, logits[1] as f64, logits[2] as f64, logits[3] as f64, logits[4] as f64);
+    _ = printf("greedy token: %u piece=%s\n", greedy, tokenizer_piece(&tok, greedy));
+    _ = printf("generated: %s\n", tokenizer_piece(&tok, greedy));
+    tensor_weight_table_detach_mmap(&table);
     return 0;
 }

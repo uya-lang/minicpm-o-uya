@@ -9,7 +9,7 @@ audio input, speech output, and finally streaming omni chat.
 
 ## Status
 
-Phase 7 is implemented: `inspect`, `audit`, tokenizer CLI, tensor weight-table/mmap inspection, Qwen3 config/weight binding, scalar reference kernel smoke tests, and first-pass quant kernel smoke tests are available. No real MiniCPM-o inference is implemented yet.
+Phase 8 is implemented: `inspect`, `audit`, tokenizer CLI, tensor weight-table/mmap inspection, Qwen3 config/weight binding, tiny Qwen3 text-only generation, scalar reference kernel smoke tests, and first-pass quant kernel smoke tests are available.
 
 ## Goals
 

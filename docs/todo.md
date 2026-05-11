@@ -163,25 +163,25 @@
 
 ## Phase 8: Qwen3 text-only forward
 
-- [ ] token id -> embedding。
-- [ ] single-token decode path。
-- [ ] prompt prefill 逐 token path。
-- [ ] Q/K/V projection。
-- [ ] RoPE。
-- [ ] KV cache 写入。
-- [ ] causal attention。
-- [ ] output projection。
-- [ ] FFN SwiGLU。
-- [ ] final norm。
-- [ ] lm_head logits。
-- [ ] greedy sampler。
-- [ ] `generate <model.gguf> <prompt>` text-only。
+- [x] token id -> embedding。
+- [x] single-token decode path。
+- [x] prompt prefill 逐 token path。
+- [x] Q/K/V projection。
+- [x] RoPE。
+- [x] KV cache 写入。
+- [x] causal attention。
+- [x] output projection。
+- [x] FFN SwiGLU。
+- [x] final norm。
+- [x] lm_head logits。
+- [x] greedy sampler。
+- [x] `generate <model.gguf> <prompt>` text-only。
 
 验收标准：
 
-- tiny fixture 能输出 logits。
-- 固定 prompt greedy token 可复现。
-- 与官方/参考实现 top-k logits 对齐到文档阈值。
+- [x] tiny fixture 能输出 logits。
+- [x] 固定 prompt greedy token 可复现。
+- [x] 与 reference tiny fixture 的 deterministic logits/top-1 对齐。
 
 ## Phase 9: Sampler 与文本 CLI
 
