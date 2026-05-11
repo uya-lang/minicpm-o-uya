@@ -369,6 +369,16 @@ def main() -> None:
     tiny_audio = struct.pack("<IIIII", 0x4D415955, 1, 1, 4, 0)
     tiny_audio += b"".join(struct.pack("<f", value) for value in [0.2, -0.4, 0.6, -0.8])
     (out_dir / "tiny_audio.raw").write_bytes(tiny_audio)
+    stereo_pcm = [
+        (0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8),
+        (0.8, 0.6), (0.6, 0.4), (0.4, 0.2), (0.2, 0.0),
+        (-0.2, -0.4), (-0.4, -0.6), (-0.6, -0.8), (-0.8, -0.6),
+        (-0.6, -0.4), (-0.4, -0.2), (-0.2, 0.0), (0.0, 0.2),
+    ]
+    tiny_pcm = struct.pack("<IIIIII", 0x50415955, 1, 8000, 2, len(stereo_pcm), 1)
+    for left, right in stereo_pcm:
+        tiny_pcm += struct.pack("<ff", left, right)
+    (out_dir / "tiny_audio.pcm").write_bytes(tiny_pcm)
 
     bad_tensor = tensor_info("mystery.branch.weight", [4], 63, 0)
     bad_directory = struct.pack("<IIQQ", 0x46554747, 3, 1, 0) + bad_tensor

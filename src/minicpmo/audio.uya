@@ -1,4 +1,5 @@
 use libc.printf;
+use libc.sinf;
 use libc.sqrtf;
 use libc.strcmp;
 use minicpmo.binary.BinaryReader;
@@ -40,6 +41,9 @@ const AUDIO_GGUF_MAGIC: u32 = 0x46554747;
 const AUDIO_RAW_MAGIC: u32 = 0x4d415955;
 const AUDIO_RAW_VERSION: u32 = 1;
 const AUDIO_RAW_DTYPE_F32: u32 = 0;
+const AUDIO_PCM_MAGIC: u32 = 0x50415955;
+const AUDIO_PCM_DTYPE_S16: u32 = 0;
+const AUDIO_PCM_DTYPE_F32: u32 = 1;
 const AUDIO_GGUF_TYPE_UINT32: u32 = 4;
 const AUDIO_GGUF_TYPE_INT32: u32 = 5;
 const AUDIO_GGUF_TYPE_FLOAT32: u32 = 6;
@@ -57,6 +61,9 @@ const AUDIO_MAX_FFN: usize = 128;
 const AUDIO_MAX_LLM_HIDDEN: usize = 64;
 const AUDIO_MAX_PROMPT: usize = 64;
 const AUDIO_EPS: f32 = 0.000001;
+const AUDIO_PI: f32 = 3.14159265358979323846;
+const AUDIO_MAX_PCM_SAMPLES: usize = 4096;
+const AUDIO_MAX_STFT_BINS: usize = 65;
 
 export struct AudioConfig {
     frame_count: u32,
@@ -98,6 +105,30 @@ struct AudioRawMel {
     mel_bin_count: u32,
     values: [f32: 1024],
     element_count: usize,
+}
+
+struct AudioRawPcm {
+    sample_rate: u32,
+    channels: u32,
+    sample_count: u32,
+    values: [f32: 4096],
+}
+
+struct AudioPreprocessConfig {
+    target_sample_rate: u32,
+    n_fft: u32,
+    hop_length: u32,
+    win_length: u32,
+    mel_bin_count: u32,
+    log_floor: f32,
+}
+
+struct AudioStreamingCache {
+    samples: [f32: 4096],
+    sample_count: usize,
+    consumed_start: usize,
+    produced_frames: usize,
+    peak_sample_count: usize,
 }
 
 struct AudioStringRead {
@@ -233,6 +264,18 @@ fn audio_raw_init() AudioRawMel {
     return AudioRawMel{ frame_count: 0, mel_bin_count: 0, values: [], element_count: 0 };
 }
 
+fn audio_pcm_init() AudioRawPcm {
+    return AudioRawPcm{ sample_rate: 0, channels: 0, sample_count: 0, values: [] };
+}
+
+fn audio_preprocess_config_init() AudioPreprocessConfig {
+    return AudioPreprocessConfig{ target_sample_rate: 16000, n_fft: 8, hop_length: 4, win_length: 8, mel_bin_count: 4, log_floor: 0.00000001 };
+}
+
+fn audio_streaming_cache_init() AudioStreamingCache {
+    return AudioStreamingCache{ samples: [], sample_count: 0, consumed_start: 0, produced_frames: 0, peak_sample_count: 0 };
+}
+
 fn audio_read_f32(reader: &BinaryReader, out: &f32) bool {
     var bits: u32 = 0;
     if !binary_read_u32_le(reader, &bits, "audio raw f32\0" as &const byte) { return false; }
@@ -267,6 +310,214 @@ fn audio_raw_load(path: &const byte, raw: &AudioRawMel) bool {
     if reader.pos != reader.size { _ = printf("error: audio raw has trailing bytes=%llu\n", reader.size - reader.pos); binary_close(&reader); return false; }
     binary_close(&reader);
     return true;
+}
+
+
+fn audio_pcm_load(path: &const byte, pcm: &AudioRawPcm) bool {
+    pcm[0] = audio_pcm_init();
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var dtype: u32 = 0;
+    if !binary_read_u32_le(&reader, &magic, "audio pcm magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != AUDIO_PCM_MAGIC { _ = printf("error: audio pcm bad magic; expected UYAP\n"); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &version, "audio pcm version\0" as &const byte) { binary_close(&reader); return false; }
+    if version != AUDIO_RAW_VERSION { _ = printf("error: audio pcm unsupported version=%u\n", version); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &pcm.sample_rate, "audio pcm sample rate\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &pcm.channels, "audio pcm channels\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &pcm.sample_count, "audio pcm sample count\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &dtype, "audio pcm dtype\0" as &const byte) { binary_close(&reader); return false; }
+    const total: u64 = (pcm.sample_count as u64) * (pcm.channels as u64);
+    if pcm.sample_rate == 0 || pcm.channels == 0 || pcm.sample_count == 0 || total > AUDIO_MAX_PCM_SAMPLES as u64 { _ = printf("error: audio pcm shape samples=%u channels=%u exceeds cap=%zu\n", pcm.sample_count, pcm.channels, AUDIO_MAX_PCM_SAMPLES); binary_close(&reader); return false; }
+    var index: usize = 0;
+    if dtype == AUDIO_PCM_DTYPE_F32 {
+        while index < total as usize {
+            if !audio_read_f32(&reader, &pcm.values[index]) { binary_close(&reader); return false; }
+            index = index + 1;
+        }
+    } else { if dtype == AUDIO_PCM_DTYPE_S16 {
+        while index < total as usize {
+            var bits: u32 = 0;
+            if !binary_read_u32_le(&reader, &bits, "audio pcm s16-as-u32\0" as &const byte) { binary_close(&reader); return false; }
+            var signed: i32 = bits as i32;
+            pcm.values[index] = (signed as f32) / 32768.0;
+            index = index + 1;
+        }
+    } else { _ = printf("error: audio pcm dtype=%u unsupported\n", dtype); binary_close(&reader); return false; } }
+    if reader.pos != reader.size { _ = printf("error: audio pcm has trailing bytes=%llu\n", reader.size - reader.pos); binary_close(&reader); return false; }
+    binary_close(&reader);
+    return true;
+}
+
+fn audio_downmix_mono(pcm: &AudioRawPcm, mono: &f32, mono_count: &usize) bool {
+    mono_count[0] = pcm.sample_count as usize;
+    var sample: usize = 0;
+    while sample < mono_count[0] {
+        var sum: f32 = 0.0;
+        var channel: usize = 0;
+        while channel < pcm.channels as usize {
+            sum = sum + pcm.values[sample * (pcm.channels as usize) + channel];
+            channel = channel + 1;
+        }
+        mono[sample] = sum / (pcm.channels as f32);
+        sample = sample + 1;
+    }
+    return true;
+}
+
+fn audio_resample_linear(input: &const f32, input_count: usize, input_rate: u32, output_rate: u32, output: &f32, output_count: &usize) bool {
+    if input_rate == output_rate {
+        var i: usize = 0; while i < input_count { output[i] = input[i]; i = i + 1; }
+        output_count[0] = input_count; return true;
+    }
+    output_count[0] = ((input_count as u64) * (output_rate as u64) / (input_rate as u64)) as usize;
+    if output_count[0] == 0 || output_count[0] > AUDIO_MAX_PCM_SAMPLES { return false; }
+    var out_i: usize = 0;
+    while out_i < output_count[0] {
+        const pos: f32 = (out_i as f32) * (input_rate as f32) / (output_rate as f32);
+        var left: usize = pos as usize;
+        if left >= input_count { left = input_count - 1; }
+        var right: usize = left + 1;
+        if right >= input_count { right = left; }
+        const frac: f32 = pos - (left as f32);
+        output[out_i] = input[left] * (1.0 - frac) + input[right] * frac;
+        out_i = out_i + 1;
+    }
+    return true;
+}
+
+fn audio_hann(index: usize, len: usize) f32 {
+    if len <= 1 { return 1.0 as f32; }
+    return (0.5 as f32) - (0.5 as f32) * sinf(((2.0 as f32) * AUDIO_PI * (index as f32) / ((len - 1) as f32)) - (AUDIO_PI / (2.0 as f32)));
+}
+
+fn audio_compute_frame(config: &AudioPreprocessConfig, samples: &const f32, start: usize, sample_count: usize, out: &f32) void {
+    var mel: usize = 0;
+    while mel < config.mel_bin_count as usize {
+        var energy: f32 = 0.0;
+        var n: usize = 0;
+        while n < config.win_length as usize {
+            var value: f32 = 0.0;
+            if start + n < sample_count { value = samples[start + n]; }
+            const windowed: f32 = value * audio_hann(n, config.win_length as usize);
+            const phase: f32 = 2.0 * AUDIO_PI * ((mel + 1) as f32) * (n as f32) / (config.n_fft as f32);
+            const basis: f32 = sinf(phase);
+            const projected: f32 = windowed * basis;
+            energy = energy + projected * projected;
+            n = n + 1;
+        }
+        const scaled: f32 = energy / (config.win_length as f32) + config.log_floor;
+        out[mel] = scaled;
+        mel = mel + 1;
+    }
+}
+
+fn audio_log_scale(values: &f32, count: usize) void {
+    var i: usize = 0;
+    while i < count {
+        values[i] = sqrtf(values[i]);
+        i = i + 1;
+    }
+}
+
+fn audio_pcm_to_mel(config: &AudioPreprocessConfig, pcm: &AudioRawPcm, raw: &AudioRawMel) bool {
+    var mono: [f32: 4096] = [];
+    var mono_count: usize = 0;
+    if !audio_downmix_mono(pcm, &mono[0], &mono_count) { return false; }
+    var resampled: [f32: 4096] = [];
+    var resampled_count: usize = 0;
+    if !audio_resample_linear(&mono[0] as &const f32, mono_count, pcm.sample_rate, config.target_sample_rate, &resampled[0], &resampled_count) { return false; }
+    raw[0] = audio_raw_init();
+    raw.mel_bin_count = config.mel_bin_count;
+    raw.frame_count = 0;
+    var start: usize = 0;
+    while start + config.win_length as usize <= resampled_count || (start == 0 && resampled_count > 0) {
+        if raw.frame_count as usize >= AUDIO_MAX_FRAMES { return false; }
+        audio_compute_frame(config, &resampled[0] as &const f32, start, resampled_count, &raw.values[(raw.frame_count as usize) * (config.mel_bin_count as usize)]);
+        raw.frame_count = raw.frame_count + 1;
+        if start + config.hop_length as usize >= resampled_count { break; }
+        start = start + config.hop_length as usize;
+    }
+    raw.element_count = (raw.frame_count as usize) * (raw.mel_bin_count as usize);
+    audio_log_scale(&raw.values[0], raw.element_count);
+    return raw.element_count > 0;
+}
+
+fn audio_stream_append(cache: &AudioStreamingCache, samples: &const f32, count: usize) bool {
+    if cache.sample_count + count > AUDIO_MAX_PCM_SAMPLES { return false; }
+    var i: usize = 0;
+    while i < count { cache.samples[cache.sample_count + i] = samples[i]; i = i + 1; }
+    cache.sample_count = cache.sample_count + count;
+    if cache.sample_count > cache.peak_sample_count { cache.peak_sample_count = cache.sample_count; }
+    return true;
+}
+
+fn audio_stream_flush(config: &AudioPreprocessConfig, cache: &AudioStreamingCache, out: &AudioRawMel) bool {
+    out[0] = audio_raw_init(); out.mel_bin_count = config.mel_bin_count;
+    var start: usize = cache.consumed_start;
+    while start + config.win_length as usize <= cache.sample_count {
+        if out.frame_count as usize >= AUDIO_MAX_FRAMES { return false; }
+        audio_compute_frame(config, &cache.samples[0] as &const f32, start, cache.sample_count, &out.values[(out.frame_count as usize) * (config.mel_bin_count as usize)]);
+        out.frame_count = out.frame_count + 1;
+        cache.produced_frames = cache.produced_frames + 1;
+        start = start + config.hop_length as usize;
+    }
+    cache.consumed_start = start;
+    if cache.consumed_start > config.win_length as usize {
+        const keep_start: usize = cache.consumed_start - (config.win_length as usize);
+        var i: usize = 0;
+        while keep_start + i < cache.sample_count { cache.samples[i] = cache.samples[keep_start + i]; i = i + 1; }
+        cache.sample_count = i;
+        cache.consumed_start = config.win_length as usize;
+    }
+    out.element_count = (out.frame_count as usize) * (out.mel_bin_count as usize);
+    audio_log_scale(&out.values[0], out.element_count);
+    return true;
+}
+
+export fn audio_preprocess_smoke_cli(audio_path: &const byte) i32 {
+    var pcm: AudioRawPcm = audio_pcm_init();
+    if !audio_pcm_load(audio_path, &pcm) { return 1; }
+    var config: AudioPreprocessConfig = audio_preprocess_config_init();
+    var oneshot: AudioRawMel = audio_raw_init();
+    if !audio_pcm_to_mel(&config, &pcm, &oneshot) { _ = printf("error: audio preprocess failed\n"); return 1; }
+    var mono: [f32: 4096] = []; var mono_count: usize = 0;
+    if !audio_downmix_mono(&pcm, &mono[0], &mono_count) { return 1; }
+    var resampled: [f32: 4096] = []; var resampled_count: usize = 0;
+    if !audio_resample_linear(&mono[0] as &const f32, mono_count, pcm.sample_rate, config.target_sample_rate, &resampled[0], &resampled_count) { return 1; }
+    var cache: AudioStreamingCache = audio_streaming_cache_init();
+    var streamed: AudioRawMel = audio_raw_init();
+    var stream_all: AudioRawMel = audio_raw_init();
+    var offset: usize = 0;
+    while offset < resampled_count {
+        var chunk: usize = 3;
+        if offset + chunk > resampled_count { chunk = resampled_count - offset; }
+        if !audio_stream_append(&cache, &resampled[offset] as &const f32, chunk) { return 1; }
+        if !audio_stream_flush(&config, &cache, &streamed) { return 1; }
+        var i: usize = 0;
+        while i < streamed.element_count {
+            stream_all.values[stream_all.element_count + i] = streamed.values[i];
+            i = i + 1;
+        }
+        stream_all.element_count = stream_all.element_count + streamed.element_count;
+        stream_all.frame_count = stream_all.element_count as u32 / config.mel_bin_count;
+        stream_all.mel_bin_count = config.mel_bin_count;
+        offset = offset + chunk;
+    }
+    var diff: f32 = 0.0; var i2: usize = 0;
+    while i2 < oneshot.element_count && i2 < stream_all.element_count {
+        var d: f32 = oneshot.values[i2] - stream_all.values[i2]; if d < 0.0 { d = -d; }
+        diff = diff + d; i2 = i2 + 1;
+    }
+    const one_checksum: u32 = audio_checksum(&oneshot.values[0], oneshot.element_count);
+    const stream_checksum: u32 = audio_checksum(&stream_all.values[0], stream_all.element_count);
+    _ = printf("audio-preprocess pcm: sample_rate=%u channels=%u samples=%u\n", pcm.sample_rate, pcm.channels, pcm.sample_count);
+    _ = printf("audio-preprocess mel: frames=%u mel_bins=%u checksum=0x%x\n", oneshot.frame_count, oneshot.mel_bin_count, one_checksum);
+    _ = printf("audio-preprocess streaming: frames=%u checksum=0x%x diff_l1=%.9f peak_samples=%zu\n", stream_all.frame_count, stream_checksum, diff as f64, cache.peak_sample_count);
+    if oneshot.element_count != stream_all.element_count || diff > 0.0001 { _ = printf("error: streaming mel differs from one-shot\n"); return 1; }
+    _ = printf("audio-preprocess-smoke: PASS\n");
+    return 0;
 }
 
 extern "libc" fn sprintf(str: *byte, format: *const byte, ...) i32;

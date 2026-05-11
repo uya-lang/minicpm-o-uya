@@ -259,15 +259,15 @@
 
 ## Phase 13: Audio preprocessing 与 streaming cache
 
-- [ ] 实现 PCM16/F32 raw 读取。
-- [ ] 实现 mono/downmix。
-- [ ] 实现 resample reference。
-- [ ] 实现 window function。
-- [ ] 实现 STFT reference。
-- [ ] 实现 mel filterbank。
-- [ ] 实现 log scaling。
-- [ ] 实现 streaming chunk buffer。
-- [ ] 实现 overlap/cache reuse。
+- [x] 实现 PCM16/F32 raw 读取。
+- [x] 实现 mono/downmix。
+- [x] 实现 resample reference。
+- [x] 实现 window function。
+- [x] 实现 STFT reference。
+- [x] 实现 mel filterbank。
+- [x] 实现 log scaling。
+- [x] 实现 streaming chunk buffer。
+- [x] 实现 overlap/cache reuse。
 
 验收标准：
 

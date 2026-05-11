@@ -119,7 +119,10 @@ vision-fixture: FORCE build fixtures
 
 audio-fixture: FORCE build fixtures
 	$(OUT) audio-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_audio.raw >/tmp/minicpm-o-uya-audio.out
+	$(OUT) audio-preprocess-smoke tests/fixtures/tiny_audio.pcm >/tmp/minicpm-o-uya-audio-pre.out
 	grep -q "audio-smoke: PASS" /tmp/minicpm-o-uya-audio.out
+	grep -q "audio-preprocess-smoke: PASS" /tmp/minicpm-o-uya-audio-pre.out
+	grep -q "diff_l1=0.000000000" /tmp/minicpm-o-uya-audio-pre.out
 	grep -q "audio raw: frames=1 mel_bins=4 dtype=f32 elements=4 checksum=0xbca0dcc" /tmp/minicpm-o-uya-audio.out
 	grep -q "placeholders=1 span=1" /tmp/minicpm-o-uya-audio.out
 	grep -q "audio embedding checksum: 0x625ac595" /tmp/minicpm-o-uya-audio.out
