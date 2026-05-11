@@ -9,7 +9,7 @@ audio input, speech output, and finally streaming omni chat.
 
 ## Status
 
-Phase 9 is implemented: `inspect`, `audit`, tokenizer CLI, tensor weight-table/mmap inspection, Qwen3 config/weight binding, tiny Qwen3 text-only generation, sampler controls, and text-only chat REPL are available.
+Phase 10 is implemented: `inspect`, `audit`, tokenizer CLI, tensor weight-table/mmap inspection, Qwen3 config/weight binding, tiny Qwen3 text-only generation, sampler controls, text-only chat REPL, and `vision-smoke` raw tensor image injection are available.
 
 ## Goals
 
@@ -56,8 +56,9 @@ build/minicpm-o-uya encode tests/fixtures/tiny.gguf "<image> hello <audio>"
 build/minicpm-o-uya format-chat tests/fixtures/tiny.gguf "<image> hello"
 build/minicpm-o-uya tensors tests/fixtures/tiny.gguf --mmap
 build/minicpm-o-uya qwen3-bind tests/fixtures/tiny.gguf
+build/minicpm-o-uya vision-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_image.raw
 build/minicpm-o-uya kernels-smoke
 build/minicpm-o-uya quant-smoke
 ```
 
-`tests/make_tiny_gguf.py` generates deterministic GGUF fixtures for inspect/audit, including a truncated `.part` file and an intentionally unsupported schema for diagnostics.
+`tests/make_tiny_gguf.py` generates deterministic GGUF fixtures for inspect/audit plus `tiny_image.raw` for vision smoke, including a truncated `.part` file and an intentionally unsupported schema for diagnostics.

@@ -71,6 +71,32 @@ def pack_tensor_values(name: str, dims: list[int], ggml_type: int) -> bytes:
         values = [0.0] * elements
     elif name.endswith("ffn_down.weight"):
         values = [0.0] * elements
+    elif name == "vision.patch_embd.weight":
+        for col in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if row == col else 0.0)
+    elif name == "vision.patch_embd.bias":
+        values = [0.0] * elements
+    elif name == "vision.position_embd.weight":
+        values = [0.05, 0.10, 0.15, 0.20]
+    elif name == "vision.output_norm.weight":
+        values = [1.0] * elements
+    elif name == "vision.resampler.weight":
+        for col in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if row == col else 0.0)
+    elif name == "vision.projector.weight":
+        for col in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if (col % dims[0]) == row else 0.0)
+    elif name.startswith("vision.blk.") and (name.endswith("attn_norm.weight") or name.endswith("ffn_norm.weight")):
+        values = [1.0] * elements
+    elif name.startswith("vision.blk.") and (name.endswith("attn_q.weight") or name.endswith("attn_k.weight") or name.endswith("attn_v.weight") or name.endswith("attn_output.weight")):
+        for col in range(dims[1]):
+            for row in range(dims[0]):
+                values.append(1.0 if row == col else 0.0)
+    elif name.startswith("vision.blk.") and (name.endswith("ffn_gate.weight") or name.endswith("ffn_up.weight") or name.endswith("ffn_down.weight")):
+        values = [0.0] * elements
     else:
         values = [0.0] * elements
     if ggml_type == GGML_TYPE_F32:
@@ -174,7 +200,15 @@ def main() -> None:
         metadata_u32("qwen3.rope.dimension_count", 4),
         metadata_f32("qwen3.attention.layer_norm_rms_epsilon", 0.000001),
         metadata_f32("qwen3.rope.freq_base", 1000000.0),
+        metadata_u32("vision.image_width", 2),
+        metadata_u32("vision.image_height", 2),
+        metadata_u32("vision.channel_count", 1),
+        metadata_u32("vision.patch_size", 2),
+        metadata_u32("vision.embedding_length", 4),
         metadata_u32("vision.siglip2.block_count", 1),
+        metadata_u32("vision.attention.head_count", 1),
+        metadata_u32("vision.feed_forward_length", 8),
+        metadata_u32("vision.projector.output_length", 8),
         metadata_u32("audio.whisper.block_count", 1),
         metadata_string("speech.cosyvoice2.kind", "codec-vocoder"),
         metadata_string("tokenizer.ggml.model", "gpt2"),
@@ -212,7 +246,21 @@ def main() -> None:
         ("blk.0.ffn_down.weight", [16, 8], GGML_TYPE_F16),
     ]
     branch_tensor_specs = [
-        ("vision.patch_embd.weight", [4, 4], GGML_TYPE_F16),
+        ("vision.patch_embd.weight", [4, 4], GGML_TYPE_F32),
+        ("vision.patch_embd.bias", [4], GGML_TYPE_F32),
+        ("vision.position_embd.weight", [1, 4], GGML_TYPE_F32),
+        ("vision.blk.0.attn_norm.weight", [4], GGML_TYPE_F32),
+        ("vision.blk.0.attn_q.weight", [4, 4], GGML_TYPE_F32),
+        ("vision.blk.0.attn_k.weight", [4, 4], GGML_TYPE_F32),
+        ("vision.blk.0.attn_v.weight", [4, 4], GGML_TYPE_F32),
+        ("vision.blk.0.attn_output.weight", [4, 4], GGML_TYPE_F32),
+        ("vision.blk.0.ffn_norm.weight", [4], GGML_TYPE_F32),
+        ("vision.blk.0.ffn_gate.weight", [4, 8], GGML_TYPE_F32),
+        ("vision.blk.0.ffn_up.weight", [4, 8], GGML_TYPE_F32),
+        ("vision.blk.0.ffn_down.weight", [8, 4], GGML_TYPE_F32),
+        ("vision.output_norm.weight", [4], GGML_TYPE_F32),
+        ("vision.resampler.weight", [4, 4], GGML_TYPE_F32),
+        ("vision.projector.weight", [4, 8], GGML_TYPE_F32),
         ("audio.whisper.encoder.weight", [4, 4], GGML_TYPE_F16),
         ("speech.cosyvoice2.decoder.weight", [4, 4], GGML_TYPE_F16),
         ("vocoder.proj.weight", [4, 4], GGML_TYPE_F16),
@@ -240,6 +288,9 @@ def main() -> None:
     (out_dir / "tiny.gguf").write_bytes(fixture)
     (out_dir / "tiny.gguf.part").write_bytes(fixture[:48])
     (out_dir / "tiny_data_truncated.gguf").write_bytes(fixture[:-17])
+    tiny_image = struct.pack("<IIIIII", 0x49415955, 1, 2, 2, 1, 0)
+    tiny_image += b"".join(struct.pack("<f", value) for value in [0.25, 0.5, 0.75, 1.0])
+    (out_dir / "tiny_image.raw").write_bytes(tiny_image)
 
     bad_tensor = tensor_info("mystery.branch.weight", [4], 63, 0)
     bad_directory = struct.pack("<IIQQ", 0x46554747, 3, 1, 0) + bad_tensor

@@ -2,7 +2,7 @@ UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
 
-.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture chat-fixture minicpmo-audit clean FORCE
+.PHONY: build test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture chat-fixture minicpmo-audit clean FORCE
 
 build:
 	mkdir -p build
@@ -10,7 +10,7 @@ build:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture chat-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture chat-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -27,7 +27,7 @@ inspect-fixture: build fixtures
 audit-fixture: build fixtures
 	$(OUT) audit tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-audit.out
 	grep -q "tensor dtype distribution" /tmp/minicpm-o-uya-audit.out
-	grep -q "  vision: 1" /tmp/minicpm-o-uya-audit.out
+	grep -q "  vision: 15" /tmp/minicpm-o-uya-audit.out
 	grep -q "  audio: 1" /tmp/minicpm-o-uya-audit.out
 	grep -q "  speech: 2" /tmp/minicpm-o-uya-audit.out
 	grep -q "Qwen3 text metadata: present" /tmp/minicpm-o-uya-audit.out
@@ -57,7 +57,7 @@ tokenizer-fixture: build fixtures
 
 tensor-fixture: build fixtures
 	$(OUT) tensors tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-tensors.out
-	grep -q "tensor table: count=18" /tmp/minicpm-o-uya-tensors.out
+	grep -q "tensor table: count=32" /tmp/minicpm-o-uya-tensors.out
 	grep -q "root token_embd=token_embd.weight root output=output.weight" /tmp/minicpm-o-uya-tensors.out
 	grep -q "cache skeleton: llm_bytes=" /tmp/minicpm-o-uya-tensors.out
 	$(OUT) tensors tests/fixtures/tiny.gguf --mmap >/tmp/minicpm-o-uya-tensors-mmap.out
@@ -102,6 +102,13 @@ generate-fixture: FORCE build fixtures
 	else \
 		grep -q "error: invalid generate sampler args" /tmp/minicpm-o-uya-generate-bad.out; \
 	fi
+
+vision-fixture: FORCE build fixtures
+	$(OUT) vision-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_image.raw >/tmp/minicpm-o-uya-vision.out
+	grep -q "vision-smoke: PASS" /tmp/minicpm-o-uya-vision.out
+	grep -q "placeholders=1 span=1" /tmp/minicpm-o-uya-vision.out
+	grep -q "vision embedding checksum: 0xbab3d2ad" /tmp/minicpm-o-uya-vision.out
+	grep -q "diff_l1=" /tmp/minicpm-o-uya-vision.out
 
 minicpmo-audit: build
 	@if [ -z "$(MINICPM_O_GGUF)" ]; then \

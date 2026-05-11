@@ -124,11 +124,11 @@ struct Qwen3StringRead {
     truncated: bool,
 }
 
-fn qwen3_config_init() Qwen3Config {
+export fn qwen3_config_init() Qwen3Config {
     return Qwen3Config{ vocab_size: 0, context_length: 0, hidden_size: 0, intermediate_size: 0, layer_count: 0, head_count: 0, kv_head_count: 0, head_dim: 0, norm_eps_bits: 0, rope_freq_base_bits: 0, has_norm_eps: false, has_rope_freq_base: false };
 }
 
-fn qwen3_weights_init() Qwen3Weights {
+export fn qwen3_weights_init() Qwen3Weights {
     return Qwen3Weights{ token_embedding: null, output_norm: null, output: null, layers: [], layer_count: 0 };
 }
 
@@ -335,7 +335,7 @@ fn qwen3_count_layers_from_tensors(table: &TensorWeightTable) u32 {
     return count;
 }
 
-fn qwen3_complete_config_from_tensors(config: &Qwen3Config, table: &TensorWeightTable) bool {
+export fn qwen3_complete_config_from_tensors(config: &Qwen3Config, table: &TensorWeightTable) bool {
     const emb: &TensorView = tensor_lookup_root_token_embedding(table);
     if emb == null { _ = printf("error: qwen3 bind layer=0 missing tensor token_embd.weight\n"); return false; }
     if emb.n_dims != 2 { _ = printf("error: qwen3 bind tensor=%s bad embedding shape got=", &emb.name[0]); qwen3_print_shape(emb); _ = printf("\n"); return false; }
@@ -431,7 +431,7 @@ fn qwen3_read_u16_at(data: &const byte, byte_offset: usize) u16 {
     return (data[byte_offset] as u16) | ((data[byte_offset + (1 as usize)] as u16) << 8);
 }
 
-fn qwen3_tensor_get(view: &TensorView, index: usize) f32 {
+export fn qwen3_tensor_get(view: &TensorView, index: usize) f32 {
     if view.dtype == TensorDType.F16 {
         return f16_load_f32(qwen3_read_u16_at(view.data, index * (2 as usize)));
     }
@@ -445,7 +445,7 @@ fn qwen3_tensor_get(view: &TensorView, index: usize) f32 {
     return 0.0 as f32;
 }
 
-fn qwen3_check_forward_caps(config: &Qwen3Config) bool {
+export fn qwen3_check_forward_caps(config: &Qwen3Config) bool {
     const q_dim: u32 = config.head_count * config.head_dim;
     const kv_dim: u32 = config.kv_head_count * config.head_dim;
     if config.layer_count == 0 || config.layer_count > QWEN3_FORWARD_MAX_LAYERS as u32 { _ = printf("error: qwen3 forward layer_count=%u exceeds cap=%zu\n", config.layer_count, QWEN3_FORWARD_MAX_LAYERS); return false; }
@@ -584,7 +584,7 @@ fn qwen3_argmax(values: &const f32, n: usize) u32 {
     return best as u32;
 }
 
-fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32) bool {
+export fn qwen3_forward_embedding(config: &Qwen3Config, weights: &Qwen3Weights, embedding: &const f32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32) bool {
     const hidden_n: usize = config.hidden_size as usize;
     const vocab_n: usize = config.vocab_size as usize;
     const ffn_n: usize = config.intermediate_size as usize;
@@ -604,7 +604,8 @@ fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u
     var up: [f32: 256] = [];
     var fused: [f32: 256] = [];
     var down: [f32: 64] = [];
-    qwen3_copy_embedding(&hidden[0], weights.token_embedding, token_id, hidden_n, vocab_n);
+    var copy_i: usize = 0;
+    while copy_i < hidden_n { hidden[copy_i] = embedding[copy_i]; copy_i = copy_i + 1; }
     var layer: usize = 0;
     while layer < config.layer_count as usize {
         const lw: &Qwen3LayerWeights = &weights.layers[layer];
@@ -634,6 +635,12 @@ fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u
     qwen3_rms_norm_view(&normed[0], &hidden[0], weights.output_norm, hidden_n);
     qwen3_matvec_view(logits, weights.output, &normed[0], hidden_n, vocab_n);
     return true;
+}
+
+export fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32) bool {
+    var embedding: [f32: 64] = [];
+    qwen3_copy_embedding(&embedding[0], weights.token_embedding, token_id, config.hidden_size as usize, config.vocab_size as usize);
+    return qwen3_forward_embedding(config, weights, &embedding[0], pos, k_cache, v_cache, logits);
 }
 
 

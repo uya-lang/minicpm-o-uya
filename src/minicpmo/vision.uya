@@ -1,0 +1,705 @@
+use libc.printf;
+use libc.sqrtf;
+use libc.strcmp;
+use minicpmo.binary.BinaryReader;
+use minicpmo.binary.binary_close;
+use minicpmo.binary.binary_open;
+use minicpmo.binary.binary_read_exact;
+use minicpmo.binary.binary_read_u32_le;
+use minicpmo.binary.binary_read_u64_le;
+use minicpmo.binary.binary_reader_init;
+use minicpmo.binary.binary_skip;
+use minicpmo.kernels.silu;
+use minicpmo.kernels.softmax;
+use minicpmo.qwen3.Qwen3Config;
+use minicpmo.qwen3.Qwen3Weights;
+use minicpmo.qwen3.qwen3_bind_weights;
+use minicpmo.qwen3.qwen3_check_forward_caps;
+use minicpmo.qwen3.qwen3_complete_config_from_tensors;
+use minicpmo.qwen3.qwen3_config_init;
+use minicpmo.qwen3.qwen3_config_load_metadata;
+use minicpmo.qwen3.qwen3_forward_embedding;
+use minicpmo.qwen3.qwen3_forward_token;
+use minicpmo.qwen3.qwen3_tensor_get;
+use minicpmo.qwen3.qwen3_weights_init;
+use minicpmo.tensor.TensorDType;
+use minicpmo.tensor.TensorView;
+use minicpmo.tensor.TensorWeightTable;
+use minicpmo.tensor.tensor_dtype_name;
+use minicpmo.tensor.tensor_lookup;
+use minicpmo.tensor.tensor_table_init;
+use minicpmo.tensor.tensor_weight_table_attach_mmap;
+use minicpmo.tensor.tensor_weight_table_detach_mmap;
+use minicpmo.tensor.tensor_weight_table_load;
+use minicpmo.tokenizer.Tokenizer;
+use minicpmo.tokenizer.tokenizer_encode_to_ids;
+use minicpmo.tokenizer.tokenizer_init;
+use minicpmo.tokenizer.tokenizer_load;
+
+const VISION_GGUF_MAGIC: u32 = 0x46554747;
+const VISION_RAW_MAGIC: u32 = 0x49415955;
+const VISION_RAW_VERSION: u32 = 1;
+const VISION_RAW_DTYPE_F32: u32 = 0;
+const VISION_GGUF_TYPE_UINT32: u32 = 4;
+const VISION_GGUF_TYPE_INT32: u32 = 5;
+const VISION_GGUF_TYPE_FLOAT32: u32 = 6;
+const VISION_GGUF_TYPE_STRING: u32 = 8;
+const VISION_GGUF_TYPE_ARRAY: u32 = 9;
+const VISION_GGUF_TYPE_UINT64: u32 = 10;
+const VISION_GGUF_TYPE_INT64: u32 = 11;
+const VISION_GGUF_TYPE_FLOAT64: u32 = 12;
+const VISION_MAX_LAYERS: usize = 4;
+const VISION_MAX_PATCHES: usize = 16;
+const VISION_MAX_PIXELS: usize = 1024;
+const VISION_MAX_PATCH_DIM: usize = 64;
+const VISION_MAX_HIDDEN: usize = 64;
+const VISION_MAX_FFN: usize = 128;
+const VISION_MAX_LLM_HIDDEN: usize = 64;
+const VISION_MAX_PROMPT: usize = 64;
+const VISION_EPS: f32 = 0.000001;
+
+export struct VisionConfig {
+    image_width: u32,
+    image_height: u32,
+    channel_count: u32,
+    patch_size: u32,
+    patch_count: u32,
+    patch_dim: u32,
+    hidden_size: u32,
+    layer_count: u32,
+    head_count: u32,
+    head_dim: u32,
+    intermediate_size: u32,
+    llm_hidden_size: u32,
+    image_token_id: u32,
+    has_image_token_id: bool,
+}
+
+export struct VisionLayerWeights {
+    attn_norm: &TensorView,
+    q_proj: &TensorView,
+    k_proj: &TensorView,
+    v_proj: &TensorView,
+    o_proj: &TensorView,
+    ffn_norm: &TensorView,
+    gate_proj: &TensorView,
+    up_proj: &TensorView,
+    down_proj: &TensorView,
+}
+
+export struct VisionWeights {
+    patch_embd: &TensorView,
+    patch_bias: &TensorView,
+    position_embd: &TensorView,
+    output_norm: &TensorView,
+    resampler: &TensorView,
+    projector: &TensorView,
+    layers: [VisionLayerWeights: 4],
+    layer_count: u32,
+}
+
+struct VisionRawImage {
+    width: u32,
+    height: u32,
+    channels: u32,
+    values: [f32: 1024],
+    element_count: usize,
+}
+
+struct VisionStringRead {
+    len: u64,
+    copied: usize,
+    truncated: bool,
+}
+
+export fn vision_config_init() VisionConfig {
+    return VisionConfig{ image_width: 0, image_height: 0, channel_count: 0, patch_size: 0, patch_count: 0, patch_dim: 0, hidden_size: 0, layer_count: 0, head_count: 0, head_dim: 0, intermediate_size: 0, llm_hidden_size: 0, image_token_id: 0, has_image_token_id: false };
+}
+
+export fn vision_weights_init() VisionWeights {
+    return VisionWeights{ patch_embd: null, patch_bias: null, position_embd: null, output_norm: null, resampler: null, projector: null, layers: [], layer_count: 0 };
+}
+
+fn vision_cstr_eq(a: &const byte, b: &const byte) bool {
+    return strcmp(a as *const byte, b as *const byte) == 0;
+}
+
+fn vision_scalar_metadata_size(value_type: u32) u64 {
+    if value_type == 0 || value_type == 1 || value_type == 7 { return 1; }
+    if value_type == 2 || value_type == 3 { return 2; }
+    if value_type == VISION_GGUF_TYPE_UINT32 || value_type == VISION_GGUF_TYPE_INT32 || value_type == VISION_GGUF_TYPE_FLOAT32 { return 4; }
+    if value_type == VISION_GGUF_TYPE_UINT64 || value_type == VISION_GGUF_TYPE_INT64 || value_type == VISION_GGUF_TYPE_FLOAT64 { return 8; }
+    return 0;
+}
+
+fn vision_read_string(reader: &BinaryReader, dest: &byte, dest_cap: usize, info: &VisionStringRead, context: &const byte) bool {
+    info.len = 0;
+    info.copied = 0;
+    info.truncated = false;
+    if !binary_read_u64_le(reader, &info.len, context) { return false; }
+    if dest_cap == 0 { return binary_skip(reader, info.len, context); }
+    var copy_len: usize = 0;
+    if info.len > 0 {
+        if info.len >= dest_cap as u64 { copy_len = dest_cap - 1; info.truncated = true; } else { copy_len = info.len as usize; }
+        if copy_len > 0 {
+            if !binary_read_exact(reader, dest, copy_len, context) { return false; }
+        }
+    }
+    dest[copy_len] = 0;
+    info.copied = copy_len;
+    if info.len > copy_len as u64 { return binary_skip(reader, info.len - (copy_len as u64), context); }
+    return true;
+}
+
+fn vision_skip_array(reader: &BinaryReader, element_type: u32, count: u64) bool {
+    const elem_size: u64 = vision_scalar_metadata_size(element_type);
+    if elem_size > 0 { return binary_skip(reader, elem_size * count, "metadata scalar array\0" as &const byte); }
+    if element_type == VISION_GGUF_TYPE_STRING {
+        var tmp: [byte: 1] = [];
+        var info: VisionStringRead = VisionStringRead{ len: 0, copied: 0, truncated: false };
+        var array_index: u64 = 0;
+        while array_index < count {
+            if !vision_read_string(reader, &tmp[0], 1, &info, "metadata string array element\0" as &const byte) { return false; }
+            array_index = array_index + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn vision_apply_u32_metadata(config: &VisionConfig, key: &const byte, value: u32) void {
+    if vision_cstr_eq(key, "vision.image_width\0" as &const byte) { config.image_width = value; return; }
+    if vision_cstr_eq(key, "vision.image_height\0" as &const byte) { config.image_height = value; return; }
+    if vision_cstr_eq(key, "vision.image_size\0" as &const byte) { config.image_width = value; config.image_height = value; return; }
+    if vision_cstr_eq(key, "vision.channel_count\0" as &const byte) { config.channel_count = value; return; }
+    if vision_cstr_eq(key, "vision.patch_size\0" as &const byte) { config.patch_size = value; return; }
+    if vision_cstr_eq(key, "vision.embedding_length\0" as &const byte) { config.hidden_size = value; return; }
+    if vision_cstr_eq(key, "vision.block_count\0" as &const byte) { config.layer_count = value; return; }
+    if vision_cstr_eq(key, "vision.siglip2.block_count\0" as &const byte) { config.layer_count = value; return; }
+    if vision_cstr_eq(key, "vision.attention.head_count\0" as &const byte) { config.head_count = value; return; }
+    if vision_cstr_eq(key, "vision.feed_forward_length\0" as &const byte) { config.intermediate_size = value; return; }
+    if vision_cstr_eq(key, "vision.projector.output_length\0" as &const byte) { config.llm_hidden_size = value; return; }
+    if vision_cstr_eq(key, "minicpmo.media.image_token_id\0" as &const byte) { config.image_token_id = value; config.has_image_token_id = true; return; }
+}
+
+fn vision_skip_metadata_value(reader: &BinaryReader, config: &VisionConfig, key: &const byte, value_type: u32) bool {
+    if value_type == VISION_GGUF_TYPE_STRING {
+        var tmp: [byte: 1] = [];
+        var info: VisionStringRead = VisionStringRead{ len: 0, copied: 0, truncated: false };
+        return vision_read_string(reader, &tmp[0], 1, &info, "metadata string value\0" as &const byte);
+    }
+    if value_type == VISION_GGUF_TYPE_ARRAY {
+        var element_type: u32 = 0;
+        var count: u64 = 0;
+        if !binary_read_u32_le(reader, &element_type, "metadata array type\0" as &const byte) { return false; }
+        if !binary_read_u64_le(reader, &count, "metadata array length\0" as &const byte) { return false; }
+        return vision_skip_array(reader, element_type, count);
+    }
+    if value_type == VISION_GGUF_TYPE_UINT32 || value_type == VISION_GGUF_TYPE_INT32 {
+        var value: u32 = 0;
+        if !binary_read_u32_le(reader, &value, "metadata int/uint32 value\0" as &const byte) { return false; }
+        vision_apply_u32_metadata(config, key, value);
+        return true;
+    }
+    const elem_size: u64 = vision_scalar_metadata_size(value_type);
+    if elem_size > 0 { return binary_skip(reader, elem_size, "metadata scalar value\0" as &const byte); }
+    _ = printf("error: vision config unsupported metadata type=%u key=%s\n", value_type, key);
+    return false;
+}
+
+export fn vision_config_load_metadata(path: &const byte, config: &VisionConfig) bool {
+    config[0] = vision_config_init();
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var tensor_count: u64 = 0;
+    var metadata_count: u64 = 0;
+    if !binary_read_u32_le(&reader, &magic, "GGUF magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != VISION_GGUF_MAGIC { _ = printf("error: vision config bad GGUF magic\n"); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &version, "GGUF version\0" as &const byte) { binary_close(&reader); return false; }
+    if version != 2 && version != 3 { _ = printf("error: vision config unsupported GGUF version=%u\n", version); binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &tensor_count, "GGUF tensor_count\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &metadata_count, "GGUF metadata_count\0" as &const byte) { binary_close(&reader); return false; }
+    var metadata_index: u64 = 0;
+    while metadata_index < metadata_count {
+        var key: [byte: 128] = [];
+        var info: VisionStringRead = VisionStringRead{ len: 0, copied: 0, truncated: false };
+        if !vision_read_string(&reader, &key[0], @len(key), &info, "metadata key\0" as &const byte) { binary_close(&reader); return false; }
+        if info.truncated { _ = printf("error: vision config metadata key too long\n"); binary_close(&reader); return false; }
+        var value_type: u32 = 0;
+        if !binary_read_u32_le(&reader, &value_type, "metadata value type\0" as &const byte) { binary_close(&reader); return false; }
+        if !vision_skip_metadata_value(&reader, config, &key[0] as &const byte, value_type) { binary_close(&reader); return false; }
+        metadata_index = metadata_index + 1;
+    }
+    binary_close(&reader);
+    return true;
+}
+
+fn vision_read_f32(reader: &BinaryReader, out: &f32) bool {
+    var bits: u32 = 0;
+    if !binary_read_u32_le(reader, &bits, "raw f32 value\0" as &const byte) { return false; }
+    const ptr: &const f32 = &bits as &const f32;
+    *out = ptr[0];
+    return true;
+}
+
+fn vision_raw_image_init() VisionRawImage {
+    return VisionRawImage{ width: 0, height: 0, channels: 0, values: [], element_count: 0 };
+}
+
+fn vision_raw_load(path: &const byte, image: &VisionRawImage) bool {
+    image[0] = vision_raw_image_init();
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var dtype: u32 = 0;
+    if !binary_read_u32_le(&reader, &magic, "raw image magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != VISION_RAW_MAGIC { _ = printf("error: raw image bad magic; expected UYAI\n"); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &version, "raw image version\0" as &const byte) { binary_close(&reader); return false; }
+    if version != VISION_RAW_VERSION { _ = printf("error: raw image unsupported version=%u\n", version); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &image.width, "raw image width\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &image.height, "raw image height\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &image.channels, "raw image channels\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &dtype, "raw image dtype\0" as &const byte) { binary_close(&reader); return false; }
+    if dtype != VISION_RAW_DTYPE_F32 { _ = printf("error: raw image dtype=%u unsupported; only f32 tensor is supported\n", dtype); binary_close(&reader); return false; }
+    const element_count_u64: u64 = (image.width as u64) * (image.height as u64) * (image.channels as u64);
+    if element_count_u64 == 0 || element_count_u64 > VISION_MAX_PIXELS as u64 { _ = printf("error: raw image element_count=%llu exceeds cap=%zu\n", element_count_u64, VISION_MAX_PIXELS); binary_close(&reader); return false; }
+    image.element_count = element_count_u64 as usize;
+    var value_index: usize = 0;
+    while value_index < image.element_count {
+        if !vision_read_f32(&reader, &image.values[value_index]) { binary_close(&reader); return false; }
+        value_index = value_index + 1;
+    }
+    if reader.pos != reader.size { _ = printf("error: raw image has trailing bytes=%llu\n", reader.size - reader.pos); binary_close(&reader); return false; }
+    binary_close(&reader);
+    return true;
+}
+
+fn vision_build_layer_name(layer: u32, suffix: &const byte, dest: &byte, dest_cap: usize) bool {
+    if dest_cap < 40 { return false; }
+    _ = sprintf(dest as *byte, "vision.blk.%u.%s", layer, suffix);
+    return true;
+}
+
+extern "libc" fn sprintf(str: *byte, format: *const byte, ...) i32;
+
+fn vision_lookup_layer(table: &TensorWeightTable, layer: u32, suffix: &const byte) &TensorView {
+    var name: [byte: 96] = [];
+    if !vision_build_layer_name(layer, suffix, &name[0], @len(name)) { return null; }
+    return tensor_lookup(table, &name[0] as &const byte);
+}
+
+fn vision_count_layers_from_tensors(table: &TensorWeightTable) u32 {
+    var layer_count: u32 = 0;
+    while layer_count < VISION_MAX_LAYERS as u32 {
+        if vision_lookup_layer(table, layer_count, "attn_q.weight\0" as &const byte) == null { return layer_count; }
+        layer_count = layer_count + 1;
+    }
+    return layer_count;
+}
+
+fn vision_check_dtype(view: &TensorView, label: &const byte) bool {
+    if view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 || view.dtype == TensorDType.BF16 { return true; }
+    _ = printf("error: vision bind tensor=%s label=%s unsupported dtype=%s\n", &view.name[0], label, tensor_dtype_name(view.dtype));
+    return false;
+}
+
+fn vision_print_shape(view: &TensorView) void {
+    _ = printf("[");
+    var dim_index: u32 = 0;
+    while dim_index < view.n_dims {
+        if dim_index > 0 { _ = printf("x"); }
+        _ = printf("%llu", view.shape[dim_index as usize]);
+        dim_index = dim_index + 1;
+    }
+    _ = printf("]");
+}
+
+fn vision_check_vec(view: &TensorView, len: u32, label: &const byte) bool {
+    if !vision_check_dtype(view, label) { return false; }
+    if view.n_dims == 1 && view.shape[0] == len as u64 { return true; }
+    _ = printf("error: vision bind tensor=%s label=%s bad shape got=", &view.name[0], label);
+    vision_print_shape(view);
+    _ = printf(" expected=[%u]\n", len);
+    return false;
+}
+
+fn vision_check_matrix(view: &TensorView, in_dim: u32, out_dim: u32, label: &const byte) bool {
+    if !vision_check_dtype(view, label) { return false; }
+    if view.n_dims == 2 && view.shape[0] == in_dim as u64 && view.shape[1] == out_dim as u64 { return true; }
+    _ = printf("error: vision bind tensor=%s label=%s bad shape got=", &view.name[0], label);
+    vision_print_shape(view);
+    _ = printf(" expected=[%u,%u]\n", in_dim, out_dim);
+    return false;
+}
+
+export fn vision_complete_config(config: &VisionConfig, table: &TensorWeightTable, image: &VisionRawImage) bool {
+    if config.image_width == 0 { config.image_width = image.width; }
+    if config.image_height == 0 { config.image_height = image.height; }
+    if config.channel_count == 0 { config.channel_count = image.channels; }
+    if config.patch_size == 0 { config.patch_size = 1; }
+    if config.head_count == 0 { config.head_count = 1; }
+    if !config.has_image_token_id { config.image_token_id = 12; }
+    if config.image_width != image.width || config.image_height != image.height || config.channel_count != image.channels {
+        _ = printf("error: raw image shape %ux%ux%u does not match vision config %ux%ux%u\n", image.width, image.height, image.channels, config.image_width, config.image_height, config.channel_count);
+        return false;
+    }
+    if config.patch_size == 0 || config.image_width % config.patch_size != 0 || config.image_height % config.patch_size != 0 {
+        _ = printf("error: vision patch_size=%u does not divide image %ux%u\n", config.patch_size, config.image_width, config.image_height);
+        return false;
+    }
+    config.patch_count = (config.image_width / config.patch_size) * (config.image_height / config.patch_size);
+    config.patch_dim = config.channel_count * config.patch_size * config.patch_size;
+    if config.patch_count == 0 || config.patch_count > VISION_MAX_PATCHES as u32 { _ = printf("error: vision patch_count=%u exceeds cap=%zu\n", config.patch_count, VISION_MAX_PATCHES); return false; }
+    if config.patch_dim == 0 || config.patch_dim > VISION_MAX_PATCH_DIM as u32 { _ = printf("error: vision patch_dim=%u exceeds cap=%zu\n", config.patch_dim, VISION_MAX_PATCH_DIM); return false; }
+    const patch: &TensorView = tensor_lookup(table, "vision.patch_embd.weight\0" as &const byte);
+    if patch == null { _ = printf("error: vision bind missing tensor vision.patch_embd.weight\n"); return false; }
+    if patch.n_dims == 2 && config.hidden_size == 0 { config.hidden_size = patch.shape[1] as u32; }
+    const projector: &TensorView = tensor_lookup(table, "vision.projector.weight\0" as &const byte);
+    if projector == null { _ = printf("error: vision bind missing tensor vision.projector.weight\n"); return false; }
+    if projector.n_dims == 2 && config.llm_hidden_size == 0 { config.llm_hidden_size = projector.shape[1] as u32; }
+    if config.layer_count == 0 { config.layer_count = vision_count_layers_from_tensors(table); }
+    const gate: &TensorView = vision_lookup_layer(table, 0, "ffn_gate.weight\0" as &const byte);
+    if gate != null && gate.n_dims == 2 && config.intermediate_size == 0 { config.intermediate_size = gate.shape[1] as u32; }
+    if config.hidden_size == 0 || config.layer_count == 0 || config.head_count == 0 || config.llm_hidden_size == 0 || config.intermediate_size == 0 {
+        _ = printf("error: vision config incomplete hidden=%u layers=%u heads=%u ffn=%u llm_hidden=%u\n", config.hidden_size, config.layer_count, config.head_count, config.intermediate_size, config.llm_hidden_size);
+        return false;
+    }
+    if config.hidden_size % config.head_count != 0 { _ = printf("error: vision hidden_size=%u not divisible by head_count=%u\n", config.hidden_size, config.head_count); return false; }
+    config.head_dim = config.hidden_size / config.head_count;
+    if config.hidden_size > VISION_MAX_HIDDEN as u32 || config.intermediate_size > VISION_MAX_FFN as u32 || config.llm_hidden_size > VISION_MAX_LLM_HIDDEN as u32 || config.layer_count > VISION_MAX_LAYERS as u32 {
+        _ = printf("error: vision config exceeds smoke caps hidden=%u ffn=%u llm_hidden=%u layers=%u\n", config.hidden_size, config.intermediate_size, config.llm_hidden_size, config.layer_count);
+        return false;
+    }
+    return true;
+}
+
+export fn vision_bind_weights(table: &TensorWeightTable, config: &VisionConfig, weights: &VisionWeights) bool {
+    weights[0] = vision_weights_init();
+    weights.patch_embd = tensor_lookup(table, "vision.patch_embd.weight\0" as &const byte);
+    if weights.patch_embd == null || !vision_check_matrix(weights.patch_embd, config.patch_dim, config.hidden_size, "patch embedding\0" as &const byte) { return false; }
+    weights.patch_bias = tensor_lookup(table, "vision.patch_embd.bias\0" as &const byte);
+    if weights.patch_bias != null && !vision_check_vec(weights.patch_bias, config.hidden_size, "patch bias\0" as &const byte) { return false; }
+    weights.position_embd = tensor_lookup(table, "vision.position_embd.weight\0" as &const byte);
+    if weights.position_embd == null || !vision_check_matrix(weights.position_embd, config.patch_count, config.hidden_size, "position embedding\0" as &const byte) { return false; }
+    weights.output_norm = tensor_lookup(table, "vision.output_norm.weight\0" as &const byte);
+    if weights.output_norm == null || !vision_check_vec(weights.output_norm, config.hidden_size, "output norm\0" as &const byte) { return false; }
+    weights.resampler = tensor_lookup(table, "vision.resampler.weight\0" as &const byte);
+    if weights.resampler == null || !vision_check_matrix(weights.resampler, config.hidden_size, config.hidden_size, "resampler\0" as &const byte) { return false; }
+    weights.projector = tensor_lookup(table, "vision.projector.weight\0" as &const byte);
+    if weights.projector == null || !vision_check_matrix(weights.projector, config.hidden_size, config.llm_hidden_size, "projector\0" as &const byte) { return false; }
+    weights.layer_count = config.layer_count;
+    var layer_index: u32 = 0;
+    while layer_index < config.layer_count {
+        var layer: &VisionLayerWeights = &weights.layers[layer_index as usize];
+        layer.attn_norm = vision_lookup_layer(table, layer_index, "attn_norm.weight\0" as &const byte);
+        if layer.attn_norm == null || !vision_check_vec(layer.attn_norm, config.hidden_size, "attention norm\0" as &const byte) { return false; }
+        layer.q_proj = vision_lookup_layer(table, layer_index, "attn_q.weight\0" as &const byte);
+        if layer.q_proj == null || !vision_check_matrix(layer.q_proj, config.hidden_size, config.hidden_size, "q projection\0" as &const byte) { return false; }
+        layer.k_proj = vision_lookup_layer(table, layer_index, "attn_k.weight\0" as &const byte);
+        if layer.k_proj == null || !vision_check_matrix(layer.k_proj, config.hidden_size, config.hidden_size, "k projection\0" as &const byte) { return false; }
+        layer.v_proj = vision_lookup_layer(table, layer_index, "attn_v.weight\0" as &const byte);
+        if layer.v_proj == null || !vision_check_matrix(layer.v_proj, config.hidden_size, config.hidden_size, "v projection\0" as &const byte) { return false; }
+        layer.o_proj = vision_lookup_layer(table, layer_index, "attn_output.weight\0" as &const byte);
+        if layer.o_proj == null || !vision_check_matrix(layer.o_proj, config.hidden_size, config.hidden_size, "o projection\0" as &const byte) { return false; }
+        layer.ffn_norm = vision_lookup_layer(table, layer_index, "ffn_norm.weight\0" as &const byte);
+        if layer.ffn_norm == null || !vision_check_vec(layer.ffn_norm, config.hidden_size, "ffn norm\0" as &const byte) { return false; }
+        layer.gate_proj = vision_lookup_layer(table, layer_index, "ffn_gate.weight\0" as &const byte);
+        if layer.gate_proj == null || !vision_check_matrix(layer.gate_proj, config.hidden_size, config.intermediate_size, "ffn gate\0" as &const byte) { return false; }
+        layer.up_proj = vision_lookup_layer(table, layer_index, "ffn_up.weight\0" as &const byte);
+        if layer.up_proj == null || !vision_check_matrix(layer.up_proj, config.hidden_size, config.intermediate_size, "ffn up\0" as &const byte) { return false; }
+        layer.down_proj = vision_lookup_layer(table, layer_index, "ffn_down.weight\0" as &const byte);
+        if layer.down_proj == null || !vision_check_matrix(layer.down_proj, config.intermediate_size, config.hidden_size, "ffn down\0" as &const byte) { return false; }
+        layer_index = layer_index + 1;
+    }
+    return true;
+}
+
+fn vision_matvec_view(dst: &f32, matrix: &TensorView, src: &const f32, in_dim: usize, out_dim: usize) void {
+    var out_index: usize = 0;
+    while out_index < out_dim {
+        var sum: f32 = 0.0;
+        var in_index: usize = 0;
+        while in_index < in_dim {
+            sum = sum + src[in_index] * qwen3_tensor_get(matrix, in_index * out_dim + out_index);
+            in_index = in_index + 1;
+        }
+        dst[out_index] = sum;
+        out_index = out_index + 1;
+    }
+}
+
+fn vision_rms_norm_view(dst: &f32, src: &const f32, weight: &TensorView, len: usize) void {
+    var sum: f32 = 0.0;
+    var value_index: usize = 0;
+    while value_index < len { sum = sum + src[value_index] * src[value_index]; value_index = value_index + 1; }
+    const inv: f32 = 1.0 / sqrtf(sum / (len as f32) + VISION_EPS);
+    value_index = 0;
+    while value_index < len {
+        dst[value_index] = src[value_index] * inv * qwen3_tensor_get(weight, value_index);
+        value_index = value_index + 1;
+    }
+}
+
+fn vision_raw_value(image: &VisionRawImage, channel: u32, row: u32, col: u32) f32 {
+    const index: usize = (((channel * image.height + row) * image.width + col) as usize);
+    return image.values[index];
+}
+
+fn vision_patch_embedding(config: &VisionConfig, weights: &VisionWeights, image: &VisionRawImage, states: &f32) void {
+    var patch_values: [f32: 64] = [];
+    var patch_index: usize = 0;
+    var patch_row: u32 = 0;
+    while patch_row < config.image_height {
+        var patch_col: u32 = 0;
+        while patch_col < config.image_width {
+            var flat_index: usize = 0;
+            var channel: u32 = 0;
+            while channel < config.channel_count {
+                var local_row: u32 = 0;
+                while local_row < config.patch_size {
+                    var local_col: u32 = 0;
+                    while local_col < config.patch_size {
+                        patch_values[flat_index] = vision_raw_value(image, channel, patch_row + local_row, patch_col + local_col);
+                        flat_index = flat_index + 1;
+                        local_col = local_col + 1;
+                    }
+                    local_row = local_row + 1;
+                }
+                channel = channel + 1;
+            }
+            vision_matvec_view(&states[patch_index * VISION_MAX_HIDDEN], weights.patch_embd, &patch_values[0], config.patch_dim as usize, config.hidden_size as usize);
+            var hidden_index: usize = 0;
+            while hidden_index < config.hidden_size as usize {
+                if weights.patch_bias != null { states[patch_index * VISION_MAX_HIDDEN + hidden_index] = states[patch_index * VISION_MAX_HIDDEN + hidden_index] + qwen3_tensor_get(weights.patch_bias, hidden_index); }
+                states[patch_index * VISION_MAX_HIDDEN + hidden_index] = states[patch_index * VISION_MAX_HIDDEN + hidden_index] + qwen3_tensor_get(weights.position_embd, patch_index * (config.hidden_size as usize) + hidden_index);
+                hidden_index = hidden_index + 1;
+            }
+            patch_index = patch_index + 1;
+            patch_col = patch_col + config.patch_size;
+        }
+        patch_row = patch_row + config.patch_size;
+    }
+}
+
+fn vision_attention(out: &f32, q_values: &const f32, k_values: &const f32, v_values: &const f32, token_count: usize, head_count: usize, head_dim: usize, token_index: usize) void {
+    var hidden_index: usize = 0;
+    while hidden_index < head_count * head_dim { out[hidden_index] = 0.0; hidden_index = hidden_index + 1; }
+    var scores: [f32: 16] = [];
+    var probs: [f32: 16] = [];
+    const scale: f32 = 1.0 / sqrtf(head_dim as f32);
+    var head_index: usize = 0;
+    while head_index < head_count {
+        var key_token: usize = 0;
+        while key_token < token_count {
+            var dot: f32 = 0.0;
+            var dim_index: usize = 0;
+            while dim_index < head_dim {
+                dot = dot + q_values[token_index * VISION_MAX_HIDDEN + head_index * head_dim + dim_index] * k_values[key_token * VISION_MAX_HIDDEN + head_index * head_dim + dim_index];
+                dim_index = dim_index + 1;
+            }
+            scores[key_token] = dot * scale;
+            key_token = key_token + 1;
+        }
+        softmax(&probs[0], &scores[0], token_count);
+        var out_dim: usize = 0;
+        while out_dim < head_dim {
+            var sum: f32 = 0.0;
+            var value_token: usize = 0;
+            while value_token < token_count {
+                sum = sum + probs[value_token] * v_values[value_token * VISION_MAX_HIDDEN + head_index * head_dim + out_dim];
+                value_token = value_token + 1;
+            }
+            out[head_index * head_dim + out_dim] = sum;
+            out_dim = out_dim + 1;
+        }
+        head_index = head_index + 1;
+    }
+}
+
+fn vision_transformer(config: &VisionConfig, weights: &VisionWeights, states: &f32) void {
+    var normed: [f32: 1024] = [];
+    var q_values: [f32: 1024] = [];
+    var k_values: [f32: 1024] = [];
+    var v_values: [f32: 1024] = [];
+    var attn_ctx: [f32: 1024] = [];
+    var attn_out: [f32: 1024] = [];
+    var gate: [f32: 2048] = [];
+    var up: [f32: 2048] = [];
+    var fused: [f32: 2048] = [];
+    var down: [f32: 1024] = [];
+    const token_count: usize = config.patch_count as usize;
+    const hidden: usize = config.hidden_size as usize;
+    const ffn: usize = config.intermediate_size as usize;
+    var layer_index: usize = 0;
+    while layer_index < config.layer_count as usize {
+        const layer: &VisionLayerWeights = &weights.layers[layer_index];
+        var token_index: usize = 0;
+        while token_index < token_count {
+            vision_rms_norm_view(&normed[token_index * VISION_MAX_HIDDEN], &states[token_index * VISION_MAX_HIDDEN] as &const f32, layer.attn_norm, hidden);
+            vision_matvec_view(&q_values[token_index * VISION_MAX_HIDDEN], layer.q_proj, &normed[token_index * VISION_MAX_HIDDEN] as &const f32, hidden, hidden);
+            vision_matvec_view(&k_values[token_index * VISION_MAX_HIDDEN], layer.k_proj, &normed[token_index * VISION_MAX_HIDDEN] as &const f32, hidden, hidden);
+            vision_matvec_view(&v_values[token_index * VISION_MAX_HIDDEN], layer.v_proj, &normed[token_index * VISION_MAX_HIDDEN] as &const f32, hidden, hidden);
+            token_index = token_index + 1;
+        }
+        token_index = 0;
+        while token_index < token_count {
+            vision_attention(&attn_ctx[token_index * VISION_MAX_HIDDEN], &q_values[0], &k_values[0], &v_values[0], token_count, config.head_count as usize, config.head_dim as usize, token_index);
+            vision_matvec_view(&attn_out[token_index * VISION_MAX_HIDDEN], layer.o_proj, &attn_ctx[token_index * VISION_MAX_HIDDEN] as &const f32, hidden, hidden);
+            var hidden_index: usize = 0;
+            while hidden_index < hidden { states[token_index * VISION_MAX_HIDDEN + hidden_index] = states[token_index * VISION_MAX_HIDDEN + hidden_index] + attn_out[token_index * VISION_MAX_HIDDEN + hidden_index]; hidden_index = hidden_index + 1; }
+            token_index = token_index + 1;
+        }
+        token_index = 0;
+        while token_index < token_count {
+            vision_rms_norm_view(&normed[token_index * VISION_MAX_HIDDEN], &states[token_index * VISION_MAX_HIDDEN] as &const f32, layer.ffn_norm, hidden);
+            vision_matvec_view(&gate[token_index * VISION_MAX_FFN], layer.gate_proj, &normed[token_index * VISION_MAX_HIDDEN] as &const f32, hidden, ffn);
+            vision_matvec_view(&up[token_index * VISION_MAX_FFN], layer.up_proj, &normed[token_index * VISION_MAX_HIDDEN] as &const f32, hidden, ffn);
+            var ffn_index: usize = 0;
+            while ffn_index < ffn { fused[token_index * VISION_MAX_FFN + ffn_index] = silu(gate[token_index * VISION_MAX_FFN + ffn_index]) * up[token_index * VISION_MAX_FFN + ffn_index]; ffn_index = ffn_index + 1; }
+            vision_matvec_view(&down[token_index * VISION_MAX_HIDDEN], layer.down_proj, &fused[token_index * VISION_MAX_FFN] as &const f32, ffn, hidden);
+            var hidden_index2: usize = 0;
+            while hidden_index2 < hidden { states[token_index * VISION_MAX_HIDDEN + hidden_index2] = states[token_index * VISION_MAX_HIDDEN + hidden_index2] + down[token_index * VISION_MAX_HIDDEN + hidden_index2]; hidden_index2 = hidden_index2 + 1; }
+            token_index = token_index + 1;
+        }
+        layer_index = layer_index + 1;
+    }
+}
+
+export fn vision_encode(config: &VisionConfig, weights: &VisionWeights, image: &VisionRawImage, embeddings: &f32, span_count: &usize) bool {
+    var states: [f32: 1024] = [];
+    vision_patch_embedding(config, weights, image, &states[0]);
+    vision_transformer(config, weights, &states[0]);
+    const token_count: usize = config.patch_count as usize;
+    const hidden: usize = config.hidden_size as usize;
+    const llm_hidden: usize = config.llm_hidden_size as usize;
+    var normed: [f32: 64] = [];
+    var resampled: [f32: 64] = [];
+    var token_index: usize = 0;
+    while token_index < token_count {
+        vision_rms_norm_view(&normed[0], &states[token_index * VISION_MAX_HIDDEN] as &const f32, weights.output_norm, hidden);
+        vision_matvec_view(&resampled[0], weights.resampler, &normed[0], hidden, hidden);
+        vision_matvec_view(&embeddings[token_index * VISION_MAX_LLM_HIDDEN], weights.projector, &resampled[0], hidden, llm_hidden);
+        token_index = token_index + 1;
+    }
+    *span_count = token_count;
+    return true;
+}
+
+fn vision_f32_bits(value: f32) u32 {
+    const ptr: &const u32 = &value as &const u32;
+    return ptr[0];
+}
+
+fn vision_checksum(values: &const f32, count: usize) u32 {
+    var hash: u32 = 2166136261;
+    var value_index: usize = 0;
+    while value_index < count {
+        const bits: u32 = vision_f32_bits(values[value_index]);
+        var byte_index: u32 = 0;
+        while byte_index < 4 {
+            hash = hash ^ ((bits >> ((byte_index * 8) as i32)) & (255 as u32));
+            hash = hash * 16777619;
+            byte_index = byte_index + 1;
+        }
+        value_index = value_index + 1;
+    }
+    return hash;
+}
+
+fn vision_count_placeholders(ids: &const u32, id_count: usize, image_token_id: u32) usize {
+    var placeholder_count: usize = 0;
+    var token_index: usize = 0;
+    while token_index < id_count {
+        if ids[token_index] == image_token_id { placeholder_count = placeholder_count + 1; }
+        token_index = token_index + 1;
+    }
+    return placeholder_count;
+}
+
+fn vision_prefill_prompt(qwen_config: &Qwen3Config, qwen_weights: &Qwen3Weights, ids: &const u32, id_count: usize, image_token_id: u32, embeddings: &const f32, span_count: usize, use_image: bool, logits: &f32) bool {
+    var k_cache: [f32: 16384] = [];
+    var v_cache: [f32: 16384] = [];
+    var token_index: usize = 0;
+    var span_index: usize = 0;
+    while token_index < id_count {
+        if ids[token_index] == image_token_id && use_image {
+            if span_index >= span_count { _ = printf("error: image embedding span underflow span=%zu\n", span_count); return false; }
+            if !qwen3_forward_embedding(qwen_config, qwen_weights, &embeddings[span_index * VISION_MAX_LLM_HIDDEN] as &const f32, token_index, &k_cache[0], &v_cache[0], logits) { return false; }
+            span_index = span_index + 1;
+        } else {
+            if !qwen3_forward_token(qwen_config, qwen_weights, ids[token_index], token_index, &k_cache[0], &v_cache[0], logits) { return false; }
+        }
+        token_index = token_index + 1;
+    }
+    if use_image && span_index != span_count { _ = printf("error: image embedding span overflow used=%zu span=%zu\n", span_index, span_count); return false; }
+    return true;
+}
+
+fn vision_logits_l1(a: &const f32, b: &const f32, count: usize) f32 {
+    var sum: f32 = 0.0;
+    var value_index: usize = 0;
+    while value_index < count {
+        if a[value_index] > b[value_index] { sum = sum + (a[value_index] - b[value_index]); } else { sum = sum + (b[value_index] - a[value_index]); }
+        value_index = value_index + 1;
+    }
+    return sum;
+}
+
+export fn vision_smoke_cli(model_path: &const byte, image_path: &const byte) i32 {
+    var image: VisionRawImage = vision_raw_image_init();
+    if !vision_raw_load(image_path, &image) { return 1; }
+    var vision_config: VisionConfig = vision_config_init();
+    if !vision_config_load_metadata(model_path, &vision_config) { return 1; }
+    var qwen_config: Qwen3Config = qwen3_config_init();
+    if !qwen3_config_load_metadata(model_path, &qwen_config) { return 1; }
+    var table: TensorWeightTable = tensor_table_init();
+    if !tensor_weight_table_load(model_path, &table) { return 1; }
+    if !vision_complete_config(&vision_config, &table, &image) { return 1; }
+    if !qwen3_complete_config_from_tensors(&qwen_config, &table) { return 1; }
+    if qwen_config.hidden_size != vision_config.llm_hidden_size { _ = printf("error: vision projector output=%u does not match qwen hidden=%u\n", vision_config.llm_hidden_size, qwen_config.hidden_size); return 1; }
+    if !qwen3_check_forward_caps(&qwen_config) { return 1; }
+    if !tensor_weight_table_attach_mmap(model_path, &table) { return 1; }
+    var vision_weights: VisionWeights = vision_weights_init();
+    if !vision_bind_weights(&table, &vision_config, &vision_weights) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var qwen_weights: Qwen3Weights = qwen3_weights_init();
+    if !qwen3_bind_weights(&table, &qwen_config, &qwen_weights) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var tok: Tokenizer = tokenizer_init();
+    if !tokenizer_load(model_path, &tok) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var embeddings: [f32: 1024] = [];
+    var span_count: usize = 0;
+    if !vision_encode(&vision_config, &vision_weights, &image, &embeddings[0], &span_count) { tensor_weight_table_detach_mmap(&table); return 1; }
+    var prompt_ids: [u32: 64] = [];
+    var prompt_count: usize = 0;
+    if !tokenizer_encode_to_ids(&tok, "<image> hello\0" as &const byte, &prompt_ids[0], VISION_MAX_PROMPT, &prompt_count) { tensor_weight_table_detach_mmap(&table); return 1; }
+    const placeholder_count: usize = vision_count_placeholders(&prompt_ids[0], prompt_count, vision_config.image_token_id);
+    if placeholder_count != span_count {
+        _ = printf("error: image placeholder count=%zu does not match embedding span=%zu\n", placeholder_count, span_count);
+        tensor_weight_table_detach_mmap(&table);
+        return 1;
+    }
+    var logits_image: [f32: 256] = [];
+    var logits_text: [f32: 256] = [];
+    if !vision_prefill_prompt(&qwen_config, &qwen_weights, &prompt_ids[0], prompt_count, vision_config.image_token_id, &embeddings[0], span_count, true, &logits_image[0]) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !vision_prefill_prompt(&qwen_config, &qwen_weights, &prompt_ids[0], prompt_count, vision_config.image_token_id, &embeddings[0], span_count, false, &logits_text[0]) { tensor_weight_table_detach_mmap(&table); return 1; }
+    const diff_l1: f32 = vision_logits_l1(&logits_image[0], &logits_text[0], qwen_config.vocab_size as usize);
+    if diff_l1 <= 0.000001 { _ = printf("error: image logits are not observably different diff_l1=%.9f\n", diff_l1 as f64); tensor_weight_table_detach_mmap(&table); return 1; }
+    const embed_checksum: u32 = vision_checksum(&embeddings[0], span_count * (vision_config.llm_hidden_size as usize));
+    const image_logits_checksum: u32 = vision_checksum(&logits_image[0], qwen_config.vocab_size as usize);
+    const text_logits_checksum: u32 = vision_checksum(&logits_text[0], qwen_config.vocab_size as usize);
+    _ = printf("vision raw: width=%u height=%u channels=%u dtype=f32 elements=%zu\n", image.width, image.height, image.channels, image.element_count);
+    _ = printf("vision config: patch=%u patch_dim=%u patches=%u hidden=%u layers=%u heads=%u ffn=%u llm_hidden=%u image_token=%u\n", vision_config.patch_size, vision_config.patch_dim, vision_config.patch_count, vision_config.hidden_size, vision_config.layer_count, vision_config.head_count, vision_config.intermediate_size, vision_config.llm_hidden_size, vision_config.image_token_id);
+    _ = printf("vision bind: patch=%s pos=%s resampler=%s projector=%s layers=%u\n", &vision_weights.patch_embd.name[0], &vision_weights.position_embd.name[0], &vision_weights.resampler.name[0], &vision_weights.projector.name[0], vision_weights.layer_count);
+    _ = printf("vision-smoke prompt_tokens:");
+    var prompt_index: usize = 0;
+    while prompt_index < prompt_count { _ = printf(" %u", prompt_ids[prompt_index]); prompt_index = prompt_index + 1; }
+    _ = printf(" placeholders=%zu span=%zu\n", placeholder_count, span_count);
+    _ = printf("vision embedding checksum: 0x%x\n", embed_checksum);
+    _ = printf("vision logits checksum: image=0x%x text=0x%x diff_l1=%.9f\n", image_logits_checksum, text_logits_checksum, diff_l1 as f64);
+    _ = printf("vision logits[0..4]: %.6f %.6f %.6f %.6f %.6f\n", logits_image[0] as f64, logits_image[1] as f64, logits_image[2] as f64, logits_image[3] as f64, logits_image[4] as f64);
+    _ = printf("vision-smoke: PASS\n");
+    tensor_weight_table_detach_mmap(&table);
+    return 0;
+}

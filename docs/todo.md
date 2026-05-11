@@ -204,22 +204,22 @@
 
 ## Phase 10: Vision raw tensor smoke
 
-- [ ] 定义 raw image tensor fixture 格式。
-- [ ] 定义 `VisionConfig`。
-- [ ] 绑定 vision patch/embedding tensors。
-- [ ] 绑定 vision transformer tensors。
-- [ ] 绑定 projector/resampler tensors。
-- [ ] 实现 patch embedding。
-- [ ] 实现 vision transformer block。
-- [ ] 实现 projector 到 LLM hidden。
-- [ ] 实现 image embedding span 注入 LLM prefill。
-- [ ] 实现 `vision-smoke <model.gguf> <image.raw>`。
+- [x] 定义 raw image tensor fixture 格式。
+- [x] 定义 `VisionConfig`。
+- [x] 绑定 vision patch/embedding tensors。
+- [x] 绑定 vision transformer tensors。
+- [x] 绑定 projector/resampler tensors。
+- [x] 实现 patch embedding。
+- [x] 实现 vision transformer block。
+- [x] 实现 projector 到 LLM hidden。
+- [x] 实现 image embedding span 注入 LLM prefill。
+- [x] 实现 `vision-smoke <model.gguf> <image.raw>`。
 
 验收标准：
 
-- tiny vision fixture checksum 稳定。
-- image placeholder 数量与 embedding span 一致。
-- 同 prompt 加/不加图像 logits 有可观测差异。
+- [x] tiny vision fixture checksum 稳定。
+- [x] image placeholder 数量与 embedding span 一致。
+- [x] 同 prompt 加/不加图像 logits 有可观测差异。
 
 ## Phase 11: Vision preprocessing
 
