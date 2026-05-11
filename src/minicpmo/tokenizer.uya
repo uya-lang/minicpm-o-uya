@@ -1,3 +1,5 @@
+use libc.calloc;
+use libc.free;
 use libc.printf;
 use libc.strcmp;
 use minicpmo.binary.BinaryReader;
@@ -17,10 +19,13 @@ const TOK_GGUF_TYPE_INT32: u32 = 5;
 const TOK_GGUF_TYPE_FLOAT32: u32 = 6;
 const TOK_GGUF_TYPE_STRING: u32 = 8;
 const TOK_GGUF_TYPE_ARRAY: u32 = 9;
-const TOKENIZER_MAX_TOKENS: usize = 4096;
-const TOKENIZER_PIECE_CAP: usize = 64;
-const TOKENIZER_MAX_MERGES: usize = 4096;
-const TOKENIZER_CHAT_TEMPLATE_CAP: usize = 512;
+const TOKENIZER_DEFAULT_TOKEN_CAP: usize = 4096;
+const TOKENIZER_PIECE_CAP: usize = 512;
+const TOKENIZER_DEFAULT_MERGE_CAP: usize = 4096;
+const TOKENIZER_CHAT_TEMPLATE_DEFAULT_CAP: usize = 512;
+const TOKENIZER_HARD_MAX_TOKENS: usize = 262144;
+const TOKENIZER_HARD_MAX_MERGES: usize = 262144;
+const TOKENIZER_HARD_MAX_CHAT_TEMPLATE: usize = 16384;
 const TOKENIZER_UNKNOWN_ID: u32 = 4294967295;
 
 struct TokGgufStringRead {
@@ -31,34 +36,98 @@ struct TokGgufStringRead {
 
 export struct Tokenizer {
     token_count: usize,
-    tokens: [byte: 262144],
-    scores: [u32: 4096],
-    types: [u32: 4096],
+    token_capacity: usize,
+    tokens: &byte,
+    scores: &u32,
+    types: &u32,
     merge_count: usize,
-    merges: [byte: 262144],
+    merge_capacity: usize,
+    merges: &byte,
     bos_id: u32,
     eos_id: u32,
     pad_id: u32,
     unk_id: u32,
-    chat_template: [byte: 512],
+    chat_template: &byte,
+    chat_template_cap: usize,
     has_chat_template: bool,
 }
 
 export fn tokenizer_init() Tokenizer {
     return Tokenizer{
         token_count: 0,
-        tokens: [],
-        scores: [],
-        types: [],
+        token_capacity: 0,
+        tokens: null,
+        scores: null,
+        types: null,
         merge_count: 0,
-        merges: [],
+        merge_capacity: 0,
+        merges: null,
         bos_id: TOKENIZER_UNKNOWN_ID,
         eos_id: TOKENIZER_UNKNOWN_ID,
         pad_id: TOKENIZER_UNKNOWN_ID,
         unk_id: TOKENIZER_UNKNOWN_ID,
-        chat_template: [],
+        chat_template: null,
+        chat_template_cap: 0,
         has_chat_template: false,
     };
+}
+
+export fn tokenizer_free(tok: &Tokenizer) void {
+    if tok.tokens != null { free(tok.tokens as &void); }
+    if tok.scores != null { free(tok.scores as &void); }
+    if tok.types != null { free(tok.types as &void); }
+    if tok.merges != null { free(tok.merges as &void); }
+    if tok.chat_template != null { free(tok.chat_template as &void); }
+    tok[0] = tokenizer_init();
+}
+
+fn tokenizer_alloc_tokens(tok: &Tokenizer, count: usize) bool {
+    if count > TOKENIZER_HARD_MAX_TOKENS {
+        _ = printf("error: tokenizer has too many tokens (%zu > %zu)\n", count, TOKENIZER_HARD_MAX_TOKENS);
+        return false;
+    }
+    if tok.tokens != null { free(tok.tokens as &void); tok.tokens = null; }
+    if tok.scores != null { free(tok.scores as &void); tok.scores = null; }
+    if tok.types != null { free(tok.types as &void); tok.types = null; }
+    tok.tokens = calloc(count, TOKENIZER_PIECE_CAP) as &byte;
+    tok.scores = calloc(count, 4) as &u32;
+    tok.types = calloc(count, 4) as &u32;
+    if tok.tokens == null || tok.scores == null || tok.types == null {
+        _ = printf("error: tokenizer allocation failed for tokens=%zu\n", count);
+        return false;
+    }
+    tok.token_capacity = count;
+    return true;
+}
+
+fn tokenizer_alloc_merges(tok: &Tokenizer, count: usize) bool {
+    if count > TOKENIZER_HARD_MAX_MERGES {
+        _ = printf("error: tokenizer has too many merges (%zu > %zu)\n", count, TOKENIZER_HARD_MAX_MERGES);
+        return false;
+    }
+    if tok.merges != null { free(tok.merges as &void); tok.merges = null; }
+    tok.merges = calloc(count, TOKENIZER_PIECE_CAP) as &byte;
+    if tok.merges == null {
+        _ = printf("error: tokenizer allocation failed for merges=%zu\n", count);
+        return false;
+    }
+    tok.merge_capacity = count;
+    return true;
+}
+
+fn tokenizer_alloc_chat_template(tok: &Tokenizer, cap: usize) bool {
+    if cap > TOKENIZER_HARD_MAX_CHAT_TEMPLATE {
+        _ = printf("error: tokenizer chat template too large (%zu > %zu)\n", cap, TOKENIZER_HARD_MAX_CHAT_TEMPLATE);
+        return false;
+    }
+    if tok.chat_template != null { free(tok.chat_template as &void); tok.chat_template = null; }
+    tok.chat_template = calloc(cap, 1) as &byte;
+    if tok.chat_template == null {
+        _ = printf("error: tokenizer allocation failed for chat template cap=%zu\n", cap);
+        return false;
+    }
+    tok.chat_template_cap = cap;
+    return true;
 }
 
 fn tok_cstr_len(s: &const byte) usize {
@@ -84,6 +153,21 @@ fn tok_cstr_starts_with(value: &const byte, prefix: &const byte) bool {
     return true;
 }
 
+fn tok_cstr_contains(value: &const byte, needle: &const byte) bool {
+    var i: usize = 0;
+    while value[i] != 0 {
+        var j: usize = 0;
+        var matched: bool = true;
+        while needle[j] != 0 {
+            if value[i + j] == 0 || value[i + j] != needle[j] { matched = false; break; }
+            j = j + 1;
+        }
+        if matched { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
 fn tok_copy_cstr(dest: &byte, dest_cap: usize, src: &const byte) void {
     if dest_cap == 0 {
         return;
@@ -97,6 +181,7 @@ fn tok_copy_cstr(dest: &byte, dest_cap: usize, src: &const byte) void {
 }
 
 fn token_ptr(tok: &Tokenizer, id: usize) &const byte {
+    if tok.tokens == null { return "\0" as &const byte; }
     return &tok.tokens[id * TOKENIZER_PIECE_CAP] as &const byte;
 }
 
@@ -105,6 +190,7 @@ fn token_mut_ptr(tok: &Tokenizer, id: usize) &byte {
 }
 
 fn merge_ptr(tok: &Tokenizer, id: usize) &const byte {
+    if tok.merges == null { return "\0" as &const byte; }
     return &tok.merges[id * TOKENIZER_PIECE_CAP] as &const byte;
 }
 
@@ -192,10 +278,7 @@ fn tok_skip_metadata_array(reader: &BinaryReader, element_type: u32, count: u64)
 }
 
 fn read_token_array(reader: &BinaryReader, tok: &Tokenizer, count: u64) bool {
-    if count > TOKENIZER_MAX_TOKENS as u64 {
-        _ = printf("error: tokenizer has too many tokens (%llu > %zu)\n", count, TOKENIZER_MAX_TOKENS);
-        return false;
-    }
+    if !tokenizer_alloc_tokens(tok, count as usize) { return false; }
     var info: TokGgufStringRead = TokGgufStringRead{ len: 0, copied: 0, truncated: false };
     var i: u64 = 0;
     while i < count {
@@ -213,10 +296,7 @@ fn read_token_array(reader: &BinaryReader, tok: &Tokenizer, count: u64) bool {
 }
 
 fn read_merge_array(reader: &BinaryReader, tok: &Tokenizer, count: u64) bool {
-    if count > TOKENIZER_MAX_MERGES as u64 {
-        _ = printf("error: tokenizer has too many merges (%llu > %zu)\n", count, TOKENIZER_MAX_MERGES);
-        return false;
-    }
+    if !tokenizer_alloc_merges(tok, count as usize) { return false; }
     var info: TokGgufStringRead = TokGgufStringRead{ len: 0, copied: 0, truncated: false };
     var i: u64 = 0;
     while i < count {
@@ -273,30 +353,34 @@ fn handle_array_metadata(reader: &BinaryReader, tok: &Tokenizer, key: &const byt
             _ = printf("error: tokenizer.ggml.scores must be float32 array\n");
             return false;
         }
-        return read_u32_array(reader, &tok.scores[0], TOKENIZER_MAX_TOKENS, count, "tokenizer scores\0" as &const byte);
+        if tok.scores == null || count > tok.token_capacity as u64 { if !tokenizer_alloc_tokens(tok, count as usize) { return false; } }
+        return read_u32_array(reader, tok.scores, tok.token_capacity, count, "tokenizer scores\0" as &const byte);
     }
     if tok_cstr_eq(key, "tokenizer.ggml.token_type\0" as &const byte) || tok_cstr_eq(key, "tokenizer.ggml.token_types\0" as &const byte) {
         if element_type != TOK_GGUF_TYPE_INT32 && element_type != TOK_GGUF_TYPE_UINT32 {
             _ = printf("error: tokenizer token types must be int32/uint32 array\n");
             return false;
         }
-        return read_u32_array(reader, &tok.types[0], TOKENIZER_MAX_TOKENS, count, "tokenizer token types\0" as &const byte);
+        if tok.types == null || count > tok.token_capacity as u64 { if !tokenizer_alloc_tokens(tok, count as usize) { return false; } }
+        return read_u32_array(reader, tok.types, tok.token_capacity, count, "tokenizer token types\0" as &const byte);
     }
     return tok_skip_metadata_array(reader, element_type, count);
 }
 
 fn skip_metadata_value(reader: &BinaryReader, tok: &Tokenizer, key: &const byte, value_type: u32, alignment: &u64) bool {
     if value_type == TOK_GGUF_TYPE_STRING {
+        if tok_cstr_eq(key, "tokenizer.chat_template\0" as &const byte) || tok_cstr_eq(key, "tokenizer.ggml.chat_template\0" as &const byte) {
+            var len: u64 = 0;
+            if !binary_read_u64_le(reader, &len, "metadata chat_template length\0" as &const byte) { return false; }
+            if !tokenizer_alloc_chat_template(tok, (len as usize) + (1 as usize)) { return false; }
+            if len > 0 && !binary_read_exact(reader, tok.chat_template, len as usize, "metadata chat_template value\0" as &const byte) { return false; }
+            tok.chat_template[len as usize] = 0;
+            tok.has_chat_template = true;
+            return true;
+        }
         var value: [byte: 512] = [];
         var info: TokGgufStringRead = TokGgufStringRead{ len: 0, copied: 0, truncated: false };
-        if !tok_read_gguf_string(reader, &value[0], @len(value), &info, "metadata string value\0" as &const byte) {
-            return false;
-        }
-        if tok_cstr_eq(key, "tokenizer.chat_template\0" as &const byte) || tok_cstr_eq(key, "tokenizer.ggml.chat_template\0" as &const byte) {
-            tok_copy_cstr(&tok.chat_template[0], TOKENIZER_CHAT_TEMPLATE_CAP, &value[0] as &const byte);
-            tok.has_chat_template = true;
-        }
-        return true;
+        return tok_read_gguf_string(reader, &value[0], @len(value), &info, "metadata string value\0" as &const byte);
     }
     if value_type == TOK_GGUF_TYPE_ARRAY {
         return handle_array_metadata(reader, tok, key);
@@ -468,6 +552,46 @@ fn try_match_plain_token(tok: &Tokenizer, text: &const byte, pos: usize, out_id:
     return false;
 }
 
+
+fn tok_byte_direct(value: u32) bool {
+    if value >= 33 && value <= 126 { return true; }
+    if value >= 161 && value <= 172 { return true; }
+    if value >= 174 && value <= 255 { return true; }
+    return false;
+}
+
+fn tok_utf8_encode(codepoint: u32, dest: &byte, dest_cap: usize) bool {
+    if dest_cap < 4 { return false; }
+    if codepoint < 128 {
+        dest[0] = codepoint as byte;
+        dest[1] = 0;
+        return true;
+    }
+    if codepoint < 2048 {
+        dest[0] = ((192 as u32) | (codepoint >> 6)) as byte;
+        dest[1] = ((128 as u32) | (codepoint & (63 as u32))) as byte;
+        dest[2] = 0;
+        return true;
+    }
+    dest[0] = ((224 as u32) | (codepoint >> 12)) as byte;
+    dest[1] = ((128 as u32) | ((codepoint >> 6) & (63 as u32))) as byte;
+    dest[2] = ((128 as u32) | (codepoint & (63 as u32))) as byte;
+    dest[3] = 0;
+    return true;
+}
+
+fn tok_byte_fallback_piece(value: byte, dest: &byte, dest_cap: usize) bool {
+    const b: u32 = value as u32;
+    if tok_byte_direct(b) { return tok_utf8_encode(b, dest, dest_cap); }
+    var extra: u32 = 0;
+    var i: u32 = 0;
+    while i < b {
+        if !tok_byte_direct(i) { extra = extra + 1; }
+        i = i + 1;
+    }
+    return tok_utf8_encode(256 + extra, dest, dest_cap);
+}
+
 fn parse_u32(s: &const byte, out: &u32) bool {
     var i: usize = 0;
     var value: u32 = 0;
@@ -509,10 +633,14 @@ export fn tokenizer_encode_to_ids(tok: &Tokenizer, text: &const byte, out_ids: &
             *out_count = *out_count + 1;
             pos = pos + match_len;
         } else {
-            var piece: [byte: 2] = [];
-            piece[0] = text[pos];
-            piece[1] = 0;
+            var piece: [byte: 8] = [];
+            if !tok_byte_fallback_piece(text[pos], &piece[0], @len(piece)) { return false; }
             id = find_token(tok, &piece[0] as &const byte);
+            if id == TOKENIZER_UNKNOWN_ID {
+                piece[0] = text[pos];
+                piece[1] = 0;
+                id = find_token(tok, &piece[0] as &const byte);
+            }
             if id == TOKENIZER_UNKNOWN_ID {
                 if tok.unk_id != TOKENIZER_UNKNOWN_ID {
                     id = tok.unk_id;
@@ -585,10 +713,14 @@ export fn tokenizer_encode_cli(path: &const byte, text: &const byte) i32 {
             first = false;
             pos = pos + match_len;
         } else {
-            var piece: [byte: 2] = [];
-            piece[0] = text[pos];
-            piece[1] = 0;
+            var piece: [byte: 8] = [];
+            if !tok_byte_fallback_piece(text[pos], &piece[0], @len(piece)) { return 1; }
             id = find_token(&tok, &piece[0] as &const byte);
+            if id == TOKENIZER_UNKNOWN_ID {
+                piece[0] = text[pos];
+                piece[1] = 0;
+                id = find_token(&tok, &piece[0] as &const byte);
+            }
             if id == TOKENIZER_UNKNOWN_ID {
                 if tok.unk_id != TOKENIZER_UNKNOWN_ID {
                     id = tok.unk_id;
@@ -614,10 +746,12 @@ export fn tokenizer_chat_template_supported(tok: &Tokenizer) bool {
     if !tok.has_chat_template {
         return true;
     }
-    if tok_cstr_eq(&tok.chat_template[0] as &const byte, "minicpmo.chatml\0" as &const byte) {
+    if tok_cstr_eq(tok.chat_template as &const byte, "minicpmo.chatml\0" as &const byte) {
         return true;
     }
-    return tok_cstr_starts_with(&tok.chat_template[0] as &const byte, "<|im_start|>\0" as &const byte);
+    if tok.chat_template == null { return true; }
+    if tok_cstr_starts_with(tok.chat_template as &const byte, "<|im_start|>\0" as &const byte) { return true; }
+    return tok_cstr_contains(tok.chat_template as &const byte, "<|im_start|>\0" as &const byte);
 }
 
 fn tok_append_cstr(dest: &byte, dest_cap: usize, pos: &usize, src: &const byte) bool {
@@ -669,6 +803,6 @@ export fn tokenizer_format_chat_cli(path: &const byte, user_text: &const byte) i
         _ = printf("%s", &prompt[0]);
         return 0;
     }
-    _ = printf("%s\n", &tok.chat_template[0]);
+    _ = printf("%s\n", tok.chat_template);
     return 0;
 }
