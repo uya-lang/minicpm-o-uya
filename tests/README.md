@@ -50,7 +50,7 @@ Generated files:
 - `kernels-fixture` for scalar reference kernel goldens.
 - `quant-fixture` for selected GGML quant kernel goldens and unsupported dtype diagnostics.
 - `qwen3-fixture` for tiny Qwen3 config/weight binding and missing tensor diagnostics.
-- `generate-fixture` for deterministic prefill/decode, KV cache writes, logits, and sampler output.
+- `generate-fixture` for deterministic prefill/decode, KV cache writes, logits, sampler output, and hidden-state dump summaries.
 - `vision-fixture` for raw image tensor smoke, RGB preprocessing, image/video manifest handling, tile counts, and checksum stability.
 - `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
 - `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.

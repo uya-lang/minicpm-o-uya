@@ -114,6 +114,9 @@ generate-fixture: FORCE build fixtures
 	cmp -s /tmp/minicpm-o-uya-generate-seed-a.out /tmp/minicpm-o-uya-generate-seed-b.out
 	$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 3 >/tmp/minicpm-o-uya-generate-thread1.out
 	$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 3 --threads 2 >/tmp/minicpm-o-uya-generate-thread2.out
+	$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 1 --dump-hidden >/tmp/minicpm-o-uya-generate-hidden.out
+	grep -q "prompt hidden: token_index=0 token=4 n=8" /tmp/minicpm-o-uya-generate-hidden.out
+	grep -q "generated hidden: token_index=0 token=4 n=8" /tmp/minicpm-o-uya-generate-hidden.out
 	cmp -s /tmp/minicpm-o-uya-generate-thread1.out /tmp/minicpm-o-uya-generate-thread2.out
 	$(OUT) generate tests/fixtures/tiny.gguf hello >/tmp/minicpm-o-uya-generate-eos.out
 	grep -q "stop: context_limit=32" /tmp/minicpm-o-uya-generate-eos.out

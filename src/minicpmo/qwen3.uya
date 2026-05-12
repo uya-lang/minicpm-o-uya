@@ -98,6 +98,7 @@ export struct Qwen3SamplerConfig {
     stop_token: u32,
     stop_on_eos: bool,
     verbose: bool,
+    dump_hidden: bool,
     threads: u32,
 }
 
@@ -126,8 +127,11 @@ struct Qwen3Runtime {
     rope_cos: &f32,
     rope_sin: &f32,
     prompt_ids: &u32,
+    last_hidden: &f32,
     context_capacity: usize,
     rope_half_dim: usize,
+    last_hidden_len: usize,
+    last_hidden_valid: bool,
     prompt_count: usize,
     total_tokens: usize,
     seed: u32,
@@ -1167,7 +1171,25 @@ fn qwen3_argmax_penalized(values: &const f32, n: usize, seen: &const u32, seen_c
     return best as u32;
 }
 
-fn qwen3_forward_embedding_with_rope(config: &Qwen3Config, weights: &Qwen3Weights, embedding: &const f32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool, rope_cos: &const f32, rope_sin: &const f32, context_capacity: usize) bool {
+fn qwen3_print_hidden_summary(label: &const byte, token_index: usize, token_id: u32, hidden: &const f32, n: usize) void {
+    if hidden == null || n == 0 { return; }
+    var sum: f32 = 0.0;
+    var abs_sum: f32 = 0.0;
+    var max_abs: f32 = 0.0;
+    var i: usize = 0;
+    while i < n {
+        const v: f32 = hidden[i];
+        var av: f32 = v;
+        if av < 0.0 { av = -av; }
+        sum = sum + v;
+        abs_sum = abs_sum + av;
+        if av > max_abs { max_abs = av; }
+        i = i + 1;
+    }
+    _ = printf("%s: token_index=%zu token=%u n=%zu sum=%.6f abs_sum=%.6f max_abs=%.6f first=%.6f last=%.6f\n", label, token_index, token_id, n, sum as f64, abs_sum as f64, max_abs as f64, hidden[0] as f64, hidden[n - (1 as usize)] as f64);
+}
+
+fn qwen3_forward_embedding_with_rope(config: &Qwen3Config, weights: &Qwen3Weights, embedding: &const f32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool, rope_cos: &const f32, rope_sin: &const f32, context_capacity: usize, hidden_out: &f32, hidden_out_len: usize) bool {
     if pos >= context_capacity || pos >= QWEN3_FORWARD_MAX_CONTEXT {
         _ = printf("error: qwen3 forward pos=%zu exceeds runtime_context=%zu max_context=%zu\n", pos, context_capacity, QWEN3_FORWARD_MAX_CONTEXT);
         return false;
@@ -1225,6 +1247,15 @@ fn qwen3_forward_embedding_with_rope(config: &Qwen3Config, weights: &Qwen3Weight
         while i < hidden_n { hidden[i] = hidden[i] + down[i]; i = i + 1; }
         layer = layer + 1;
     }
+    if hidden_out != null {
+        if hidden_out_len < hidden_n {
+            _ = printf("error: qwen3 hidden capture buffer too small len=%zu hidden=%zu\n", hidden_out_len, hidden_n);
+            free(hidden as &void); free(normed as &void); free(q as &void); free(k as &void); free(v as &void); free(attn_ctx as &void); free(attn_out as &void); free(gate as &void); free(up as &void); free(fused as &void); free(down as &void);
+            return false;
+        }
+        var hidden_i: usize = 0;
+        while hidden_i < hidden_n { hidden_out[hidden_i] = hidden[hidden_i]; hidden_i = hidden_i + 1; }
+    }
     if compute_logits {
         qwen3_rms_norm_view(normed, hidden, weights.output_norm, hidden_n);
         qwen3_matvec_view(logits, weights.output, normed, hidden_n, vocab_n);
@@ -1234,25 +1265,25 @@ fn qwen3_forward_embedding_with_rope(config: &Qwen3Config, weights: &Qwen3Weight
 }
 
 export fn qwen3_forward_embedding(config: &Qwen3Config, weights: &Qwen3Weights, embedding: &const f32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool) bool {
-    return qwen3_forward_embedding_with_rope(config, weights, embedding, pos, k_cache, v_cache, logits, compute_logits, null as &const f32, null as &const f32, QWEN3_FORWARD_COMPAT_CONTEXT);
+    return qwen3_forward_embedding_with_rope(config, weights, embedding, pos, k_cache, v_cache, logits, compute_logits, null as &const f32, null as &const f32, QWEN3_FORWARD_COMPAT_CONTEXT, null as &f32, 0);
 }
 
-fn qwen3_forward_token_with_rope(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool, rope_cos: &const f32, rope_sin: &const f32, context_capacity: usize) bool {
+fn qwen3_forward_token_with_rope(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool, rope_cos: &const f32, rope_sin: &const f32, context_capacity: usize, hidden_out: &f32, hidden_out_len: usize) bool {
     var embedding: &f32 = calloc(config.hidden_size as usize, 4) as &f32;
     if embedding == null { _ = printf("error: qwen3 embedding allocation failed\n"); return false; }
     qwen3_copy_embedding(embedding, weights.token_embedding, token_id, config.hidden_size as usize, config.vocab_size as usize);
-    const ok: bool = qwen3_forward_embedding_with_rope(config, weights, embedding, pos, k_cache, v_cache, logits, compute_logits, rope_cos, rope_sin, context_capacity);
+    const ok: bool = qwen3_forward_embedding_with_rope(config, weights, embedding, pos, k_cache, v_cache, logits, compute_logits, rope_cos, rope_sin, context_capacity, hidden_out, hidden_out_len);
     free(embedding as &void);
     return ok;
 }
 
 export fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, token_id: u32, pos: usize, k_cache: &f32, v_cache: &f32, logits: &f32, compute_logits: bool) bool {
-    return qwen3_forward_token_with_rope(config, weights, token_id, pos, k_cache, v_cache, logits, compute_logits, null as &const f32, null as &const f32, QWEN3_FORWARD_COMPAT_CONTEXT);
+    return qwen3_forward_token_with_rope(config, weights, token_id, pos, k_cache, v_cache, logits, compute_logits, null as &const f32, null as &const f32, QWEN3_FORWARD_COMPAT_CONTEXT, null as &f32, 0);
 }
 
 
 fn qwen3_sampler_init() Qwen3SamplerConfig {
-    return Qwen3SamplerConfig{ max_new_tokens: 0, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true, verbose: false, threads: 1 };
+    return Qwen3SamplerConfig{ max_new_tokens: 0, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true, verbose: false, dump_hidden: false, threads: 1 };
 }
 
 fn qwen3_bench_config_init() Qwen3BenchConfig {
@@ -1432,6 +1463,10 @@ fn qwen3_parse_sampler_args(argc: i32, argv: & &byte, start_index: i32, sampler:
             sampler.verbose = true;
             i = i + 1; continue;
         }
+        if strcmp(argv[i] as *const byte, "--dump-hidden\0" as *const byte) == 0 {
+            sampler.dump_hidden = true;
+            i = i + 1; continue;
+        }
         if strcmp(argv[i] as *const byte, "--threads\0" as *const byte) == 0 {
             if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &sampler.threads) { return false; }
             i = i + 2; continue;
@@ -1475,7 +1510,7 @@ fn qwen3_parse_bench_args(argc: i32, argv: & &byte, start_index: i32, bench: &Qw
 }
 
 fn qwen3_runtime_init() Qwen3Runtime {
-    return Qwen3Runtime{ k_cache: null, v_cache: null, rope_cos: null, rope_sin: null, prompt_ids: null, context_capacity: 0, rope_half_dim: 0, prompt_count: 0, total_tokens: 0, seed: QWEN3_SAMPLER_DEFAULT_SEED };
+    return Qwen3Runtime{ k_cache: null, v_cache: null, rope_cos: null, rope_sin: null, prompt_ids: null, last_hidden: null, context_capacity: 0, rope_half_dim: 0, last_hidden_len: 0, last_hidden_valid: false, prompt_count: 0, total_tokens: 0, seed: QWEN3_SAMPLER_DEFAULT_SEED };
 }
 
 fn qwen3_runtime_context_capacity(config: &Qwen3Config) usize {
@@ -1491,15 +1526,18 @@ fn qwen3_runtime_alloc(config: &Qwen3Config, runtime: &Qwen3Runtime) bool {
     runtime.k_cache = calloc(cache_count, 4) as &f32;
     runtime.v_cache = calloc(cache_count, 4) as &f32;
     runtime.prompt_ids = calloc(context_capacity, 4) as &u32;
-    if runtime.k_cache == null || runtime.v_cache == null || runtime.prompt_ids == null {
-        _ = printf("error: qwen3 runtime allocation failed cache_floats=%zu runtime_context=%zu kv_dim=%zu\n", cache_count, context_capacity, kv_dim);
-        free(runtime.k_cache as &void); free(runtime.v_cache as &void); free(runtime.prompt_ids as &void);
+    runtime.last_hidden = calloc(config.hidden_size as usize, 4) as &f32;
+    if runtime.k_cache == null || runtime.v_cache == null || runtime.prompt_ids == null || runtime.last_hidden == null {
+        _ = printf("error: qwen3 runtime allocation failed cache_floats=%zu runtime_context=%zu kv_dim=%zu hidden=%u\n", cache_count, context_capacity, kv_dim, config.hidden_size);
+        free(runtime.k_cache as &void); free(runtime.v_cache as &void); free(runtime.prompt_ids as &void); free(runtime.last_hidden as &void);
         runtime[0] = qwen3_runtime_init();
         return false;
     }
     runtime.context_capacity = context_capacity;
+    runtime.last_hidden_len = config.hidden_size as usize;
+    runtime.last_hidden_valid = false;
     if !qwen3_precompute_rope(config, runtime) {
-        free(runtime.k_cache as &void); free(runtime.v_cache as &void); free(runtime.prompt_ids as &void);
+        free(runtime.k_cache as &void); free(runtime.v_cache as &void); free(runtime.prompt_ids as &void); free(runtime.last_hidden as &void);
         runtime[0] = qwen3_runtime_init();
         return false;
     }
@@ -1515,6 +1553,7 @@ fn qwen3_runtime_free(runtime: &Qwen3Runtime) void {
     if runtime.rope_cos != null { free(runtime.rope_cos as &void); }
     if runtime.rope_sin != null { free(runtime.rope_sin as &void); }
     if runtime.prompt_ids != null { free(runtime.prompt_ids as &void); }
+    if runtime.last_hidden != null { free(runtime.last_hidden as &void); }
     runtime[0] = qwen3_runtime_init();
 }
 
@@ -1575,7 +1614,7 @@ fn qwen3_bench_decode_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runti
         const next_id: u32 = seed_ids[i % seed_count];
         runtime.prompt_ids[runtime.total_tokens] = next_id;
         runtime.total_tokens = runtime.total_tokens + 1;
-        if !qwen3_forward_token_with_rope(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, true, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity) { return false; }
+        if !qwen3_forward_token_with_rope(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, true, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity, null as &f32, 0) { return false; }
         i = i + 1;
     }
     return true;
@@ -1644,7 +1683,8 @@ fn qwen3_append_prompt_ids(config: &Qwen3Config, weights: &Qwen3Weights, runtime
         const pos: usize = runtime.total_tokens;
         runtime.prompt_ids[pos] = ids[i];
         const compute_logits: bool = (i + (1 as usize)) == id_count;
-        if !qwen3_forward_token_with_rope(config, weights, ids[i], pos, runtime.k_cache, runtime.v_cache, logits, compute_logits, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity) { return false; }
+        if !qwen3_forward_token_with_rope(config, weights, ids[i], pos, runtime.k_cache, runtime.v_cache, logits, compute_logits, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity, runtime.last_hidden, runtime.last_hidden_len) { return false; }
+        runtime.last_hidden_valid = true;
         runtime.total_tokens = runtime.total_tokens + 1;
         i = i + 1;
     }
@@ -1694,9 +1734,15 @@ fn qwen3_generate_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: 
         runtime.prompt_ids[runtime.total_tokens] = next_id;
         runtime.total_tokens = runtime.total_tokens + 1;
         const will_stop_after_token: bool = sampler.max_new_tokens != 0 && (generated + (1 as usize)) >= sampler.max_new_tokens as usize;
-        if preserve_final_cache || !will_stop_after_token {
+        const should_forward_generated: bool = preserve_final_cache || sampler.dump_hidden || !will_stop_after_token;
+        if should_forward_generated {
             const compute_next_logits: bool = !will_stop_after_token;
-            if !qwen3_forward_token_with_rope(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, compute_next_logits, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity) { return 1; }
+            if !qwen3_forward_token_with_rope(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, compute_next_logits, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity, runtime.last_hidden, runtime.last_hidden_len) { return 1; }
+            runtime.last_hidden_valid = true;
+            if sampler.dump_hidden {
+                _ = printf("\n");
+                qwen3_print_hidden_summary("generated hidden\0" as &const byte, generated, next_id, runtime.last_hidden as &const f32, runtime.last_hidden_len);
+            }
         }
         generated = generated + 1;
     }
@@ -1897,6 +1943,9 @@ export fn qwen3_generate_cli(path: &const byte, prompt: &const byte) i32 {
     var i: usize = 0;
     while i < runtime.prompt_count { _ = printf(" %u", runtime.prompt_ids[i]); i = i + 1; }
     _ = printf("\n");
+    if sampler.dump_hidden && runtime.last_hidden_valid && runtime.total_tokens > 0 {
+        qwen3_print_hidden_summary("prompt hidden\0" as &const byte, runtime.total_tokens - (1 as usize), runtime.prompt_ids[runtime.total_tokens - (1 as usize)], runtime.last_hidden as &const f32, runtime.last_hidden_len);
+    }
     const rc: i32 = qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, logits, "generated text\0" as &const byte, false);
     if rc == 0 {
         _ = printf("logits[0..4]: %.6f %.6f %.6f %.6f %.6f\n", logits[0] as f64, logits[1] as f64, logits[2] as f64, logits[3] as f64, logits[4] as f64);
@@ -1907,7 +1956,7 @@ export fn qwen3_generate_cli(path: &const byte, prompt: &const byte) i32 {
 }
 
 export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
-    if argc < 4 { _ = printf("usage: minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose]\n"); return 1; }
+    if argc < 4 { _ = printf("usage: minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose] [--dump-hidden]\n"); return 1; }
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
     var weights: Qwen3Weights = qwen3_weights_init();
@@ -1931,6 +1980,9 @@ export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
     var i: usize = 0;
     while i < runtime.prompt_count { _ = printf(" %u", runtime.prompt_ids[i]); i = i + 1; }
     _ = printf("\n");
+    if sampler.dump_hidden && runtime.last_hidden_valid && runtime.total_tokens > 0 {
+        qwen3_print_hidden_summary("prompt hidden\0" as &const byte, runtime.total_tokens - (1 as usize), runtime.prompt_ids[runtime.total_tokens - (1 as usize)], runtime.last_hidden as &const f32, runtime.last_hidden_len);
+    }
     const rc: i32 = qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, logits, "generated text\0" as &const byte, false);
     tensor_weight_table_detach_mmap(&table);
     free(logits as &void);
@@ -1938,7 +1990,7 @@ export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
 }
 
 export fn qwen3_chat_cli(argc: i32, argv: & &byte) i32 {
-    if argc < 3 { _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose]\n"); return 1; }
+    if argc < 3 { _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose] [--dump-hidden]\n"); return 1; }
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
     var weights: Qwen3Weights = qwen3_weights_init();

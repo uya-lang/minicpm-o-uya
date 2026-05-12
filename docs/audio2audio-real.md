@@ -80,7 +80,7 @@ Each file audit also prints a compact inventory with tensor count, dtype distrib
 Audit diagnostics include candidate next actions for unknown dtype, unclassified tensor prefixes, and key alias shape mismatches. The current shape sanity checks cover representative official MiniCPM-o 4.5 audio, TTS, projector, token2wav, HiFiGAN2, and prompt-cache tensors. A shape mismatch is treated as unsupported until the alias table or expected shape is updated.
 
 The Qwen3 text path now accepts the MiniCPM-o 4.5 text dimensions used by `MiniCPM-o-4_5-Q4_K_M.gguf`: `hidden=4096`, `layers=36`, `ffn=12288`, `ctx>=4096`, and `vocab=151748`. Large forward workspaces and logits buffers are heap-backed rather than fixed stack arrays.
-Runtime text generation has real GGML-layout fused matvec support for Q4_K, Q5_K, and Q6_K, plus Q4_K/Q5_K/Q6_K embedding-row dequantization. The official Q4_K_M LLM now passes a text-only one-token generate smoke; Q8_K/IQ runtime matvec remains guarded until implemented or proven unused by the target bundle.
+Runtime text generation has real GGML-layout fused matvec support for Q4_K, Q5_K, and Q6_K, plus Q4_K/Q5_K/Q6_K embedding-row dequantization. The official Q4_K_M LLM now passes a text-only one-token generate smoke, and its audited dtype distribution is only `F32/Q4_K/Q6_K`; Q8_K/IQ runtime matvec remains guarded for other bundles. Use `generate ... --dump-hidden` to emit prompt/generated token hidden-state summaries; on the official MiniCPM-o 4.5 LLM this reports `n=4096`, which is the handoff shape needed by the later TTS projector path.
 
 ## Required GGUF Files
 
