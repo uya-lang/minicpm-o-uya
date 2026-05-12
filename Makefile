@@ -4,7 +4,7 @@ OUT := build/minicpm-o-uya
 RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio2audio-real-audit clean FORCE
 
 build: build-release
 
@@ -188,6 +188,18 @@ minicpmo-audit: build
 		exit 2; \
 	fi
 	$(OUT) audit "$(MINICPM_O_GGUF)"
+
+audio2audio-real-audit: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf make audio2audio-real-audit"; \
+		exit 2; \
+	fi
+	$(OUT) audio2audio-real --audit-only \
+		--llm "$(MINICPM_O_REAL_BUNDLE)/MiniCPM-o-4_5-Q4_K_M.gguf" \
+		--audio "$(MINICPM_O_REAL_BUNDLE)/audio/MiniCPM-o-4_5-audio-F16.gguf" \
+		--tts "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf" \
+		--projector "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-projector-F16.gguf" \
+		--token2wav-dir "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf"
 
 clean:
 	rm -rf build

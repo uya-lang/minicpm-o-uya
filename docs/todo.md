@@ -411,7 +411,7 @@
 - [x] 生成 `outputs/nihao_case` 和 `outputs/complex_case2` 作为行为基线。
 - [x] 记录错误用法风险：只传 `prefix_0000.wav` 会被当作参考音色，容易看起来像复述输入。
 - [ ] 增加不入库的外部 baseline manifest，记录模型路径、输入 wav、输出 wav、回答文本、运行日志路径。
-- [ ] 增加 `docs/audio2audio-real.md`，明确 baseline 命令、输入文件命名、输出目录和验收口径。
+- [x] 增加 `docs/audio2audio-real.md`，明确 baseline 命令、输入文件命名、输出目录和验收口径。
 
 验收标准：
 
@@ -422,7 +422,7 @@
 ### 21.2 官方 GGUF audit 与 tensor alias
 
 - [x] Uya `audio2audio-smoke` 支持 split GGUF 参数：`--audio-model`、`--speech-model`、`--vocoder-model`。
-- [ ] 为官方 `MiniCPM-o-4_5-Q4_K_M.gguf`、`audio/MiniCPM-o-4_5-audio-F16.gguf`、`tts/MiniCPM-o-4_5-tts-F16.gguf`、`tts/MiniCPM-o-4_5-projector-F16.gguf`、`token2wav-gguf/*.gguf` 生成 tensor/metadata inventory。
+- [x] 为官方 `MiniCPM-o-4_5-Q4_K_M.gguf`、`audio/MiniCPM-o-4_5-audio-F16.gguf`、`tts/MiniCPM-o-4_5-tts-F16.gguf`、`tts/MiniCPM-o-4_5-projector-F16.gguf`、`token2wav-gguf/*.gguf` 生成 tensor/metadata inventory。
 - [ ] 增加 `audit-bundle` 或等价脚本，批量输出每个 GGUF 的 tensor count、dtype distribution、name prefix、shape summary。
 - [ ] 为 audio encoder 建立官方 tensor alias 表。
 - [ ] 为 TTS GGUF 建立 `emb_code`、`emb_text`、`projector_semantic`、`projector_spk`、`head_code` 绑定表。
@@ -501,8 +501,8 @@
 
 ### 21.7 `audio2audio-real` CLI
 
-- [ ] 新增真实 CLI，不复用 smoke 名称：`audio2audio-real`。
-- [ ] 支持显式分文件参数：`--llm`、`--audio`、`--tts`、`--projector`、`--token2wav-dir`。
+- [x] 新增真实 CLI，不复用 smoke 名称：`audio2audio-real`。
+- [x] 支持显式分文件参数：`--llm`、`--audio`、`--tts`、`--projector`、`--token2wav-dir`。
 - [ ] 支持输入参数：`--ref-audio`、`--user-audio`、`--out`。
 - [ ] 支持 llama.cpp-omni 测试格式：`--test-prefix PREFIX --count N`，其中 `0000` 是 ref，`0001..` 是 user turn。
 - [ ] 输出回答文本、answer wav、turn wav、audio token chunks、timing log。
@@ -539,7 +539,7 @@ build/minicpm-o-uya audio2audio-real \
 验收标准：
 
 - `make test` 仍只跑 tiny fixture。
-- `MINICPM_O_REAL_BUNDLE=/path make audio2audio-real-smoke` 可手动跑真实模型。
+- `MINICPM_O_REAL_BUNDLE=/path make audio2audio-real-audit` 可手动跑真实模型。
 - 每个性能回归都有日志和指标，便于比较 Uya 与 llama.cpp-omni。
 
 

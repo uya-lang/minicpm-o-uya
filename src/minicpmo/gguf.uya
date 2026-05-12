@@ -1,5 +1,6 @@
 use libc.printf;
 use libc.strcmp;
+use libc.snprintf;
 use minicpmo.binary.BinaryReader;
 use minicpmo.binary.binary_close;
 use minicpmo.binary.binary_open;
@@ -1152,5 +1153,110 @@ export fn audit_gguf(path: &const byte) i32 {
     audit_print_diagnostics(&stats);
 
     binary_close(&reader);
+    return 0;
+}
+
+fn audit_bundle_one(label: &const byte, path: &const byte) bool {
+    _ = printf("\n== bundle file: %s ==\n", label);
+    const rc: i32 = audit_gguf(path);
+    if rc != 0 {
+        _ = printf("bundle audit failed: %s path=%s\n", label, path);
+        return false;
+    }
+    return true;
+}
+
+fn audit_join_path(dir: &const byte, leaf: &const byte, out: &byte, cap: usize) bool {
+    const written: i32 = snprintf(out as *byte, cap, "%s/%s\0" as *const byte, dir, leaf);
+    if written < 0 || (written as usize) >= cap {
+        _ = printf("error: token2wav path too long for %s/%s\n", dir, leaf);
+        return false;
+    }
+    return true;
+}
+
+fn audit_bundle_usage() void {
+    _ = printf("usage: minicpm-o-uya audio2audio-real --audit-only --llm <llm.gguf> --audio <audio.gguf> --tts <tts.gguf> --projector <projector.gguf> --token2wav-dir <dir>\n");
+}
+
+export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
+    var llm_path: &const byte = null;
+    var audio_path: &const byte = null;
+    var tts_path: &const byte = null;
+    var projector_path: &const byte = null;
+    var token2wav_dir: &const byte = null;
+    var audit_only: bool = false;
+    var i: i32 = 2;
+    while i < argc {
+        if strcmp(argv[i] as *const byte, "--audit-only\0" as *const byte) == 0 {
+            audit_only = true;
+            i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--llm\0" as *const byte) == 0 {
+            if i + 1 >= argc { audit_bundle_usage(); return 1; }
+            llm_path = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--audio\0" as *const byte) == 0 {
+            if i + 1 >= argc { audit_bundle_usage(); return 1; }
+            audio_path = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--tts\0" as *const byte) == 0 {
+            if i + 1 >= argc { audit_bundle_usage(); return 1; }
+            tts_path = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--projector\0" as *const byte) == 0 {
+            if i + 1 >= argc { audit_bundle_usage(); return 1; }
+            projector_path = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--token2wav-dir\0" as *const byte) == 0 {
+            if i + 1 >= argc { audit_bundle_usage(); return 1; }
+            token2wav_dir = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
+        }
+        audit_bundle_usage();
+        return 1;
+    }
+    if !audit_only || llm_path == null || audio_path == null || tts_path == null || projector_path == null || token2wav_dir == null {
+        audit_bundle_usage();
+        return 1;
+    }
+
+    _ = printf("audio2audio-real: audit-only bundle validation\n");
+    var ok: bool = true;
+    if !audit_bundle_one("llm\0" as &const byte, llm_path) { ok = false; }
+    if !audit_bundle_one("audio\0" as &const byte, audio_path) { ok = false; }
+    if !audit_bundle_one("tts\0" as &const byte, tts_path) { ok = false; }
+    if !audit_bundle_one("projector\0" as &const byte, projector_path) { ok = false; }
+
+    var path: [byte: 512] = [];
+    if audit_join_path(token2wav_dir, "encoder.gguf\0" as &const byte, &path[0], @len(path)) {
+        if !audit_bundle_one("token2wav.encoder\0" as &const byte, &path[0] as &const byte) { ok = false; }
+    } else { ok = false; }
+    if audit_join_path(token2wav_dir, "flow_matching.gguf\0" as &const byte, &path[0], @len(path)) {
+        if !audit_bundle_one("token2wav.flow_matching\0" as &const byte, &path[0] as &const byte) { ok = false; }
+    } else { ok = false; }
+    if audit_join_path(token2wav_dir, "flow_extra.gguf\0" as &const byte, &path[0], @len(path)) {
+        if !audit_bundle_one("token2wav.flow_extra\0" as &const byte, &path[0] as &const byte) { ok = false; }
+    } else { ok = false; }
+    if audit_join_path(token2wav_dir, "hifigan2.gguf\0" as &const byte, &path[0], @len(path)) {
+        if !audit_bundle_one("token2wav.hifigan2\0" as &const byte, &path[0] as &const byte) { ok = false; }
+    } else { ok = false; }
+    if audit_join_path(token2wav_dir, "prompt_cache.gguf\0" as &const byte, &path[0], @len(path)) {
+        if !audit_bundle_one("token2wav.prompt_cache\0" as &const byte, &path[0] as &const byte) { ok = false; }
+    } else { ok = false; }
+
+    if !ok { return 1; }
+    _ = printf("audio2audio-real: audit-only PASS files=9\n");
+    _ = printf("audio2audio-real: inference_supported=false next=bind-official-tensors\n");
     return 0;
 }
