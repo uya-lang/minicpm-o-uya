@@ -53,7 +53,9 @@ Generated files:
 - `generate-fixture` for deterministic prefill/decode, KV cache writes, logits, sampler output, and hidden-state dump summaries.
 - `text-real-align` is manual and compares an external official text GGUF against llama.cpp `llama-completion`; it is not part of default CI.
 - `vision-fixture` for raw image tensor smoke, RGB preprocessing, image/video manifest handling, tile counts, and checksum stability.
-- `audio-real-preprocess-probe` is manual and checks real WAV/UYAP input shape, 100ms alignment, center padding, and encoder-position planning before the full STFT/mel implementation lands.
+- `audio-real-preprocess-probe` is manual and checks real WAV/UYAP input shape, 100ms alignment, center padding, and encoder-position planning.
+- `audio-real-mel-probe` is manual and computes numeric MiniCPM-o mel features from a real audio GGUF plus WAV/UYAP input; it also supports `--dump-f32 out.uyml` for full-array comparison and is not part of default CI because it needs the external official bundle.
+- `audio-real-mel-align` is manual and compares a Uya `--dump-f32` mel dump against a `llama.cpp-omni` `log_mel_spectrogram.json` dump from the same audio input. The current default acceptance bound is `max_abs <= 2e-3` and `mean_abs <= 2e-5`.
 - `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
 - `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.
 - `audio2audio-fixture` for PCM/mel audio input through audio encoder, speech decoder, vocoder, and WAV output.

@@ -4,7 +4,7 @@ OUT := build/minicpm-o-uya
 RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind text-real-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind text-real-align audio-real-mel-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
 
 build: build-release
 
@@ -221,6 +221,26 @@ tts-real-bind: build
 		exit 2; \
 	fi
 	$(OUT) tts-bind "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf"
+
+audio-real-mel-probe: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_REAL_USER_AUDIO)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-mel-probe"; \
+		exit 2; \
+	fi
+	$(OUT) audio-real-mel-probe "$(MINICPM_O_REAL_BUNDLE)/audio/MiniCPM-o-4_5-audio-F16.gguf" "$(MINICPM_O_REAL_USER_AUDIO)"
+
+audio-real-mel-align: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_REAL_USER_AUDIO)" ] || [ -z "$(MINICPM_O_REAL_MEL_JSON)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav MINICPM_O_REAL_MEL_JSON=/path/to/log_mel_spectrogram.json [MINICPM_O_MEL_ALIGN_MAX_ABS=2e-3] [MINICPM_O_MEL_ALIGN_MEAN_ABS=2e-5] make audio-real-mel-align"; \
+		exit 2; \
+	fi
+	python3 tests/compare_audio_mel_alignment.py \
+		--uya "$(OUT)" \
+		--audio-model "$(MINICPM_O_REAL_BUNDLE)/audio/MiniCPM-o-4_5-audio-F16.gguf" \
+		--audio "$(MINICPM_O_REAL_USER_AUDIO)" \
+		--llama-json "$(MINICPM_O_REAL_MEL_JSON)" \
+		--max-abs-threshold "$${MINICPM_O_MEL_ALIGN_MAX_ABS:-2e-3}" \
+		--mean-abs-threshold "$${MINICPM_O_MEL_ALIGN_MEAN_ABS:-2e-5}"
 
 text-real-align: build
 	@if [ -z "$(MINICPM_O_TEXT_GGUF)" ] || [ -z "$(LLAMA_COMPLETION_BIN)" ]; then \

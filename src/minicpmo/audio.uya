@@ -1,7 +1,17 @@
+use libc.O_CREAT;
+use libc.O_TRUNC;
+use libc.O_WRONLY;
+use libc.calloc;
+use libc.cosf;
+use libc.free;
+use libc.log10f;
 use libc.printf;
 use libc.sinf;
 use libc.sqrtf;
 use libc.strcmp;
+use libc.sys_close;
+use libc.sys_open;
+use libc.sys_write;
 use minicpmo.binary.BinaryReader;
 use minicpmo.binary.binary_close;
 use minicpmo.binary.binary_open;
@@ -104,6 +114,9 @@ const AUDIO_REAL_ALIGN_SAMPLES: u32 = 1600;
 const AUDIO_REAL_ENCODER_CONTEXT: u32 = 1500;
 const AUDIO_REAL_POOL_KERNEL: u32 = 5;
 const AUDIO_REAL_POOL_STRIDE: u32 = 5;
+const AUDIO_REAL_MEL_PROBE_MAX_SAMPLES: u64 = 480000;
+const AUDIO_REAL_MEL_DUMP_MAGIC: u32 = 0x4c4d5955;
+const AUDIO_REAL_MEL_DUMP_VERSION: u32 = 1;
 const AUDIO_INFO_CONTAINER_WAV: u32 = 1;
 const AUDIO_INFO_CONTAINER_UYAP: u32 = 2;
 const AUDIO_INFO_DTYPE_S16: u32 = 1;
@@ -177,6 +190,18 @@ struct AudioRealInputInfo {
     sample_count: u64,
     container_kind: u32,
     dtype_kind: u32,
+}
+
+struct AudioRealPcmHeap {
+    sample_count: u64,
+    values: &f32,
+}
+
+struct AudioRealFilterBank {
+    mel_bins: u32,
+    filter_bins: u32,
+    value_count: u64,
+    values: &f32,
 }
 
 struct AudioStreamingCache {
@@ -342,6 +367,28 @@ fn audio_preprocess_config_init() AudioPreprocessConfig {
 
 fn audio_real_input_info_init() AudioRealInputInfo {
     return AudioRealInputInfo{ sample_rate: 0, channels: 0, sample_count: 0, container_kind: 0, dtype_kind: 0 };
+}
+
+fn audio_real_pcm_heap_init() AudioRealPcmHeap {
+    return AudioRealPcmHeap{ sample_count: 0, values: null };
+}
+
+fn audio_real_filter_bank_init() AudioRealFilterBank {
+    return AudioRealFilterBank{ mel_bins: 0, filter_bins: 0, value_count: 0, values: null };
+}
+
+fn audio_real_pcm_heap_free(pcm: &AudioRealPcmHeap) void {
+    if pcm.values != null { free(pcm.values as &void); }
+    pcm.values = null;
+    pcm.sample_count = 0;
+}
+
+fn audio_real_filter_bank_free(filters: &AudioRealFilterBank) void {
+    if filters.values != null { free(filters.values as &void); }
+    filters.values = null;
+    filters.value_count = 0;
+    filters.mel_bins = 0;
+    filters.filter_bins = 0;
 }
 
 fn audio_streaming_cache_init() AudioStreamingCache {
@@ -698,6 +745,418 @@ export fn audio_real_preprocess_probe_cli(audio_path: &const byte) i32 {
     if !audio_real_preprocess_probe_file(audio_path, "probe\0" as &const byte) { return 1; }
     _ = printf("audio-real-preprocess-probe: PASS\n");
     return 0;
+}
+
+
+
+fn audio_real_skip_untracked_metadata(reader: &BinaryReader, value_type: u32) bool {
+    if value_type == AUDIO_GGUF_TYPE_STRING {
+        var tmp: [byte: 1] = [];
+        var info: AudioStringRead = AudioStringRead{ len: 0, copied: 0, truncated: false };
+        return audio_read_string(reader, &tmp[0], 1, &info, "audio-real-mel metadata string\0" as &const byte);
+    }
+    const elem_size: u64 = audio_scalar_metadata_size(value_type);
+    if elem_size > 0 { return binary_skip(reader, elem_size, "audio-real-mel metadata scalar\0" as &const byte); }
+    _ = printf("error: audio-real-mel unsupported metadata type=%u\n", value_type);
+    return false;
+}
+
+fn audio_real_filterbank_load_array(reader: &BinaryReader, count: u64, filters: &AudioRealFilterBank) bool {
+    if count == 0 || count > (AUDIO_REAL_MEL_BINS as u64) * (AUDIO_REAL_FILTER_BINS as u64) { _ = printf("error: audio-real-mel filters count=%llu out of supported range\n", count); return false; }
+    filters.values = calloc(count as usize, 4) as &f32;
+    if filters.values == null { _ = printf("error: audio-real-mel filters allocation failed count=%llu\n", count); return false; }
+    var index: u64 = 0;
+    while index < count {
+        if !audio_read_f32(reader, &filters.values[index as usize]) { return false; }
+        index = index + 1;
+    }
+    filters.value_count = count;
+    return true;
+}
+
+fn audio_real_filterbank_load(audio_model_path: &const byte, filters: &AudioRealFilterBank) bool {
+    filters[0] = audio_real_filter_bank_init();
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(audio_model_path, &reader) { return false; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var tensor_count: u64 = 0;
+    var metadata_count: u64 = 0;
+    if !binary_read_u32_le(&reader, &magic, "audio-real-mel GGUF magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != AUDIO_GGUF_MAGIC { _ = printf("error: audio-real-mel bad audio GGUF magic\n"); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &version, "audio-real-mel GGUF version\0" as &const byte) { binary_close(&reader); return false; }
+    if version != 2 && version != 3 { _ = printf("error: audio-real-mel unsupported audio GGUF version=%u\n", version); binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &tensor_count, "audio-real-mel tensor_count\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &metadata_count, "audio-real-mel metadata_count\0" as &const byte) { binary_close(&reader); return false; }
+    _ = tensor_count;
+    var metadata_index: u64 = 0;
+    while metadata_index < metadata_count {
+        var key: [byte: 128] = [];
+        var info: AudioStringRead = AudioStringRead{ len: 0, copied: 0, truncated: false };
+        if !audio_read_string(&reader, &key[0], @len(key), &info, "audio-real-mel metadata key\0" as &const byte) { audio_real_filter_bank_free(filters); binary_close(&reader); return false; }
+        if info.truncated { _ = printf("error: audio-real-mel metadata key too long\n"); audio_real_filter_bank_free(filters); binary_close(&reader); return false; }
+        var value_type: u32 = 0;
+        if !binary_read_u32_le(&reader, &value_type, "audio-real-mel metadata value type\0" as &const byte) { audio_real_filter_bank_free(filters); binary_close(&reader); return false; }
+        if value_type == AUDIO_GGUF_TYPE_UINT32 || value_type == AUDIO_GGUF_TYPE_INT32 {
+            var value: u32 = 0;
+            if !binary_read_u32_le(&reader, &value, "audio-real-mel metadata u32\0" as &const byte) { audio_real_filter_bank_free(filters); binary_close(&reader); return false; }
+            if audio_cstr_eq(&key[0] as &const byte, "n_mel\0" as &const byte) { filters.mel_bins = value; }
+            if audio_cstr_eq(&key[0] as &const byte, "n_fft\0" as &const byte) { filters.filter_bins = value; }
+        } else { if value_type == AUDIO_GGUF_TYPE_ARRAY {
+            var element_type: u32 = 0;
+            var count: u64 = 0;
+            if !binary_read_u32_le(&reader, &element_type, "audio-real-mel metadata array type\0" as &const byte) { audio_real_filter_bank_free(filters); binary_close(&reader); return false; }
+            if !binary_read_u64_le(&reader, &count, "audio-real-mel metadata array length\0" as &const byte) { audio_real_filter_bank_free(filters); binary_close(&reader); return false; }
+            if audio_cstr_eq(&key[0] as &const byte, "filters\0" as &const byte) {
+                if element_type != AUDIO_GGUF_TYPE_FLOAT32 { _ = printf("error: audio-real-mel filters element_type=%u expected=float32\n", element_type); audio_real_filter_bank_free(filters); binary_close(&reader); return false; }
+                if !audio_real_filterbank_load_array(&reader, count, filters) { audio_real_filter_bank_free(filters); binary_close(&reader); return false; }
+            } else {
+                if !audio_skip_array(&reader, element_type, count) { audio_real_filter_bank_free(filters); binary_close(&reader); return false; }
+            }
+        } else {
+            if !audio_real_skip_untracked_metadata(&reader, value_type) { audio_real_filter_bank_free(filters); binary_close(&reader); return false; }
+        } }
+        metadata_index = metadata_index + 1;
+    }
+    binary_close(&reader);
+    if filters.mel_bins == 0 { filters.mel_bins = AUDIO_REAL_MEL_BINS; }
+    if filters.filter_bins == 0 { filters.filter_bins = AUDIO_REAL_FILTER_BINS; }
+    const expected: u64 = (filters.mel_bins as u64) * (filters.filter_bins as u64);
+    if filters.values == null || filters.value_count != expected { _ = printf("error: audio-real-mel filters metadata incomplete mel_bins=%u filter_bins=%u values=%llu expected=%llu\n", filters.mel_bins, filters.filter_bins, filters.value_count, expected); audio_real_filter_bank_free(filters); return false; }
+    if filters.mel_bins != AUDIO_REAL_MEL_BINS || filters.filter_bins != AUDIO_REAL_FILTER_BINS { _ = printf("error: audio-real-mel unsupported filters shape mel_bins=%u filter_bins=%u expected=80x201\n", filters.mel_bins, filters.filter_bins); audio_real_filter_bank_free(filters); return false; }
+    return true;
+}
+
+fn audio_real_load_samples_alloc(sample_count: u64, pcm: &AudioRealPcmHeap) bool {
+    if sample_count == 0 || sample_count > AUDIO_REAL_MEL_PROBE_MAX_SAMPLES { _ = printf("error: audio-real-mel samples=%llu exceeds probe cap=%llu; trim or chunk before numeric probe\n", sample_count, AUDIO_REAL_MEL_PROBE_MAX_SAMPLES); return false; }
+    pcm.sample_count = sample_count;
+    pcm.values = calloc(sample_count as usize, 4) as &f32;
+    if pcm.values == null { _ = printf("error: audio-real-mel sample allocation failed samples=%llu\n", sample_count); return false; }
+    return true;
+}
+
+fn audio_real_load_samples_uyap(path: &const byte, role: &const byte, reader: &BinaryReader, pcm: &AudioRealPcmHeap) bool {
+    _ = path;
+    var version: u32 = 0;
+    var sample_rate: u32 = 0;
+    var channels: u32 = 0;
+    var sample_count32: u32 = 0;
+    var dtype: u32 = 0;
+    if !binary_read_u32_le(reader, &version, "audio-real-mel UYAP version\0" as &const byte) { return false; }
+    if version != AUDIO_RAW_VERSION { _ = printf("error: audio-real-mel[%s] UYAP unsupported version=%u\n", role, version); return false; }
+    if !binary_read_u32_le(reader, &sample_rate, "audio-real-mel UYAP sample rate\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &channels, "audio-real-mel UYAP channels\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &sample_count32, "audio-real-mel UYAP sample count\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &dtype, "audio-real-mel UYAP dtype\0" as &const byte) { return false; }
+    if !audio_probe_require_real(role, sample_rate, channels) { return false; }
+    if !audio_real_load_samples_alloc(sample_count32 as u64, pcm) { return false; }
+    var index: u64 = 0;
+    if dtype == AUDIO_PCM_DTYPE_F32 {
+        while index < pcm.sample_count {
+            if !audio_read_f32(reader, &pcm.values[index as usize]) { return false; }
+            index = index + 1;
+        }
+    } else { if dtype == AUDIO_PCM_DTYPE_S16 {
+        while index < pcm.sample_count {
+            var bits: u32 = 0;
+            if !binary_read_u32_le(reader, &bits, "audio-real-mel UYAP s16-as-i32\0" as &const byte) { return false; }
+            var signed: i32 = bits as i32;
+            pcm.values[index as usize] = (signed as f32) / 32768.0;
+            index = index + 1;
+        }
+    } else { _ = printf("error: audio-real-mel[%s] UYAP dtype=%u unsupported\n", role, dtype); return false; } }
+    if reader.pos != reader.size { _ = printf("error: audio-real-mel[%s] UYAP has trailing bytes=%llu\n", role, reader.size - reader.pos); return false; }
+    return true;
+}
+
+fn audio_real_load_samples_wav(path: &const byte, role: &const byte, reader: &BinaryReader, pcm: &AudioRealPcmHeap) bool {
+    _ = path;
+    var riff_size: u32 = 0;
+    var wave: u32 = 0;
+    if !binary_read_u32_le(reader, &riff_size, "audio-real-mel WAV RIFF size\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &wave, "audio-real-mel WAV WAVE magic\0" as &const byte) { return false; }
+    if wave != AUDIO_WAV_WAVE { _ = printf("error: audio-real-mel[%s] bad WAV magic\n", role); return false; }
+    var format_tag: u16 = 0;
+    var channels: u16 = 0;
+    var sample_rate: u32 = 0;
+    var bits_per_sample: u16 = 0;
+    var data_pos: u64 = 0;
+    var data_size: u32 = 0;
+    var have_fmt: bool = false;
+    var have_data: bool = false;
+    while reader.pos + (8 as u64) <= reader.size {
+        var chunk_id: u32 = 0;
+        var chunk_size: u32 = 0;
+        if !binary_read_u32_le(reader, &chunk_id, "audio-real-mel WAV chunk id\0" as &const byte) { return false; }
+        if !binary_read_u32_le(reader, &chunk_size, "audio-real-mel WAV chunk size\0" as &const byte) { return false; }
+        const payload_pos: u64 = reader.pos;
+        var padded: u64 = chunk_size as u64;
+        if padded % (2 as u64) != 0 { padded = padded + 1; }
+        if payload_pos + padded > reader.size { _ = printf("error: audio-real-mel[%s] WAV chunk extends past EOF\n", role); return false; }
+        if chunk_id == AUDIO_WAV_FMT {
+            if chunk_size < 16 { _ = printf("error: audio-real-mel[%s] WAV fmt chunk too small=%u\n", role, chunk_size); return false; }
+            var byte_rate: u32 = 0; var block_align: u16 = 0;
+            if !binary_read_u16_le(reader, &format_tag, "audio-real-mel WAV format tag\0" as &const byte) { return false; }
+            if !binary_read_u16_le(reader, &channels, "audio-real-mel WAV channels\0" as &const byte) { return false; }
+            if !binary_read_u32_le(reader, &sample_rate, "audio-real-mel WAV sample rate\0" as &const byte) { return false; }
+            if !binary_read_u32_le(reader, &byte_rate, "audio-real-mel WAV byte rate\0" as &const byte) { return false; }
+            if !binary_read_u16_le(reader, &block_align, "audio-real-mel WAV block align\0" as &const byte) { return false; }
+            if !binary_read_u16_le(reader, &bits_per_sample, "audio-real-mel WAV bits per sample\0" as &const byte) { return false; }
+            have_fmt = true;
+        } else { if chunk_id == AUDIO_WAV_DATA { data_pos = payload_pos; data_size = chunk_size; have_data = true; } }
+        if !binary_seek(reader, payload_pos + padded, "audio-real-mel WAV next chunk\0" as &const byte) { return false; }
+        if have_fmt && have_data { break; }
+    }
+    _ = riff_size;
+    if !have_fmt { _ = printf("error: audio-real-mel[%s] WAV missing fmt chunk\n", role); return false; }
+    if !have_data { _ = printf("error: audio-real-mel[%s] WAV missing data chunk\n", role); return false; }
+    if !audio_probe_require_real(role, sample_rate, channels as u32) { return false; }
+    var bytes_per_sample: u32 = 0;
+    if format_tag == AUDIO_WAV_FORMAT_PCM && bits_per_sample == 16 { bytes_per_sample = 2; }
+    else { if format_tag == AUDIO_WAV_FORMAT_FLOAT && bits_per_sample == 32 { bytes_per_sample = 4; }
+    else { _ = printf("error: audio-real-mel[%s] WAV unsupported format_tag=%u bits_per_sample=%u\n", role, format_tag as u32, bits_per_sample as u32); return false; } }
+    const frame_bytes: u32 = (channels as u32) * bytes_per_sample;
+    if frame_bytes == 0 || data_size % frame_bytes != 0 { _ = printf("error: audio-real-mel[%s] WAV data bytes=%u not aligned to frame_bytes=%u\n", role, data_size, frame_bytes); return false; }
+    const sample_count: u64 = (data_size / frame_bytes) as u64;
+    if !audio_real_load_samples_alloc(sample_count, pcm) { return false; }
+    if !binary_seek(reader, data_pos, "audio-real-mel WAV data seek\0" as &const byte) { return false; }
+    var index: u64 = 0;
+    while index < pcm.sample_count {
+        if format_tag == AUDIO_WAV_FORMAT_PCM {
+            var raw: u16 = 0;
+            if !binary_read_u16_le(reader, &raw, "audio-real-mel WAV s16 sample\0" as &const byte) { return false; }
+            var signed: i32 = raw as i32;
+            if raw >= (32768 as u16) { signed = signed - 65536; }
+            pcm.values[index as usize] = (signed as f32) / 32768.0;
+        } else {
+            if !audio_read_f32(reader, &pcm.values[index as usize]) { return false; }
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+fn audio_real_load_samples_file(path: &const byte, role: &const byte, pcm: &AudioRealPcmHeap) bool {
+    pcm[0] = audio_real_pcm_heap_init();
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    if !binary_read_u32_le(&reader, &magic, "audio-real-mel input magic\0" as &const byte) { binary_close(&reader); return false; }
+    var ok: bool = false;
+    if magic == AUDIO_WAV_RIFF { ok = audio_real_load_samples_wav(path, role, &reader, pcm); }
+    else { if magic == AUDIO_PCM_MAGIC { ok = audio_real_load_samples_uyap(path, role, &reader, pcm); }
+    else { _ = printf("error: audio-real-mel[%s] unsupported container magic=0x%x; expected RIFF/WAVE or UYAP\n", role, magic); ok = false; } }
+    binary_close(&reader);
+    if !ok { audio_real_pcm_heap_free(pcm); }
+    return ok;
+}
+
+fn audio_real_aligned_sample_count(sample_count: u64) u64 {
+    var aligned_samples: u64 = sample_count;
+    if aligned_samples < (AUDIO_REAL_ALIGN_SAMPLES as u64) { aligned_samples = AUDIO_REAL_ALIGN_SAMPLES as u64; }
+    else { if aligned_samples % (AUDIO_REAL_ALIGN_SAMPLES as u64) != 0 { aligned_samples = ((aligned_samples / (AUDIO_REAL_ALIGN_SAMPLES as u64)) + 1) * (AUDIO_REAL_ALIGN_SAMPLES as u64); } }
+    return aligned_samples;
+}
+
+fn audio_real_centered_sample(pcm: &AudioRealPcmHeap, aligned_samples: u64, padded_index: u64) f32 {
+    if padded_index < (AUDIO_REAL_CENTER_PAD as u64) {
+        const src: u64 = (AUDIO_REAL_CENTER_PAD as u64) - padded_index;
+        if src < pcm.sample_count { return pcm.values[src as usize]; }
+        return 0.0 as f32;
+    }
+    const body_start: u64 = AUDIO_REAL_CENTER_PAD as u64;
+    if padded_index < body_start + aligned_samples {
+        const src2: u64 = padded_index - body_start;
+        if src2 < pcm.sample_count { return pcm.values[src2 as usize]; }
+        return 0.0 as f32;
+    }
+    return 0.0 as f32;
+}
+
+fn audio_real_hann(index: u32) f32 {
+    return (0.5 as f32) * ((1.0 as f32) - cosf(((2.0 as f32) * AUDIO_PI * (index as f32)) / (AUDIO_REAL_FRAME_SIZE as f32)));
+}
+
+fn audio_real_update_minmax(value: f32, min_value: &f32, max_value: &f32, have: &bool) void {
+    if !have[0] { min_value[0] = value; max_value[0] = value; have[0] = true; return; }
+    if value < min_value[0] { min_value[0] = value; }
+    if value > max_value[0] { max_value[0] = value; }
+}
+
+fn audio_real_write_u32_le(dest: &byte, offset: usize, value: u32) void {
+    dest[offset] = (value & (0xff as u32)) as byte;
+    dest[offset + (1 as usize)] = ((value >> 8) & (0xff as u32)) as byte;
+    dest[offset + (2 as usize)] = ((value >> 16) & (0xff as u32)) as byte;
+    dest[offset + (3 as usize)] = ((value >> 24) & (0xff as u32)) as byte;
+}
+
+fn audio_real_write_all(fd: i32, src: &const byte, count: usize, path: &const byte, label: &const byte) bool {
+    var done: usize = 0;
+    while done < count {
+        const write_result: !isize = sys_write(fd, (&src[done]) as *const byte, count - done);
+        const wrote: isize = write_result catch {
+            _ = printf("error: audio-real-mel dump %s write syscall failed path=%s\n", label, path);
+            return false;
+        };
+        if wrote <= (0 as isize) {
+            _ = printf("error: audio-real-mel dump %s short write path=%s wrote=%lld remaining=%zu\n", label, path, wrote as i64, count - done);
+            return false;
+        }
+        done = done + (wrote as usize);
+    }
+    return true;
+}
+
+fn audio_real_mel_dump_write(path: &const byte, mel_values: &f32, mel_frames: u64, mel_bins: u32) bool {
+    if mel_frames > 0xffffffff as u64 { _ = printf("error: audio-real-mel dump frames=%llu exceed u32 header limit\n", mel_frames); return false; }
+    const fd_result: !i32 = sys_open(path as *const byte, (O_WRONLY | O_CREAT | O_TRUNC) as i32, 420);
+    const fd: i32 = fd_result catch {
+        _ = printf("error: audio-real-mel dump open failed path=%s\n", path);
+        return false;
+    };
+    var header: [byte: 16] = [];
+    audio_real_write_u32_le(&header[0], 0, AUDIO_REAL_MEL_DUMP_MAGIC);
+    audio_real_write_u32_le(&header[0], 4, AUDIO_REAL_MEL_DUMP_VERSION);
+    audio_real_write_u32_le(&header[0], 8, mel_frames as u32);
+    audio_real_write_u32_le(&header[0], 12, mel_bins);
+    if !audio_real_write_all(fd, &header[0] as &const byte, 16, path, "header\0" as &const byte) { _ = sys_close(fd); return false; }
+    const mel_count: u64 = mel_frames * (mel_bins as u64);
+    const data_bytes: usize = (mel_count * (4 as u64)) as usize;
+    if data_bytes > 0 {
+        if !audio_real_write_all(fd, mel_values as &const byte, data_bytes, path, "payload\0" as &const byte) { _ = sys_close(fd); return false; }
+    }
+    const close_result: !i32 = sys_close(fd);
+    close_result catch {
+        _ = printf("error: audio-real-mel dump close failed path=%s\n", path);
+        return false;
+    };
+    _ = printf("audio-real-mel dump: path=%s format=uyml-f32 frames=%llu mel_bins=%u bytes=%zu\n", path, mel_frames, mel_bins, data_bytes + (16 as usize));
+    return true;
+}
+
+fn audio_real_mel_compute(pcm: &AudioRealPcmHeap, filters: &AudioRealFilterBank, mel_values: &f32, mel_frames: u64, aligned_samples: u64) bool {
+    var hann: [f32: 400] = [];
+    var n_hann: u32 = 0;
+    while n_hann < AUDIO_REAL_FRAME_SIZE { hann[n_hann as usize] = audio_real_hann(n_hann); n_hann = n_hann + 1; }
+    const trig_count: u64 = (AUDIO_REAL_FRAME_SIZE as u64) * (AUDIO_REAL_FILTER_BINS as u64);
+    var cos_table: &f32 = calloc(trig_count as usize, 4) as &f32;
+    var sin_table: &f32 = calloc(trig_count as usize, 4) as &f32;
+    if cos_table == null || sin_table == null { _ = printf("error: audio-real-mel trig table allocation failed\n"); if cos_table != null { free(cos_table as &void); } if sin_table != null { free(sin_table as &void); } return false; }
+    var k_pre: u32 = 0;
+    while k_pre < AUDIO_REAL_FILTER_BINS {
+        var n_pre: u32 = 0;
+        while n_pre < AUDIO_REAL_FRAME_SIZE {
+            const idx: usize = (k_pre * AUDIO_REAL_FRAME_SIZE + n_pre) as usize;
+            const phase: f32 = ((2.0 as f32) * AUDIO_PI * (k_pre as f32) * (n_pre as f32)) / (AUDIO_REAL_FRAME_SIZE as f32);
+            cos_table[idx] = cosf(phase);
+            sin_table[idx] = sinf(phase);
+            n_pre = n_pre + 1;
+        }
+        k_pre = k_pre + 1;
+    }
+    var mmax: f32 = -1000000000.0;
+    var frame: u64 = 0;
+    while frame < mel_frames {
+        var power: [f32: 201] = [];
+        var k: u32 = 0;
+        while k < AUDIO_REAL_FILTER_BINS {
+            var re: f32 = 0.0;
+            var im: f32 = 0.0;
+            var n: u32 = 0;
+            while n < AUDIO_REAL_FRAME_SIZE {
+                const sample: f32 = audio_real_centered_sample(pcm, aligned_samples, frame * (AUDIO_REAL_HOP_LENGTH as u64) + (n as u64)) * hann[n as usize];
+                const tidx: usize = (k * AUDIO_REAL_FRAME_SIZE + n) as usize;
+                re = re + sample * cos_table[tidx];
+                im = im - sample * sin_table[tidx];
+                n = n + 1;
+            }
+            power[k as usize] = re * re + im * im;
+            k = k + 1;
+        }
+        var mel: u32 = 0;
+        while mel < AUDIO_REAL_MEL_BINS {
+            var sum: f32 = 0.0;
+            var bin: u32 = 0;
+            while bin < AUDIO_REAL_FILTER_BINS {
+                sum = sum + power[bin as usize] * filters.values[(mel * AUDIO_REAL_FILTER_BINS + bin) as usize];
+                bin = bin + 1;
+            }
+            if sum < 0.0000000001 { sum = 0.0000000001; }
+            const log_value: f32 = log10f(sum);
+            mel_values[(mel as u64 * mel_frames + frame) as usize] = log_value;
+            if log_value > mmax { mmax = log_value; }
+            mel = mel + 1;
+        }
+        frame = frame + 1;
+    }
+    const floor_value: f32 = mmax - 8.0;
+    var total: u64 = mel_frames * (AUDIO_REAL_MEL_BINS as u64);
+    var i: u64 = 0;
+    while i < total {
+        var value: f32 = mel_values[i as usize];
+        if value < floor_value { value = floor_value; }
+        mel_values[i as usize] = (value + 4.0) / 4.0;
+        i = i + 1;
+    }
+    free(cos_table as &void);
+    free(sin_table as &void);
+    return true;
+}
+
+fn audio_real_mel_probe_run(audio_model_path: &const byte, audio_path: &const byte, dump_path: &const byte) i32 {
+    var filters: AudioRealFilterBank = audio_real_filter_bank_init();
+    if !audio_real_filterbank_load(audio_model_path, &filters) { return 1; }
+    var pcm: AudioRealPcmHeap = audio_real_pcm_heap_init();
+    if !audio_real_load_samples_file(audio_path, "probe\0" as &const byte, &pcm) { audio_real_filter_bank_free(&filters); return 1; }
+    const aligned_samples: u64 = audio_real_aligned_sample_count(pcm.sample_count);
+    const padded_samples: u64 = aligned_samples + (AUDIO_REAL_CENTER_PAD as u64) * (2 as u64);
+    const mel_frames: u64 = (padded_samples - (AUDIO_REAL_FRAME_SIZE as u64)) / (AUDIO_REAL_HOP_LENGTH as u64);
+    const mel_count: u64 = mel_frames * (AUDIO_REAL_MEL_BINS as u64);
+    if mel_frames == 0 || mel_count == 0 { _ = printf("error: audio-real-mel produced empty mel frames\n"); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); return 1; }
+    var mel_values: &f32 = calloc(mel_count as usize, 4) as &f32;
+    if mel_values == null { _ = printf("error: audio-real-mel output allocation failed elements=%llu\n", mel_count); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); return 1; }
+    if !audio_real_mel_compute(&pcm, &filters, mel_values, mel_frames, aligned_samples) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); return 1; }
+    var min_value: f32 = 0.0;
+    var max_value: f32 = 0.0;
+    var have: bool = false;
+    var i: u64 = 0;
+    while i < mel_count { audio_real_update_minmax(mel_values[i as usize], &min_value, &max_value, &have); i = i + 1; }
+    const checksum: u32 = audio_checksum(mel_values as &const f32, mel_count as usize);
+    const conv_tokens: u64 = mel_frames / (2 as u64);
+    var encoder_positions: u64 = 0;
+    if conv_tokens >= (AUDIO_REAL_POOL_KERNEL as u64) { encoder_positions = ((conv_tokens - (AUDIO_REAL_POOL_KERNEL as u64)) / (AUDIO_REAL_POOL_STRIDE as u64)) + 1; }
+    _ = printf("audio-real-mel input: model=%s audio=%s samples=%llu aligned_samples=%llu padded_samples=%llu\n", audio_model_path, audio_path, pcm.sample_count, aligned_samples, padded_samples);
+    _ = printf("audio-real-mel shape: frames=%llu mel_bins=%u elements=%llu filter_bins=%u conv_tokens=%llu encoder_positions=%llu checksum=0x%x min=%.6f max=%.6f\n", mel_frames, AUDIO_REAL_MEL_BINS, mel_count, AUDIO_REAL_FILTER_BINS, conv_tokens, encoder_positions, checksum, min_value as f64, max_value as f64);
+    _ = printf("audio-real-mel values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", mel_values[0] as f64, mel_values[1] as f64, mel_values[2] as f64, mel_values[3] as f64, mel_values[4] as f64, mel_values[5] as f64);
+    if dump_path != null {
+        if !audio_real_mel_dump_write(dump_path, mel_values, mel_frames, AUDIO_REAL_MEL_BINS) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); return 1; }
+    }
+    _ = printf("audio-real-mel-probe: PASS\n");
+    free(mel_values as &void);
+    audio_real_pcm_heap_free(&pcm);
+    audio_real_filter_bank_free(&filters);
+    return 0;
+}
+
+export fn audio_real_mel_probe_cli(audio_model_path: &const byte, audio_path: &const byte) i32 {
+    return audio_real_mel_probe_run(audio_model_path, audio_path, null);
+}
+
+export fn audio_real_mel_probe_args_cli(argc: i32, argv: & &byte) i32 {
+    if argc != 4 && argc != 6 {
+        _ = printf("usage: minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--dump-f32 out.uyml]\n");
+        return 1;
+    }
+    var dump_path: &const byte = null;
+    if argc == 6 {
+        if strcmp(argv[4] as *const byte, "--dump-f32\0" as *const byte) != 0 {
+            _ = printf("error: audio-real-mel-probe expected optional flag --dump-f32\n");
+            _ = printf("usage: minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--dump-f32 out.uyml]\n");
+            return 1;
+        }
+        dump_path = argv[5] as &const byte;
+    }
+    return audio_real_mel_probe_run(argv[2] as &const byte, argv[3] as &const byte, dump_path);
 }
 
 fn audio_pcm_load(path: &const byte, pcm: &AudioRawPcm) bool {

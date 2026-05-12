@@ -83,7 +83,30 @@ The Qwen3 text path now accepts the MiniCPM-o 4.5 text dimensions used by `MiniC
 Runtime text generation has real GGML-layout fused matvec support for Q4_K, Q5_K, and Q6_K, plus Q4_K/Q5_K/Q6_K embedding-row dequantization. The official Q4_K_M LLM now passes a text-only one-token generate smoke, and its audited dtype distribution is only `F32/Q4_K/Q6_K`; Q8_K/IQ runtime matvec remains guarded for other bundles. Use `generate ... --dump-hidden` to emit prompt/generated token hidden-state summaries; on the official MiniCPM-o 4.5 LLM this reports `n=4096`, which is the handoff shape needed by the later TTS projector path.
 A manual text alignment target is available for the same text GGUF: `MINICPM_O_TEXT_GGUF=/path/to/MiniCPM-o-4_5-Q4_K_M.gguf LLAMA_COMPLETION_BIN=/path/to/llama-completion make text-real-align`. It compares Uya and llama.cpp greedy one-token text output for the same prompt before moving deeper into audio/TTS alignment.
 
-A manual audio preprocessing probe is available as `build/minicpm-o-uya audio-real-preprocess-probe <audio.wav|audio.uyap.pcm>`. It validates 16 kHz mono PCM16/F32 WAV or UYAP input and prints the llama.cpp-omni MiniCPM-o preprocessing plan: `frame_size=400`, `filter_bins=201`, `hop_length=160`, `mel_bins=80`, 100ms sample alignment, 200-sample center padding on each side, conv2 downsampling, and pool(5,5) `encoder_positions`. The `audio2audio-real --audit-only` input path now prints this plan for both ref and user audio. This is still a plan/shape probe; numeric FFT/STFT plus the GGUF `filters` mel filterbank and audio encoder forward remain TODO.
+A manual audio preprocessing probe is available as `build/minicpm-o-uya audio-real-preprocess-probe <audio.wav|audio.uyap.pcm>`, and a numeric mel probe is available as `MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-mel-probe`. It validates 16 kHz mono PCM16/F32 WAV or UYAP input and prints the llama.cpp-omni MiniCPM-o preprocessing plan: `frame_size=400`, `filter_bins=201`, `hop_length=160`, `mel_bins=80`, 100ms sample alignment, 200-sample center padding on each side, conv2 downsampling, and pool(5,5) `encoder_positions`. The `audio2audio-real --audit-only` input path now prints this plan for both ref and user audio. The numeric mel probe runs periodic Hann, DFT/STFT power, the GGUF `filters` mel filterbank, and llama.cpp-omni style log10 clamp/normalization, then prints frames/elements/checksum/sample values.
+
+`audio-real-mel-probe` also accepts `--dump-f32 out.uyml`, which writes a compact binary dump for full-array comparison:
+
+- Header: `magic=UYML`, `version=1`, `frames(u32)`, `mel_bins(u32)`
+- Payload: little-endian row-major `f32`, matching Uya's internal `mel.data[j * n_len + i]` layout
+
+When you have a `llama.cpp-omni` `log_mel_spectrogram.json` dump, compare it with:
+
+```sh
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf \
+MINICPM_O_REAL_USER_AUDIO=user.wav \
+MINICPM_O_REAL_MEL_JSON=/path/to/log_mel_spectrogram.json \
+make audio-real-mel-align
+```
+
+The helper runs Uya with `--dump-f32`, loads the llama.cpp-omni JSON dump, and reports shape, checksum, `L1`, `mean_abs`, and `max_abs`.
+
+Current manual alignment thresholds default to `max_abs <= 2e-3` and `mean_abs <= 2e-5`. On the local `outputs/complex_case2` baseline, both the reference voice chunk and the user audio chunk pass under that bound:
+
+- `complex2_0000.wav` vs `log_mel_spectrogram_0000.json`: `mean_abs=0.000012707`, `max_abs=0.001426596`
+- `complex2_0001.wav` vs `log_mel_spectrogram_0001.json`: `mean_abs=0.000012695`, `max_abs=0.001400372`
+
+Current upstream `llama.cpp-omni/tools/omni/audition.cpp` writes `log_mel_spectrogram.json` only when the local `debug` argument passed into `log_mel_spectrogram(...)` is switched from `false` to `true`; there is not yet a CLI flag for this. Audio encoder forward remains the next major implementation layer after numeric mel alignment.
 
 ## Required GGUF Files
 

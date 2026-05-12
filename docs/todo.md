@@ -466,7 +466,9 @@
   - [x] `audio-real-preprocess-probe` 已按 llama.cpp-omni MiniCPM-o 路径输出参数 plan：`frame_size=400`、`filter_bins=201`、`hop_length=160`、`mel_bins=80`、100ms 对齐、center pad 200 samples/side、conv2 下采样和 pool(5,5) 后的 `encoder_positions`。
   - [x] `audio2audio-real --audit-only` 已在 ref/user 输入检查后追加 preprocessing plan，支持显式 ref/user 和 `prefix_0000.wav`/`prefix_0001.wav` 测试格式。
   - [x] `audio-bind` 已验证官方 audio GGUF 的 `filters` metadata：`n_mel=80`、`n_fft/filter_bins=201`、`filters=16080`。
-  - [ ] 实现真实 FFT/STFT + GGUF `filters` mel filterbank 数值计算，并与 llama.cpp-omni dump 对齐。
+  - [x] `audio-real-mel-probe` 已实现真实 WAV/UYAP -> periodic Hann -> DFT/STFT power -> GGUF `filters` mel filterbank -> log10 clamp/normalize，并输出 frames/elements/checksum/首值。
+  - [x] `audio-real-mel-probe --dump-f32` 与 `tests/compare_audio_mel_alignment.py`/`make audio-real-mel-align` 已接好，可对比 `llama.cpp-omni` 的 `log_mel_spectrogram.json` dump。
+  - [x] 已与本地 `llama.cpp-omni` `log_mel_spectrogram` dump 做数值误差对齐：`outputs/complex_case2/complex2_0000.wav` 为 `mean_abs=1.2707e-5`、`max_abs=1.4266e-3`，`complex2_0001.wav` 为 `mean_abs=1.2695e-5`、`max_abs=1.4004e-3`；当前默认阈值取 `mean_abs <= 2e-5`、`max_abs <= 2e-3`。
 - [ ] 移除 tiny audio cap，支持真实用户语音长度和多 chunk 输入。
   - [x] 输入 probe 流式扫描真实 WAV/UYAP，不受 tiny mel cap 限制；真实 mel/audio encoder forward 仍待接入。
 - [ ] 绑定官方 audio encoder tensors，并实现对应 conv/transformer/projector forward。
