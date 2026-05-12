@@ -57,6 +57,8 @@ Generated files:
 - `audio-real-mel-probe` is manual and computes numeric MiniCPM-o mel features from a real audio GGUF plus WAV/UYAP input; it also supports `--dump-f32 out.uyml` for full-array comparison and is not part of default CI because it needs the external official bundle.
 - `audio-real-encode-probe` is manual and runs the official audio encoder `conv + transformer + projector + pool` path for a real audio GGUF plus WAV/UYAP input. It is correctness-first and currently much slower than llama.cpp-omni.
 - `audio-real-mel-align` is manual and compares a Uya `--dump-f32` mel dump against a `llama.cpp-omni` `log_mel_spectrogram.json` dump from the same audio input. The current default acceptance bound is `max_abs <= 2e-3` and `mean_abs <= 2e-5`.
+- `tts-condition-probe` is manual and runs the real `emb_text + projector_semantic + L2 normalize + merge` path from `llama.cpp-omni` `llm_debug/chunk_*` token-id and hidden-state dumps. `tts-merge-align` compares the resulting Uya `merged` dump against `llama.cpp-omni` `merged_embeddings.bin` with default bounds `max_abs <= 1e-5` and `mean_abs <= 1e-6`.
+- `tts-simplex-probe` is manual and runs the official 20-layer TTS decoder over a whole `llm_debug/chunk_*` directory, keeps KV cache across chunks, and writes `audio_tokens_chunk_*.txt/bin` in the same relative-token format as `llama.cpp-omni`.
 - `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
 - `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.
 - `audio2audio-fixture` for PCM/mel audio input through audio encoder, speech decoder, vocoder, and WAV output.
@@ -81,6 +83,9 @@ Generation smoke coverage uses the deterministic tiny Qwen3-like fixture to vali
 Vision smoke coverage uses tiny raw image fixtures to validate patch embedding, one-block vision transformer behavior, resampler/projector binding, image embedding span injection, stable checksum `0xb5a01b45`, placeholder/span alignment, RGB resize/crop-pad/normalize checksum `0xea7fa412`, image manifest parity, video manifest frame/tile counts, and 2D position embedding interpolation.
 
 Audio smoke coverage binds the tiny conv/front-end, one transformer block, output norm, projector, and `<audio>` embedding injection path. Current checks include raw checksum `0xbca0dcc`, embedding checksum `0x625ac595`, non-zero logits diff, PCM preprocessing, real 16 kHz mono WAV/UYAP input probing with explicit rejection of unsupported sample rates/channels, and clear missing-branch errors. Real MiniCPM-o audio GGUF binding is covered by the manual `MINICPM_O_REAL_BUNDLE=/path make audio-real-bind` target. Real TTS GGUF binding is covered by `MINICPM_O_REAL_BUNDLE=/path make tts-real-bind`.
+
+Real TTS conditioning coverage is manual because it depends on external `llama.cpp-omni` `llm_debug` artifacts. The current local `chunk_{0..3}` projector/merge alignment results are all in the `1e-8` mean-absolute range with `max_abs=2.384e-7`.
+Real TTS decoder coverage is also manual. The current Uya simplex probe can generate non-empty audio token chunks from the same `llm_debug` inputs, but exact token replay against the saved local `round_000/tts_wav` files is not yet treated as deterministic because that baseline was generated without a pinned sampler seed.
 
 Audio-to-audio smoke coverage runs `audio2audio-smoke` from `UYAP` PCM input through mel preprocessing, audio encoder, Qwen prompt prefill, speech token generation, vocoder decode, and WAV writing. It validates the audio-conditioned logits differ from text-only logits, writes a RIFF/WAVE file, checks sample rate/data bytes, and exercises both single-GGUF and split `--audio-model`/`--speech-model`/`--vocoder-model` argument forms.
 
@@ -135,6 +140,7 @@ build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
 build/minicpm-o-uya audio-real-preprocess-probe /path/to/user.wav
 build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya audio-real-encode-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
+build/minicpm-o-uya tts-condition-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_token_ids.txt /path/to/llm_hidden_states.bin --dump-merged /tmp/minicpm-o-uya-merged.bin
 build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_TEXT_GGUF" --audio-model "$MINICPM_O_AUDIO_GGUF" --speech-model "$MINICPM_O_SPEECH_GGUF" --vocoder-model "$MINICPM_O_VOCODER_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"

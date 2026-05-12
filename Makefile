@@ -5,7 +5,7 @@ RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 AUDIO2AUDIO_REAL_ENCODE_PROBE_FLAG := $(if $(MINICPM_O_REAL_ENCODE_PROBE),--encode-probe,)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind tts-condition-probe tts-simplex-probe tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
 
 build: build-release
 
@@ -222,6 +222,54 @@ tts-real-bind: build
 		exit 2; \
 	fi
 	$(OUT) tts-bind "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf"
+
+tts-condition-probe: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_TTS_TOKEN_IDS)" ] || [ -z "$(MINICPM_O_TTS_HIDDEN_BIN)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_TTS_TOKEN_IDS=/path/to/llm_token_ids.txt MINICPM_O_TTS_HIDDEN_BIN=/path/to/llm_hidden_states.bin [MINICPM_O_TTS_MERGED_OUT=/tmp/minicpm-o-uya-merged.bin] [MINICPM_O_TTS_PROJECTED_OUT=/tmp/minicpm-o-uya-projected.bin] [MINICPM_O_TTS_FILTERED_IDS_OUT=/tmp/minicpm-o-uya-filtered-ids.txt] [MINICPM_O_TTS_CONDITION_OUT=/tmp/minicpm-o-uya-condition.bin] [MINICPM_O_TTS_AUDIO_BOS_ID=151687] make tts-condition-probe"; \
+		exit 2; \
+	fi
+	$(OUT) tts-condition-probe \
+		"$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf" \
+		"$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-projector-F16.gguf" \
+		"$(MINICPM_O_TTS_TOKEN_IDS)" \
+		"$(MINICPM_O_TTS_HIDDEN_BIN)" \
+		--audio-bos-id "$${MINICPM_O_TTS_AUDIO_BOS_ID:-151687}" \
+		--dump-merged "$${MINICPM_O_TTS_MERGED_OUT:-/tmp/minicpm-o-uya-merged.bin}" \
+		--dump-projected "$${MINICPM_O_TTS_PROJECTED_OUT:-/tmp/minicpm-o-uya-projected.bin}" \
+		--dump-filtered-token-ids "$${MINICPM_O_TTS_FILTERED_IDS_OUT:-/tmp/minicpm-o-uya-filtered-ids.txt}" \
+		$$( [ -n "$${MINICPM_O_TTS_CONDITION_OUT:-}" ] && printf '%s' "--dump-condition $${MINICPM_O_TTS_CONDITION_OUT}" )
+
+tts-merge-align: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_TTS_TOKEN_IDS)" ] || [ -z "$(MINICPM_O_TTS_HIDDEN_BIN)" ] || [ -z "$(MINICPM_O_TTS_MERGED_BIN)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_TTS_TOKEN_IDS=/path/to/llm_token_ids.txt MINICPM_O_TTS_HIDDEN_BIN=/path/to/llm_hidden_states.bin MINICPM_O_TTS_MERGED_BIN=/path/to/merged_embeddings.bin [MINICPM_O_TTS_AUDIO_BOS_ID=151687] [MINICPM_O_TTS_ALIGN_MAX_ABS=1e-5] [MINICPM_O_TTS_ALIGN_MEAN_ABS=1e-6] make tts-merge-align"; \
+		exit 2; \
+	fi
+	python3 tests/compare_tts_merge_alignment.py \
+		--uya "$(OUT)" \
+		--tts-model "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf" \
+		--projector-model "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-projector-F16.gguf" \
+		--token-ids "$(MINICPM_O_TTS_TOKEN_IDS)" \
+		--hidden-bin "$(MINICPM_O_TTS_HIDDEN_BIN)" \
+		--llama-merged-bin "$(MINICPM_O_TTS_MERGED_BIN)" \
+		--audio-bos-id "$${MINICPM_O_TTS_AUDIO_BOS_ID:-151687}" \
+		--max-abs-threshold "$${MINICPM_O_TTS_ALIGN_MAX_ABS:-1e-5}" \
+		--mean-abs-threshold "$${MINICPM_O_TTS_ALIGN_MEAN_ABS:-1e-6}"
+
+tts-simplex-probe: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_TTS_LLM_DEBUG_DIR)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_TTS_LLM_DEBUG_DIR=/path/to/llm_debug [MINICPM_O_TTS_CHUNK_COUNT=N] [MINICPM_O_TTS_OUT_DIR=/tmp/out] [MINICPM_O_TTS_COMPARE_DIR=/path/to/tts_wav] [MINICPM_O_TTS_MAX_AUDIO_TOKENS=500] [MINICPM_O_TTS_SEED=1] [MINICPM_O_TTS_GREEDY=1] make tts-simplex-probe"; \
+		exit 2; \
+	fi
+	$(OUT) tts-simplex-probe \
+		"$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf" \
+		"$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-projector-F16.gguf" \
+		"$(MINICPM_O_TTS_LLM_DEBUG_DIR)" \
+		$$( [ -n "$${MINICPM_O_TTS_CHUNK_COUNT:-}" ] && printf '%s' "--count $${MINICPM_O_TTS_CHUNK_COUNT}" ) \
+		$$( [ -n "$${MINICPM_O_TTS_OUT_DIR:-}" ] && printf '%s' "--out-dir $${MINICPM_O_TTS_OUT_DIR}" ) \
+		$$( [ -n "$${MINICPM_O_TTS_COMPARE_DIR:-}" ] && printf '%s' "--compare-dir $${MINICPM_O_TTS_COMPARE_DIR}" ) \
+		$$( [ -n "$${MINICPM_O_TTS_MAX_AUDIO_TOKENS:-}" ] && printf '%s' "--max-audio-tokens $${MINICPM_O_TTS_MAX_AUDIO_TOKENS}" ) \
+		$$( [ -n "$${MINICPM_O_TTS_SEED:-}" ] && printf '%s' "--seed $${MINICPM_O_TTS_SEED}" ) \
+		$$( [ -n "$${MINICPM_O_TTS_GREEDY:-}" ] && printf '%s' "--greedy" )
 
 audio-real-mel-probe: build
 	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_REAL_USER_AUDIO)" ]; then \

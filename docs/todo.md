@@ -490,11 +490,19 @@
 
 - [x] 实现 TTS GGUF 权重加载/绑定审计：`emb_code.0.weight`、`emb_text.weight`、`projector_semantic.*`、`projector_spk.*`、`head_code.0.weight`。
   - [x] `tts-bind`/`audio2audio-real --audit-only` 已绑定官方 TTS decoder 20 层 `blk.*`、embedding/projector/head，共 193 个 tensor。
-- [ ] 实现 LLM hidden states 到 TTS conditioning embedding 的 projector path。
+- [x] 实现 LLM hidden states 到 TTS conditioning embedding 的 projector path。
+  - [x] 新增 `tts-condition-probe`：读取 `llama.cpp-omni` `llm_token_ids.txt` + `llm_hidden_states.bin`，执行 `emb_text + projector_semantic + L2 normalize + merge`，并可 dump `projected/merged/condition`。
+  - [x] 新增 `tests/compare_tts_merge_alignment.py` / `make tts-merge-align`，对照 `llama.cpp-omni` `merged_embeddings.bin`。
+  - [x] 本地 `round_000/llm_debug/chunk_{0..3}` 已数值对齐，`mean_abs≈1.4e-8..1.8e-8`、`max_abs=2.384e-7`。
 - [ ] 实现 TTS prefill/decode cache，与 audio_bos、audio_eos、audio token vocabulary 对齐。
+  - [x] 新增 `tts-simplex-probe`：官方 TTS decoder 20 层 forward、assistant prompt prefill、`audio_bos`/`text_eos` 注入、跨 chunk KV cache 与 audio-token history 已可跑通。
 - [ ] 实现 chunked text/hidden-state queue：LLM 每个文本 chunk 同步送入 TTS。
+  - [x] `tts-simplex-probe <llm_debug_dir> --count N` 已顺序消费 `chunk_0..chunk_N-1`，并跨 chunk 复用同一套 TTS runtime。
 - [ ] 生成 audio token ids 并保存 `audio_tokens_chunk_*.txt/bin`，格式对齐 llama.cpp-omni。
+  - [x] `tts-simplex-probe --out-dir DIR` 已输出相同命名的 `audio_tokens_chunk_*.txt/bin`，内容为 relative audio token ids。
 - [ ] 增加 TTS token 级对照：相同 hidden/text chunk 下，audio token 前 N 个与 baseline 对比。
+  - [x] `tts-simplex-probe --compare-dir DIR` 已支持逐 chunk exact compare。
+  - [ ] 当前本地 `round_000/tts_wav` baseline 未固定 sampler seed，暂不作为严格 deterministic token oracle。
 
 验收标准：
 

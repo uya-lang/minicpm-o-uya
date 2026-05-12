@@ -112,6 +112,88 @@ Current manual alignment thresholds default to `max_abs <= 2e-3` and `mean_abs <
 
 Current upstream `llama.cpp-omni/tools/omni/audition.cpp` writes `log_mel_spectrogram.json` only when the local `debug` argument passed into `log_mel_spectrogram(...)` is switched from `false` to `true`; there is not yet a CLI flag for this. For Uya, `audio2audio-real --audit-only` also accepts an optional `--encode-probe` flag, which runs the same correctness-first encoder probe on the validated ref/user audio inputs and prints the resulting embedding diagnostics.
 
+## TTS Condition Merge Probe
+
+The next correctness gate after audio encoder alignment is the TTS conditioning merge:
+
+```text
+merged_embeds =
+  emb_text(filtered_token_ids)
+  + normalize(projector_semantic(filtered_hidden_states))
+```
+
+Uya now has a standalone probe for that stage:
+
+```sh
+build/minicpm-o-uya tts-condition-probe \
+  models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf \
+  models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-projector-F16.gguf \
+  llama.cpp-omni/tools/omni/output/round_000/llm_debug/chunk_0/llm_token_ids.txt \
+  llama.cpp-omni/tools/omni/output/round_000/llm_debug/chunk_0/llm_hidden_states.bin \
+  --dump-merged /tmp/minicpm-o-uya-merged.bin \
+  --dump-projected /tmp/minicpm-o-uya-projected.bin \
+  --dump-filtered-token-ids /tmp/minicpm-o-uya-filtered-ids.txt
+```
+
+It reads the same `llama.cpp-omni` `llm_debug/chunk_*` token-id and hidden-state dumps, filters TTS-invalid tokens with the same rule (`special ids`, token `271`, and `>=150000`), runs the official `emb_text` and `linear1/linear2` projector weights, applies per-token L2 normalization, and writes binary dumps with a simple header:
+
+- `u32 n_tokens`
+- `u32 n_embd`
+- row-major `f32` payload
+
+`--dump-condition out.bin` is also available if you want the prefill condition with `audio_bos` appended. By default `audio_bos_id=151687`, and `--audio-bos-id` can override it for future bundles.
+
+For direct alignment against the local `llama.cpp-omni` `merged_embeddings.bin`, use:
+
+```sh
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf \
+MINICPM_O_TTS_TOKEN_IDS=/path/to/llm_token_ids.txt \
+MINICPM_O_TTS_HIDDEN_BIN=/path/to/llm_hidden_states.bin \
+MINICPM_O_TTS_MERGED_BIN=/path/to/merged_embeddings.bin \
+make tts-merge-align
+```
+
+Current default thresholds are much tighter than the mel path because this stage is pure F32:
+
+- `max_abs <= 1e-5`
+- `mean_abs <= 1e-6`
+
+On the local `llama.cpp-omni/tools/omni/output/round_000/llm_debug` baseline, all four saved chunks pass comfortably:
+
+- `chunk_0`: `mean_abs=1.44496e-8`, `max_abs=2.38419e-7`
+- `chunk_1`: `mean_abs=1.76361e-8`, `max_abs=2.38419e-7`
+- `chunk_2`: `mean_abs=1.73070e-8`, `max_abs=2.38419e-7`
+- `chunk_3`: `mean_abs=1.56946e-8`, `max_abs=2.38419e-7`
+
+## TTS Simplex Probe
+
+Uya now also has a standalone real TTS decoder probe that consumes a whole `llm_debug/chunk_*` directory and emits `audio_tokens_chunk_*.txt/bin` in the same relative-token format as `llama.cpp-omni`:
+
+```sh
+build/minicpm-o-uya tts-simplex-probe \
+  models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf \
+  models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-projector-F16.gguf \
+  llama.cpp-omni/tools/omni/output/round_000/llm_debug \
+  --count 4 \
+  --out-dir /tmp/minicpm-o-uya-ttsprobe
+```
+
+Current Uya probe behavior:
+
+- loads the official 20-layer Llama-style TTS decoder from `tts.gguf`
+- pre-fills the same assistant-side prompt prefix before chunk audio generation
+- reuses `tts-condition-probe` logic for `merged_embeds`
+- keeps TTS KV cache and generated audio-token history across chunks
+- writes relative audio token IDs, one file per chunk
+
+This is the first real Uya implementation of:
+
+- TTS prefill/decode cache
+- chunked text/hidden-state queue consumption
+- real audio token dump emission
+
+Current limitation: the local saved `llama.cpp-omni` `audio_tokens_chunk_*.txt` files were generated from an unpinned sampler seed, so exact token-by-token replay is not yet expected to match. The Uya probe already supports `--compare-dir` for future seeded baselines, but today's `round_000/tts_wav` artifacts should be treated as a structural/debug reference rather than a strict deterministic oracle.
+
 ## Required GGUF Files
 
 The official bundle must include:
@@ -174,7 +256,7 @@ After alias classification, these token2wav files should have zero unknown tenso
 `audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, or `--test-prefix prefix --count N` for the llama.cpp-omni convention where `0000` is reference voice and `0001..` are user turns. The next implementation layer is to run the official audio encoder forward and bind the remaining TTS/token2wav tensor families discovered by audit:
 
 - Audio encoder: bind complete, and `audio-real-encode-probe` now runs correctness-first `conv + transformer + projector + pool` forward for short real clips; it is still too slow for practical long-turn inference.
-- TTS model: bind-only complete for `emb_code.*`, `emb_text.*`, decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, and `head_code.*`; decode/cache forward still pending.
+- TTS model: bind-only complete for `emb_code.*`, `emb_text.*`, decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, and `head_code.*`; `tts-condition-probe` now aligns `emb_text + projector_semantic + normalize + merge` against `llama.cpp-omni`, while decode/cache forward still pending.
 - Projector: `linear1.*`, `linear2.*`
 - Token2wav encoder: `after_norm.*` and encoder blocks
 - Flow matching: `estimator.*`
