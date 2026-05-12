@@ -51,7 +51,9 @@ Generated files:
 - `quant-fixture` for selected GGML quant kernel goldens and unsupported dtype diagnostics.
 - `qwen3-fixture` for tiny Qwen3 config/weight binding and missing tensor diagnostics.
 - `generate-fixture` for deterministic prefill/decode, KV cache writes, logits, sampler output, and hidden-state dump summaries.
+- `text-real-align` is manual and compares an external official text GGUF against llama.cpp `llama-completion`; it is not part of default CI.
 - `vision-fixture` for raw image tensor smoke, RGB preprocessing, image/video manifest handling, tile counts, and checksum stability.
+- `audio-real-preprocess-probe` is manual and checks real WAV/UYAP input shape, 100ms alignment, center padding, and encoder-position planning before the full STFT/mel implementation lands.
 - `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
 - `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.
 - `audio2audio-fixture` for PCM/mel audio input through audio encoder, speech decoder, vocoder, and WAV output.

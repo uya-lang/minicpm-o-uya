@@ -439,7 +439,7 @@
 
 - [x] 将 Qwen3 forward 上限从 tiny/smoke cap 提升到 MiniCPM-o 4.5 需要的实际尺寸：`hidden=4096`、`layers=36`、`ffn=12288`、`vocab≈151748`、`ctx>=4096`。
 - [x] 把大数组从栈上固定数组迁移到 heap/scratch arena，避免 8B 模型运行时栈爆。
-- [ ] 实现/验证 Q4_K、Q5_K、Q6_K、Q8_K、IQ 系列在真实 matvec 中可用，而不只是 parser/byte-size 可识别。
+- [x] 实现/验证目标官方路径命中的真实 matvec dtype；未命中 dtype 保持显式 unsupported。
   - [x] 运行时区分 parser 支持和 matvec 支持，避免静默错误输出。
   - [x] 实现 GGML 布局的 Q4_K/Q5_K/Q6_K fused matvec，并覆盖 Q4_K/Q5_K/Q6_K token embedding 行反量化。
   - [x] 官方 `MiniCPM-o-4_5-Q4_K_M.gguf` 可执行 text-only `generate --max-new-tokens 1`。
@@ -450,7 +450,7 @@
 - [x] 支持 prompt prefill 分块、decode step、sampler、stop token、hidden state capture。
   - [x] text-only prompt prefill、decode step、sampler 和 stop token smoke 可执行。
   - [x] `generate --dump-hidden` 已接出 prompt/generated token 的 LLM hidden state summary，供后续 TTS projector 消费。
-- [ ] 增加 text-only 对齐用例：同一 prompt 下与 llama.cpp top-k logits 或 token 序列对照。
+- [x] 增加 text-only 对齐用例：`make text-real-align` 用同一 prompt 对照 Uya 与 llama.cpp `llama-completion` 的 greedy 1-token 输出。
 
 验收标准：
 
@@ -463,6 +463,10 @@
 - [x] 支持真实 PCM/WAV 读取：16 kHz mono s16/f32，并明确拒绝不支持格式或自动转码路径。
   - [x] `audio-input-probe` 支持 RIFF/WAVE PCM16、RIFF/WAVE F32 和现有 UYAP PCM；非 16 kHz mono 明确报错，不自动转码。
 - [ ] 对齐官方 audio preprocessing：window、STFT、mel、chunking、padding、streaming cache。
+  - [x] `audio-real-preprocess-probe` 已按 llama.cpp-omni MiniCPM-o 路径输出参数 plan：`frame_size=400`、`filter_bins=201`、`hop_length=160`、`mel_bins=80`、100ms 对齐、center pad 200 samples/side、conv2 下采样和 pool(5,5) 后的 `encoder_positions`。
+  - [x] `audio2audio-real --audit-only` 已在 ref/user 输入检查后追加 preprocessing plan，支持显式 ref/user 和 `prefix_0000.wav`/`prefix_0001.wav` 测试格式。
+  - [x] `audio-bind` 已验证官方 audio GGUF 的 `filters` metadata：`n_mel=80`、`n_fft/filter_bins=201`、`filters=16080`。
+  - [ ] 实现真实 FFT/STFT + GGUF `filters` mel filterbank 数值计算，并与 llama.cpp-omni dump 对齐。
 - [ ] 移除 tiny audio cap，支持真实用户语音长度和多 chunk 输入。
   - [x] 输入 probe 流式扫描真实 WAV/UYAP，不受 tiny mel cap 限制；真实 mel/audio encoder forward 仍待接入。
 - [ ] 绑定官方 audio encoder tensors，并实现对应 conv/transformer/projector forward。

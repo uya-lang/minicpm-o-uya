@@ -4,7 +4,7 @@ OUT := build/minicpm-o-uya
 RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind audio2audio-real-audit audio2audio-real-input-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind text-real-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
 
 build: build-release
 
@@ -221,6 +221,20 @@ tts-real-bind: build
 		exit 2; \
 	fi
 	$(OUT) tts-bind "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf"
+
+text-real-align: build
+	@if [ -z "$(MINICPM_O_TEXT_GGUF)" ] || [ -z "$(LLAMA_COMPLETION_BIN)" ]; then \
+		echo "usage: MINICPM_O_TEXT_GGUF=/path/to/MiniCPM-o-4_5-Q4_K_M.gguf LLAMA_COMPLETION_BIN=/path/to/llama-completion [MINICPM_O_ALIGN_PROMPT=你好] [MINICPM_O_ALIGN_THREADS=4] make text-real-align"; \
+		exit 2; \
+	fi
+	python3 tests/compare_text_alignment.py \
+		--uya "$(OUT)" \
+		--llama "$(LLAMA_COMPLETION_BIN)" \
+		--model "$(MINICPM_O_TEXT_GGUF)" \
+		--prompt "$${MINICPM_O_ALIGN_PROMPT:-你好}" \
+		--threads "$${MINICPM_O_ALIGN_THREADS:-4}" \
+		--ctx "$${MINICPM_O_ALIGN_CTX:-256}" \
+		--max-new-tokens "$${MINICPM_O_ALIGN_TOKENS:-1}"
 
 audio2audio-real-audit: build
 	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ]; then \
