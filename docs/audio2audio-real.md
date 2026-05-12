@@ -286,6 +286,34 @@ Current bind coverage:
 
 This is still bind-only coverage: no token2wav / flow / HiFiGAN forward math is claimed yet.
 
+Uya now also has two prompt-cache-side probes that prepare the next forward step:
+
+```sh
+build/minicpm-o-uya token2wav-prompt-cache-probe \
+  models/MiniCPM-o-4_5-gguf/token2wav-gguf/prompt_cache.gguf
+
+build/minicpm-o-uya token2wav-window-probe \
+  models/MiniCPM-o-4_5-gguf/token2wav-gguf/prompt_cache.gguf \
+  llama.cpp-omni/tools/omni/output/round_000/tts_wav/audio_tokens_chunk_0.txt
+```
+
+Current `prompt_cache` probe reports:
+
+- `version`
+- `n_timesteps`
+- `temperature_bits`
+- `pre_lookahead`
+- `chunk_main`
+- `chunk_total`
+- `up_rate`
+- cache tensor checksums for `spk_cb`, `conformer_*`, and `estimator_*`
+
+Current `window` probe reports the actual `28/25` streaming calls, for example on the local `audio_tokens_chunk_0.txt` baseline:
+
+- `window[0]`: `start=0 end=28`
+- `window[1]`: `start=25 end=53`
+- `window[2]`: final tail `start=50 end=61`
+
 ## Current Uya Status
 
 `audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, or `--test-prefix prefix --count N` for the llama.cpp-omni convention where `0000` is reference voice and `0001..` are user turns. The next implementation layer is to run the official audio encoder forward and bind the remaining TTS/token2wav tensor families discovered by audit:

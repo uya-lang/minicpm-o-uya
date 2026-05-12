@@ -31,6 +31,8 @@ use minicpmo.tokenizer.tokenizer_format_chat_cli;
 use minicpmo.tokenizer.tokenizer_piece_cli;
 use minicpmo.tensor.tensor_table_cli;
 use minicpmo.token2wav.token2wav_bind_dir_cli;
+use minicpmo.token2wav.token2wav_prompt_cache_probe_cli;
+use minicpmo.token2wav.token2wav_window_probe_cli;
 use minicpmo.vision.vision_preprocess_smoke_cli;
 use minicpmo.vision.vision_smoke_cli;
 
@@ -63,6 +65,8 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya speech-smoke <model.gguf> <prompt> [out.wav]\n");
     _ = printf("  minicpm-o-uya tts-bind <tts.gguf>\n");
     _ = printf("  minicpm-o-uya token2wav-bind <token2wav-gguf-dir>\n");
+    _ = printf("  minicpm-o-uya token2wav-prompt-cache-probe <prompt_cache.gguf>\n");
+    _ = printf("  minicpm-o-uya token2wav-window-probe <prompt_cache.gguf> <audio_tokens_chunk.txt>\n");
     _ = printf("  minicpm-o-uya tts-condition-probe <tts.gguf> <projector.gguf> <llm_token_ids.txt> <llm_hidden_states.bin>\n");
     _ = printf("    [--dump-merged out.bin] [--dump-projected out.bin] [--dump-filtered-token-ids out.txt] [--dump-condition out.bin] [--audio-bos-id ID]\n");
     _ = printf("  minicpm-o-uya tts-simplex-probe <tts.gguf> <projector.gguf> <llm_debug_dir>\n");
@@ -244,6 +248,20 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
             return 1;
         }
         return token2wav_bind_dir_cli(argv[2] as &const byte);
+    }
+    if strcmp(argv[1] as *const byte, "token2wav-prompt-cache-probe\0" as *const byte) == 0 {
+        if argc != 3 {
+            _ = printf("usage: minicpm-o-uya token2wav-prompt-cache-probe <prompt_cache.gguf>\n");
+            return 1;
+        }
+        return token2wav_prompt_cache_probe_cli(argv[2] as &const byte);
+    }
+    if strcmp(argv[1] as *const byte, "token2wav-window-probe\0" as *const byte) == 0 {
+        if argc != 4 {
+            _ = printf("usage: minicpm-o-uya token2wav-window-probe <prompt_cache.gguf> <audio_tokens_chunk.txt>\n");
+            return 1;
+        }
+        return token2wav_window_probe_cli(argv[2] as &const byte, argv[3] as &const byte);
     }
     if strcmp(argv[1] as *const byte, "tts-condition-probe\0" as *const byte) == 0 {
         return speech_tts_condition_probe_cli(argc, argv as & &byte);

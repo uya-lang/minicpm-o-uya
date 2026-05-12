@@ -1,6 +1,14 @@
 use libc.printf;
 use libc.snprintf;
 use libc.strcmp;
+use minicpmo.binary.BinaryReader;
+use minicpmo.binary.binary_close;
+use minicpmo.binary.binary_open;
+use minicpmo.binary.binary_read_exact;
+use minicpmo.binary.binary_read_u32_le;
+use minicpmo.binary.binary_read_u64_le;
+use minicpmo.binary.binary_reader_init;
+use minicpmo.binary.binary_skip;
 use minicpmo.tensor.TensorDType;
 use minicpmo.tensor.TensorView;
 use minicpmo.tensor.TensorWeightTable;
@@ -11,8 +19,250 @@ use minicpmo.tensor.tensor_weight_table_attach_mmap;
 use minicpmo.tensor.tensor_weight_table_detach_mmap;
 use minicpmo.tensor.tensor_weight_table_load;
 
+struct T2WPromptCacheConfig {
+    version: u32,
+    n_timesteps: u32,
+    temperature_bits: u32,
+    pre_lookahead: u32,
+    chunk_main: u32,
+    chunk_total: u32,
+    up_rate: u32,
+}
+
+struct T2WPromptCacheStats {
+    spk_checksum: u32,
+    conformer_cnn_checksum: u32,
+    conformer_att_checksum: u32,
+    estimator_cnn_checksum: u32,
+    estimator_att_checksum: u32,
+}
+
+struct T2WStringRead {
+    len: u64,
+    copied: usize,
+    truncated: bool,
+}
+
 fn t2w_dtype_supported(dtype: TensorDType) bool {
     return dtype == TensorDType.F32 || dtype == TensorDType.F16 || dtype == TensorDType.BF16;
+}
+
+fn t2w_prompt_cache_config_init() T2WPromptCacheConfig {
+    return T2WPromptCacheConfig{
+        version: 0,
+        n_timesteps: 0,
+        temperature_bits: 0,
+        pre_lookahead: 0,
+        chunk_main: 0,
+        chunk_total: 0,
+        up_rate: 0,
+    };
+}
+
+fn t2w_prompt_cache_stats_init() T2WPromptCacheStats {
+    return T2WPromptCacheStats{
+        spk_checksum: 0,
+        conformer_cnn_checksum: 0,
+        conformer_att_checksum: 0,
+        estimator_cnn_checksum: 0,
+        estimator_att_checksum: 0,
+    };
+}
+
+fn t2w_string_read_init() T2WStringRead {
+    return T2WStringRead{ len: 0, copied: 0, truncated: false };
+}
+
+fn t2w_scalar_metadata_size(value_type: u32) u64 {
+    if value_type == 0 || value_type == 1 || value_type == 7 { return 1; }
+    if value_type == 2 || value_type == 3 { return 2; }
+    if value_type == 4 || value_type == 5 || value_type == 6 { return 4; }
+    if value_type == 10 || value_type == 11 || value_type == 12 { return 8; }
+    return 0;
+}
+
+fn t2w_read_string(reader: &BinaryReader, dest: &byte, cap: usize, info: &T2WStringRead, context: &const byte) bool {
+    info[0] = t2w_string_read_init();
+    if !binary_read_u64_le(reader, &info.len, context) { return false; }
+    if cap == 0 { return binary_skip(reader, info.len, context); }
+    var copy_len: usize = 0;
+    if info.len > 0 {
+        if info.len >= cap as u64 {
+            copy_len = cap - 1;
+            info.truncated = true;
+        } else {
+            copy_len = info.len as usize;
+        }
+        if copy_len > 0 {
+            if !binary_read_exact(reader, dest, copy_len, context) { return false; }
+        }
+    }
+    dest[copy_len] = 0;
+    info.copied = copy_len;
+    if info.len > copy_len as u64 { return binary_skip(reader, info.len - (copy_len as u64), context); }
+    return true;
+}
+
+fn t2w_skip_array(reader: &BinaryReader, elem_type: u32, count: u64) bool {
+    const size: u64 = t2w_scalar_metadata_size(elem_type);
+    if size > 0 { return binary_skip(reader, size * count, "token2wav metadata array\0" as &const byte); }
+    if elem_type == 8 {
+        var tmp: [byte: 1] = [];
+        var info: T2WStringRead = t2w_string_read_init();
+        var i: u64 = 0;
+        while i < count {
+            if !t2w_read_string(reader, &tmp[0], 1, &info, "token2wav metadata string array\0" as &const byte) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn t2w_apply_prompt_cache_u32(config: &T2WPromptCacheConfig, key: &const byte, value: u32) void {
+    if strcmp(key as *const byte, "mtmd.prompt_cache.version\0" as *const byte) == 0 { config.version = value; return; }
+    if strcmp(key as *const byte, "mtmd.prompt_cache.n_timesteps\0" as *const byte) == 0 { config.n_timesteps = value; return; }
+    if strcmp(key as *const byte, "mtmd.prompt_cache.pre_lookahead\0" as *const byte) == 0 { config.pre_lookahead = value; return; }
+    if strcmp(key as *const byte, "mtmd.prompt_cache.chunk_main\0" as *const byte) == 0 { config.chunk_main = value; return; }
+    if strcmp(key as *const byte, "mtmd.prompt_cache.chunk_total\0" as *const byte) == 0 { config.chunk_total = value; return; }
+    if strcmp(key as *const byte, "mtmd.prompt_cache.up_rate\0" as *const byte) == 0 { config.up_rate = value; return; }
+}
+
+fn t2w_skip_prompt_cache_metadata_value(reader: &BinaryReader, config: &T2WPromptCacheConfig, key: &const byte, value_type: u32) bool {
+    if value_type == 8 {
+        var tmp: [byte: 1] = [];
+        var info: T2WStringRead = t2w_string_read_init();
+        return t2w_read_string(reader, &tmp[0], 1, &info, "token2wav metadata string\0" as &const byte);
+    }
+    if value_type == 9 {
+        var elem_type: u32 = 0;
+        var count: u64 = 0;
+        if !binary_read_u32_le(reader, &elem_type, "token2wav metadata array type\0" as &const byte) { return false; }
+        if !binary_read_u64_le(reader, &count, "token2wav metadata array len\0" as &const byte) { return false; }
+        return t2w_skip_array(reader, elem_type, count);
+    }
+    if value_type == 4 || value_type == 5 {
+        var value: u32 = 0;
+        if !binary_read_u32_le(reader, &value, "token2wav metadata u32\0" as &const byte) { return false; }
+        t2w_apply_prompt_cache_u32(config, key, value);
+        return true;
+    }
+    if value_type == 6 {
+        var bits: u32 = 0;
+        if !binary_read_u32_le(reader, &bits, "token2wav metadata f32\0" as &const byte) { return false; }
+        if strcmp(key as *const byte, "mtmd.prompt_cache.temperature\0" as *const byte) == 0 { config.temperature_bits = bits; }
+        return true;
+    }
+    const size: u64 = t2w_scalar_metadata_size(value_type);
+    if size > 0 { return binary_skip(reader, size, "token2wav metadata scalar\0" as &const byte); }
+    _ = printf("error: unsupported token2wav metadata type=%u key=%s\n", value_type, key);
+    return false;
+}
+
+fn t2w_load_prompt_cache_metadata(path: &const byte, config: &T2WPromptCacheConfig) bool {
+    config[0] = t2w_prompt_cache_config_init();
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var tensor_count: u64 = 0;
+    var metadata_count: u64 = 0;
+    if !binary_read_u32_le(&reader, &magic, "token2wav GGUF magic\0" as &const byte) { binary_close(&reader); return false; }
+    if magic != 0x46554747 { _ = printf("error: token2wav prompt_cache bad GGUF magic\n"); binary_close(&reader); return false; }
+    if !binary_read_u32_le(&reader, &version, "token2wav GGUF version\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &tensor_count, "token2wav tensor_count\0" as &const byte) { binary_close(&reader); return false; }
+    if !binary_read_u64_le(&reader, &metadata_count, "token2wav metadata_count\0" as &const byte) { binary_close(&reader); return false; }
+    var i: u64 = 0;
+    while i < metadata_count {
+        var key: [byte: 128] = [];
+        var info: T2WStringRead = t2w_string_read_init();
+        if !t2w_read_string(&reader, &key[0], @len(key), &info, "token2wav metadata key\0" as &const byte) { binary_close(&reader); return false; }
+        var value_type: u32 = 0;
+        if !binary_read_u32_le(&reader, &value_type, "token2wav metadata value type\0" as &const byte) { binary_close(&reader); return false; }
+        if !t2w_skip_prompt_cache_metadata_value(&reader, config, &key[0] as &const byte, value_type) { binary_close(&reader); return false; }
+        i = i + 1;
+    }
+    binary_close(&reader);
+    return true;
+}
+
+fn t2w_f32_bits(value: f32) u32 {
+    const ptr: &const u32 = &value as &const u32;
+    return ptr[0];
+}
+
+fn t2w_checksum_f32(data: &const f32, count: usize) u32 {
+    var hash: u32 = 2166136261;
+    var i: usize = 0;
+    while i < count {
+        const bits: u32 = t2w_f32_bits(data[i]);
+        var shift: u32 = 0;
+        while shift < 32 {
+            hash = hash ^ ((bits >> (shift as i32)) & (255 as u32));
+            hash = hash * (16777619 as u32);
+            shift = shift + 8;
+        }
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn t2w_prompt_cache_collect_stats(table: &TensorWeightTable, stats: &T2WPromptCacheStats) bool {
+    stats[0] = t2w_prompt_cache_stats_init();
+    const spk_cb: &TensorView = t2w_require(table, "prompt_cache.spk_cb\0" as &const byte, "prompt_cache spk_cb\0" as &const byte);
+    const conformer_cnn: &TensorView = t2w_require(table, "prompt_cache.conformer_cnn_cache\0" as &const byte, "prompt_cache conformer_cnn\0" as &const byte);
+    const conformer_att: &TensorView = t2w_require(table, "prompt_cache.conformer_att_cache\0" as &const byte, "prompt_cache conformer_att\0" as &const byte);
+    const estimator_cnn: &TensorView = t2w_require(table, "prompt_cache.estimator_cnn_cache\0" as &const byte, "prompt_cache estimator_cnn\0" as &const byte);
+    const estimator_att: &TensorView = t2w_require(table, "prompt_cache.estimator_att_cache\0" as &const byte, "prompt_cache estimator_att\0" as &const byte);
+    if spk_cb == null || conformer_cnn == null || conformer_att == null || estimator_cnn == null || estimator_att == null { return false; }
+    stats.spk_checksum = t2w_checksum_f32(spk_cb.data as &const f32, 192);
+    stats.conformer_cnn_checksum = t2w_checksum_f32(conformer_cnn.data as &const f32, 512 * 6);
+    stats.conformer_att_checksum = t2w_checksum_f32(conformer_att.data as &const f32, 128 * 302 * 8 * 10);
+    stats.estimator_cnn_checksum = t2w_checksum_f32(estimator_cnn.data as &const f32, 1024 * 2 * 80 * 2);
+    stats.estimator_att_checksum = t2w_checksum_f32(estimator_att.data as &const f32, 128 * 302 * 640 * 2);
+    return true;
+}
+
+fn t2w_parse_tokens_csv(path: &const byte, tokens: &u32, token_count: &usize) bool {
+    *token_count = 0;
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    if reader.size == 0 {
+        binary_close(&reader);
+        return true;
+    }
+    const bytes_len: usize = reader.size as usize;
+    var bytes: &byte = calloc(bytes_len, 1) as &byte;
+    if bytes == null {
+        _ = printf("error: token2wav csv alloc failed bytes=%zu\n", bytes_len);
+        binary_close(&reader);
+        return false;
+    }
+    if !binary_read_exact(&reader, bytes, bytes_len, "token2wav csv\0" as &const byte) {
+        free(bytes as &void);
+        binary_close(&reader);
+        return false;
+    }
+    binary_close(&reader);
+    var pos: usize = 0;
+    while pos < bytes_len {
+        while pos < bytes_len && (bytes[pos] == 32 || bytes[pos] == 10 || bytes[pos] == 13 || bytes[pos] == 9 || bytes[pos] == 44) { pos = pos + 1; }
+        if pos >= bytes_len { break; }
+        var value: u32 = 0;
+        if bytes[pos] < 48 || bytes[pos] > 57 {
+            _ = printf("error: bad token2wav csv near offset=%zu path=%s\n", pos, path);
+            free(bytes as &void);
+            return false;
+        }
+        while pos < bytes_len && bytes[pos] >= 48 && bytes[pos] <= 57 {
+            value = value * 10 + ((bytes[pos] - 48) as u32);
+            pos = pos + 1;
+        }
+        tokens[*token_count] = value;
+        *token_count = *token_count + 1;
+    }
+    free(bytes as &void);
+    return true;
 }
 
 fn t2w_check_vec(view: &TensorView, len: u64, label: &const byte) bool {
@@ -289,3 +539,62 @@ export fn token2wav_bind_dir_cli(dir: &const byte) i32 {
     return 0;
 }
 
+fn t2w_prompt_cache_probe_usage() void {
+    _ = printf("usage: minicpm-o-uya token2wav-prompt-cache-probe <prompt_cache.gguf>\n");
+}
+
+export fn token2wav_prompt_cache_probe_cli(path: &const byte) i32 {
+    var config: T2WPromptCacheConfig = t2w_prompt_cache_config_init();
+    if !t2w_load_prompt_cache_metadata(path, &config) { return 1; }
+    var table: TensorWeightTable = tensor_table_init();
+    if !t2w_open_table(path, &table) { return 1; }
+    var stats: T2WPromptCacheStats = t2w_prompt_cache_stats_init();
+    if !t2w_prompt_cache_collect_stats(&table, &stats) {
+        t2w_close_table(&table);
+        return 1;
+    }
+    _ = printf("token2wav prompt_cache config: version=%u n_timesteps=%u temperature_bits=0x%x pre_lookahead=%u chunk_main=%u chunk_total=%u up_rate=%u\n", config.version, config.n_timesteps, config.temperature_bits, config.pre_lookahead, config.chunk_main, config.chunk_total, config.up_rate);
+    _ = printf("token2wav prompt_cache checksum: spk_cb=0x%x conformer_cnn=0x%x conformer_att=0x%x estimator_cnn=0x%x estimator_att=0x%x\n", stats.spk_checksum, stats.conformer_cnn_checksum, stats.conformer_att_checksum, stats.estimator_cnn_checksum, stats.estimator_att_checksum);
+    _ = printf("token2wav prompt_cache derived: batch=1 token_window=%u step=%u overlap=%u mel_rate=%u\n", config.chunk_total, config.chunk_main, config.pre_lookahead, config.up_rate);
+    _ = printf("token2wav prompt_cache: PASS\n");
+    t2w_close_table(&table);
+    return 0;
+}
+
+fn t2w_window_probe_usage() void {
+    _ = printf("usage: minicpm-o-uya token2wav-window-probe <prompt_cache.gguf> <audio_tokens_chunk.txt>\n");
+}
+
+export fn token2wav_window_probe_cli(prompt_cache_path: &const byte, tokens_path: &const byte) i32 {
+    var config: T2WPromptCacheConfig = t2w_prompt_cache_config_init();
+    if !t2w_load_prompt_cache_metadata(prompt_cache_path, &config) { return 1; }
+    if config.chunk_total == 0 || config.chunk_main == 0 || config.chunk_total < config.chunk_main {
+        _ = printf("error: invalid token2wav prompt_cache window config chunk_total=%u chunk_main=%u\n", config.chunk_total, config.chunk_main);
+        return 1;
+    }
+    var tokens: [u32: 8192] = [];
+    var token_count: usize = 0;
+    if !t2w_parse_tokens_csv(tokens_path, &tokens[0], &token_count) { return 1; }
+    _ = printf("token2wav window config: chunk_total=%u chunk_main=%u pre_lookahead=%u up_rate=%u tokens=%zu\n", config.chunk_total, config.chunk_main, config.pre_lookahead, config.up_rate, token_count);
+    var pending: usize = token_count;
+    var call_index: u32 = 0;
+    var consumed: usize = 0;
+    while pending >= config.chunk_total as usize {
+        const start: usize = consumed;
+        const end: usize = consumed + config.chunk_total as usize;
+        _ = printf("token2wav window[%u]: mode=full start=%zu end=%zu size=%u step=%u first=%u last=%u\n", call_index, start, end, config.chunk_total, config.chunk_main, tokens[start], tokens[end - 1]);
+        consumed = consumed + config.chunk_main as usize;
+        pending = token_count - consumed;
+        call_index = call_index + 1;
+    }
+    if pending > 0 {
+        const start2: usize = consumed;
+        const end2: usize = token_count;
+        _ = printf("token2wav window[%u]: mode=final start=%zu end=%zu size=%zu final=1 first=%u last=%u\n", call_index, start2, end2, pending, tokens[start2], tokens[end2 - 1]);
+    } else {
+        _ = printf("token2wav window[%u]: mode=final size=0 final=1\n", call_index);
+    }
+    _ = printf("token2wav window summary: total_tokens=%zu full_calls=%u final_pending=%zu\n", token_count, call_index, pending);
+    _ = printf("token2wav window probe: PASS\n");
+    return 0;
+}

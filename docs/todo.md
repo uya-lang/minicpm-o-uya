@@ -520,6 +520,8 @@
 - [x] 解析并绑定 `token2wav-gguf/hifigan2.gguf`。
 - [x] 解析并应用 `token2wav-gguf/prompt_cache.gguf`，避免每次实时重算参考音色 cache。
   - [x] 新增 `token2wav-bind <dir>` / `make token2wav-real-bind`，对官方 5 个 GGUF 子文件做 bind-only shape/dtype 校验。
+  - [x] 新增 `token2wav-prompt-cache-probe`，可读取 `prompt_cache.gguf` metadata 与 cache tensor checksum。
+  - [x] 新增 `token2wav-window-probe`，可按 `chunk_total=28` / `chunk_main=25` / `pre_lookahead=3` 打印真实 token 窗口计划。
 - [ ] 实现 token2mel/flow matching 推理图需要的 attention、conv、norm、sampling/noise schedule。
 - [ ] 实现 hifigan2 vocoder forward，输出 24 kHz mono PCM。
 - [ ] 实现流式 WAV chunk 写入，并支持最终 concat 成完整回答 wav。

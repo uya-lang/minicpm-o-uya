@@ -60,6 +60,8 @@ Generated files:
 - `tts-condition-probe` is manual and runs the real `emb_text + projector_semantic + L2 normalize + merge` path from `llama.cpp-omni` `llm_debug/chunk_*` token-id and hidden-state dumps. `tts-merge-align` compares the resulting Uya `merged` dump against `llama.cpp-omni` `merged_embeddings.bin` with default bounds `max_abs <= 1e-5` and `mean_abs <= 1e-6`.
 - `tts-simplex-probe` is manual and runs the official 20-layer TTS decoder over a whole `llm_debug/chunk_*` directory, keeps KV cache across chunks, and writes `audio_tokens_chunk_*.txt/bin` in the same relative-token format as `llama.cpp-omni`.
 - `tts-token-align` is manual and wraps the simplex probe with per-chunk `count`, `prefix_match`, and `exact` summaries against a reference `tts_wav` directory. It supports non-strict exploratory comparison and strict exact mode for future seeded baselines.
+- `token2wav-prompt-cache-probe` is manual and validates prompt-cache metadata plus cache tensor checksums from the official `prompt_cache.gguf`.
+- `token2wav-window-probe` is manual and prints the `chunk_total=28`, `chunk_main=25`, `pre_lookahead=3` feed schedule for a real `audio_tokens_chunk.txt`.
 - `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
 - `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.
 - `audio2audio-fixture` for PCM/mel audio input through audio encoder, speech decoder, vocoder, and WAV output.
@@ -142,6 +144,8 @@ build/minicpm-o-uya audio-real-preprocess-probe /path/to/user.wav
 build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya audio-real-encode-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya token2wav-bind /path/to/token2wav-gguf
+build/minicpm-o-uya token2wav-prompt-cache-probe /path/to/token2wav-gguf/prompt_cache.gguf
+build/minicpm-o-uya token2wav-window-probe /path/to/token2wav-gguf/prompt_cache.gguf /path/to/audio_tokens_chunk_0.txt
 build/minicpm-o-uya tts-condition-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_token_ids.txt /path/to/llm_hidden_states.bin --dump-merged /tmp/minicpm-o-uya-merged.bin
 build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_TEXT_GGUF" --audio-model "$MINICPM_O_AUDIO_GGUF" --speech-model "$MINICPM_O_SPEECH_GGUF" --vocoder-model "$MINICPM_O_VOCODER_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
