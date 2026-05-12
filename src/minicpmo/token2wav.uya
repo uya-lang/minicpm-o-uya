@@ -1,6 +1,16 @@
+use libc.calloc;
+use libc.cosf;
+use libc.expf;
+use libc.free;
+use libc.logf;
 use libc.printf;
 use libc.snprintf;
+use libc.sqrtf;
 use libc.strcmp;
+use minicpmo.kernels.gelu;
+use minicpmo.kernels.silu;
+use minicpmo.kernels.softmax;
+use minicpmo.qwen3.qwen3_tensor_get;
 use minicpmo.binary.BinaryReader;
 use minicpmo.binary.binary_close;
 use minicpmo.binary.binary_open;
@@ -43,6 +53,74 @@ struct T2WStringRead {
     truncated: bool,
 }
 
+const T2W_FLOW_PI: f32 = 3.14159265358979323846;
+const T2W_FLOW_NORM_EPS: f32 = 0.000001;
+const T2W_FLOW_HEAD_DIM: usize = 64;
+const T2W_FLOW_HEAD_COUNT: usize = 8;
+const T2W_FLOW_HIDDEN: usize = 512;
+const T2W_FLOW_MEL: usize = 80;
+const T2W_FLOW_SPK: usize = 192;
+const T2W_FLOW_IN: usize = 320;
+const T2W_FLOW_T_EMBED: usize = 256;
+const T2W_FLOW_MAX_BLOCKS: usize = 64;
+
+struct T2WFlowExtraWeights {
+    input_embedding: &TensorView,
+    spk_affine_weight: &TensorView,
+    spk_affine_bias: &TensorView,
+    encoder_proj_weight: &TensorView,
+    encoder_proj_bias: &TensorView,
+}
+
+struct T2WFlowMatchingBlockWeights {
+    ada_weight: &TensorView,
+    ada_bias: &TensorView,
+    q_weight: &TensorView,
+    q_bias: &TensorView,
+    k_weight: &TensorView,
+    k_bias: &TensorView,
+    v_weight: &TensorView,
+    v_bias: &TensorView,
+    q_norm_weight: &TensorView,
+    q_norm_bias: &TensorView,
+    k_norm_weight: &TensorView,
+    k_norm_bias: &TensorView,
+    proj_weight: &TensorView,
+    proj_bias: &TensorView,
+    conv1_weight: &TensorView,
+    conv1_bias: &TensorView,
+    conv_ln_weight: &TensorView,
+    conv_ln_bias: &TensorView,
+    conv2_weight: &TensorView,
+    conv2_bias: &TensorView,
+    mlp_fc1_weight: &TensorView,
+    mlp_fc1_bias: &TensorView,
+    mlp_fc2_weight: &TensorView,
+    mlp_fc2_bias: &TensorView,
+}
+
+struct T2WFlowMatchingWeights {
+    in_proj_weight: &TensorView,
+    in_proj_bias: &TensorView,
+    t_embed1_weight: &TensorView,
+    t_embed1_bias: &TensorView,
+    t_embed2_weight: &TensorView,
+    t_embed2_bias: &TensorView,
+    final_ada_weight: &TensorView,
+    final_ada_bias: &TensorView,
+    final_linear_weight: &TensorView,
+    final_linear_bias: &TensorView,
+    blocks: [T2WFlowMatchingBlockWeights: T2W_FLOW_MAX_BLOCKS],
+    block_count: u32,
+}
+
+struct T2WFlowProbeConfig {
+    token_limit: u32,
+    block_limit: u32,
+    n_timesteps: u32,
+    zero_mu: bool,
+}
+
 fn t2w_dtype_supported(dtype: TensorDType) bool {
     return dtype == TensorDType.F32 || dtype == TensorDType.F16 || dtype == TensorDType.BF16;
 }
@@ -71,6 +149,71 @@ fn t2w_prompt_cache_stats_init() T2WPromptCacheStats {
 
 fn t2w_string_read_init() T2WStringRead {
     return T2WStringRead{ len: 0, copied: 0, truncated: false };
+}
+
+fn t2w_flow_extra_weights_init() T2WFlowExtraWeights {
+    return T2WFlowExtraWeights{
+        input_embedding: null,
+        spk_affine_weight: null,
+        spk_affine_bias: null,
+        encoder_proj_weight: null,
+        encoder_proj_bias: null,
+    };
+}
+
+fn t2w_flow_matching_block_weights_init() T2WFlowMatchingBlockWeights {
+    return T2WFlowMatchingBlockWeights{
+        ada_weight: null,
+        ada_bias: null,
+        q_weight: null,
+        q_bias: null,
+        k_weight: null,
+        k_bias: null,
+        v_weight: null,
+        v_bias: null,
+        q_norm_weight: null,
+        q_norm_bias: null,
+        k_norm_weight: null,
+        k_norm_bias: null,
+        proj_weight: null,
+        proj_bias: null,
+        conv1_weight: null,
+        conv1_bias: null,
+        conv_ln_weight: null,
+        conv_ln_bias: null,
+        conv2_weight: null,
+        conv2_bias: null,
+        mlp_fc1_weight: null,
+        mlp_fc1_bias: null,
+        mlp_fc2_weight: null,
+        mlp_fc2_bias: null,
+    };
+}
+
+fn t2w_flow_matching_weights_init() T2WFlowMatchingWeights {
+    return T2WFlowMatchingWeights{
+        in_proj_weight: null,
+        in_proj_bias: null,
+        t_embed1_weight: null,
+        t_embed1_bias: null,
+        t_embed2_weight: null,
+        t_embed2_bias: null,
+        final_ada_weight: null,
+        final_ada_bias: null,
+        final_linear_weight: null,
+        final_linear_bias: null,
+        blocks: [],
+        block_count: 0,
+    };
+}
+
+fn t2w_flow_probe_config_init() T2WFlowProbeConfig {
+    return T2WFlowProbeConfig{
+        token_limit: 2,
+        block_limit: 2,
+        n_timesteps: 0,
+        zero_mu: false,
+    };
 }
 
 fn t2w_scalar_metadata_size(value_type: u32) u64 {
@@ -188,6 +331,11 @@ fn t2w_load_prompt_cache_metadata(path: &const byte, config: &T2WPromptCacheConf
 
 fn t2w_f32_bits(value: f32) u32 {
     const ptr: &const u32 = &value as &const u32;
+    return ptr[0];
+}
+
+fn t2w_bits_f32(bits: u32) f32 {
+    const ptr: &const f32 = &bits as &const f32;
     return ptr[0];
 }
 
@@ -444,23 +592,39 @@ fn t2w_bind_flow_matching_file(path: &const byte) bool {
     if ok && !t2w_check_matrix(t2w_require(&table, "estimator.in_proj.weight\0" as &const byte, "flow_matching in_proj weight\0" as &const byte), 320, 512, "flow_matching in_proj weight\0" as &const byte) { ok = false; }
     if ok && !t2w_check_vec(t2w_require(&table, "estimator.in_proj.bias\0" as &const byte, "flow_matching in_proj bias\0" as &const byte), 512, "flow_matching in_proj bias\0" as &const byte) { ok = false; }
     if ok && !t2w_check_matrix(t2w_require(&table, "estimator.t_embedder.mlp.0.weight\0" as &const byte, "flow_matching t_embedder 0\0" as &const byte), 256, 512, "flow_matching t_embedder 0\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_vec(t2w_require(&table, "estimator.t_embedder.mlp.0.bias\0" as &const byte, "flow_matching t_embedder 0 bias\0" as &const byte), 512, "flow_matching t_embedder 0 bias\0" as &const byte) { ok = false; }
     if ok && !t2w_check_matrix(t2w_require(&table, "estimator.t_embedder.mlp.2.weight\0" as &const byte, "flow_matching t_embedder 2\0" as &const byte), 512, 512, "flow_matching t_embedder 2\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_vec(t2w_require(&table, "estimator.t_embedder.mlp.2.bias\0" as &const byte, "flow_matching t_embedder 2 bias\0" as &const byte), 512, "flow_matching t_embedder 2 bias\0" as &const byte) { ok = false; }
     if ok && !t2w_check_matrix(t2w_require(&table, "estimator.final_layer.adaLN_modulation.1.weight\0" as &const byte, "flow_matching final ada weight\0" as &const byte), 512, 1024, "flow_matching final ada weight\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_vec(t2w_require(&table, "estimator.final_layer.adaLN_modulation.1.bias\0" as &const byte, "flow_matching final ada bias\0" as &const byte), 1024, "flow_matching final ada bias\0" as &const byte) { ok = false; }
     if ok && !t2w_check_matrix(t2w_require(&table, "estimator.final_layer.linear.weight\0" as &const byte, "flow_matching final linear weight\0" as &const byte), 512, 80, "flow_matching final linear weight\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_vec(t2w_require(&table, "estimator.final_layer.linear.bias\0" as &const byte, "flow_matching final linear bias\0" as &const byte), 80, "flow_matching final linear bias\0" as &const byte) { ok = false; }
     var i: u32 = 0;
     while ok && i < block_count {
         if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "adaLN_modulation.1.weight\0" as &const byte, "flow_matching ada weight\0" as &const byte), 512, 4608, "flow_matching ada weight\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "adaLN_modulation.1.bias\0" as &const byte, "flow_matching ada bias\0" as &const byte), 4608, "flow_matching ada bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.q_norm.weight\0" as &const byte, "flow_matching q_norm\0" as &const byte), 64, "flow_matching q_norm\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.q_norm.bias\0" as &const byte, "flow_matching q_norm bias\0" as &const byte), 64, "flow_matching q_norm bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.k_norm.weight\0" as &const byte, "flow_matching k_norm\0" as &const byte), 64, "flow_matching k_norm\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.k_norm.bias\0" as &const byte, "flow_matching k_norm bias\0" as &const byte), 64, "flow_matching k_norm bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.to_q.weight\0" as &const byte, "flow_matching q\0" as &const byte), 512, 512, "flow_matching q\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.to_q.bias\0" as &const byte, "flow_matching q bias\0" as &const byte), 512, "flow_matching q bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.to_k.weight\0" as &const byte, "flow_matching k\0" as &const byte), 512, 512, "flow_matching k\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.to_k.bias\0" as &const byte, "flow_matching k bias\0" as &const byte), 512, "flow_matching k bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.to_v.weight\0" as &const byte, "flow_matching v\0" as &const byte), 512, 512, "flow_matching v\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.to_v.bias\0" as &const byte, "flow_matching v bias\0" as &const byte), 512, "flow_matching v bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.proj.weight\0" as &const byte, "flow_matching proj\0" as &const byte), 512, 512, "flow_matching proj\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.proj.bias\0" as &const byte, "flow_matching proj bias\0" as &const byte), 512, "flow_matching proj bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_tensor3(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "conv.block.1.weight\0" as &const byte, "flow_matching conv1\0" as &const byte), 3, 512, 512, "flow_matching conv1\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "conv.block.1.bias\0" as &const byte, "flow_matching conv1 bias\0" as &const byte), 512, "flow_matching conv1 bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "conv.block.3.weight\0" as &const byte, "flow_matching conv3\0" as &const byte), 512, "flow_matching conv3\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "conv.block.3.bias\0" as &const byte, "flow_matching conv3 bias\0" as &const byte), 512, "flow_matching conv3 bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_tensor3(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "conv.block.6.weight\0" as &const byte, "flow_matching conv6\0" as &const byte), 3, 512, 512, "flow_matching conv6\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "conv.block.6.bias\0" as &const byte, "flow_matching conv6 bias\0" as &const byte), 512, "flow_matching conv6 bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "mlp.fc1.weight\0" as &const byte, "flow_matching fc1\0" as &const byte), 512, 2048, "flow_matching fc1\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "mlp.fc1.bias\0" as &const byte, "flow_matching fc1 bias\0" as &const byte), 2048, "flow_matching fc1 bias\0" as &const byte) { ok = false; break; }
         if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "mlp.fc2.weight\0" as &const byte, "flow_matching fc2\0" as &const byte), 2048, 512, "flow_matching fc2\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "mlp.fc2.bias\0" as &const byte, "flow_matching fc2 bias\0" as &const byte), 512, "flow_matching fc2 bias\0" as &const byte) { ok = false; break; }
         i = i + 1;
     }
     if ok {
@@ -596,5 +760,744 @@ export fn token2wav_window_probe_cli(prompt_cache_path: &const byte, tokens_path
     }
     _ = printf("token2wav window summary: total_tokens=%zu full_calls=%u final_pending=%zu\n", token_count, call_index, pending);
     _ = printf("token2wav window probe: PASS\n");
+    return 0;
+}
+
+fn t2w_is_ascii_ws(ch: byte) bool {
+    return ch == 32 || ch == 9 || ch == 10 || ch == 13;
+}
+
+fn t2w_parse_u32_ascii(text: &const byte, pos: &usize, out: &u32) bool {
+    while text[*pos] != 0 && t2w_is_ascii_ws(text[*pos]) { *pos = *pos + 1; }
+    if text[*pos] == 0 || text[*pos] < 48 || text[*pos] > 57 { return false; }
+    var value: u32 = 0;
+    while text[*pos] >= 48 && text[*pos] <= 57 {
+        value = value * 10 + ((text[*pos] - 48) as u32);
+        *pos = *pos + 1;
+    }
+    *out = value;
+    return true;
+}
+
+fn t2w_alloc_f32(count: usize, label: &const byte) &f32 {
+    const ptr: &f32 = calloc(count, 4) as &f32;
+    if ptr == null { _ = printf("error: token2wav alloc failed label=%s count=%zu\n", label, count); }
+    return ptr;
+}
+
+fn t2w_flow_bind_extra_weights(table: &TensorWeightTable, weights: &T2WFlowExtraWeights) bool {
+    weights[0] = t2w_flow_extra_weights_init();
+    weights.input_embedding = t2w_require(table, "input_embedding.weight\0" as &const byte, "flow_extra input_embedding\0" as &const byte);
+    weights.spk_affine_weight = t2w_require(table, "spk_embed_affine_layer.weight\0" as &const byte, "flow_extra spk weight\0" as &const byte);
+    weights.spk_affine_bias = t2w_require(table, "spk_embed_affine_layer.bias\0" as &const byte, "flow_extra spk bias\0" as &const byte);
+    weights.encoder_proj_weight = t2w_require(table, "encoder_proj.weight\0" as &const byte, "flow_extra encoder_proj weight\0" as &const byte);
+    weights.encoder_proj_bias = t2w_require(table, "encoder_proj.bias\0" as &const byte, "flow_extra encoder_proj bias\0" as &const byte);
+    return weights.input_embedding != null && weights.spk_affine_weight != null && weights.spk_affine_bias != null && weights.encoder_proj_weight != null && weights.encoder_proj_bias != null;
+}
+
+fn t2w_flow_bind_matching_weights(table: &TensorWeightTable, weights: &T2WFlowMatchingWeights) bool {
+    weights[0] = t2w_flow_matching_weights_init();
+    weights.block_count = t2w_count_layers(table, "estimator.blocks.\0" as &const byte, "attn.to_q.weight\0" as &const byte, T2W_FLOW_MAX_BLOCKS as u32);
+    if weights.block_count == 0 {
+        _ = printf("error: token2wav flow probe found no estimator blocks\n");
+        return false;
+    }
+    weights.in_proj_weight = t2w_require(table, "estimator.in_proj.weight\0" as &const byte, "flow probe in_proj\0" as &const byte);
+    weights.in_proj_bias = t2w_require(table, "estimator.in_proj.bias\0" as &const byte, "flow probe in_proj bias\0" as &const byte);
+    weights.t_embed1_weight = t2w_require(table, "estimator.t_embedder.mlp.0.weight\0" as &const byte, "flow probe t_embed1\0" as &const byte);
+    weights.t_embed1_bias = t2w_require(table, "estimator.t_embedder.mlp.0.bias\0" as &const byte, "flow probe t_embed1 bias\0" as &const byte);
+    weights.t_embed2_weight = t2w_require(table, "estimator.t_embedder.mlp.2.weight\0" as &const byte, "flow probe t_embed2\0" as &const byte);
+    weights.t_embed2_bias = t2w_require(table, "estimator.t_embedder.mlp.2.bias\0" as &const byte, "flow probe t_embed2 bias\0" as &const byte);
+    weights.final_ada_weight = t2w_require(table, "estimator.final_layer.adaLN_modulation.1.weight\0" as &const byte, "flow probe final ada\0" as &const byte);
+    weights.final_ada_bias = t2w_require(table, "estimator.final_layer.adaLN_modulation.1.bias\0" as &const byte, "flow probe final ada bias\0" as &const byte);
+    weights.final_linear_weight = t2w_require(table, "estimator.final_layer.linear.weight\0" as &const byte, "flow probe final linear\0" as &const byte);
+    weights.final_linear_bias = t2w_require(table, "estimator.final_layer.linear.bias\0" as &const byte, "flow probe final linear bias\0" as &const byte);
+    if weights.in_proj_weight == null || weights.in_proj_bias == null || weights.t_embed1_weight == null || weights.t_embed1_bias == null || weights.t_embed2_weight == null || weights.t_embed2_bias == null || weights.final_ada_weight == null || weights.final_ada_bias == null || weights.final_linear_weight == null || weights.final_linear_bias == null { return false; }
+    var i: u32 = 0;
+    while i < weights.block_count {
+        var block: &T2WFlowMatchingBlockWeights = &weights.blocks[i as usize];
+        block[0] = t2w_flow_matching_block_weights_init();
+        block.ada_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "adaLN_modulation.1.weight\0" as &const byte, "flow probe ada weight\0" as &const byte);
+        block.ada_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "adaLN_modulation.1.bias\0" as &const byte, "flow probe ada bias\0" as &const byte);
+        block.q_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.to_q.weight\0" as &const byte, "flow probe q\0" as &const byte);
+        block.q_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.to_q.bias\0" as &const byte, "flow probe q bias\0" as &const byte);
+        block.k_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.to_k.weight\0" as &const byte, "flow probe k\0" as &const byte);
+        block.k_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.to_k.bias\0" as &const byte, "flow probe k bias\0" as &const byte);
+        block.v_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.to_v.weight\0" as &const byte, "flow probe v\0" as &const byte);
+        block.v_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.to_v.bias\0" as &const byte, "flow probe v bias\0" as &const byte);
+        block.q_norm_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.q_norm.weight\0" as &const byte, "flow probe q_norm weight\0" as &const byte);
+        block.q_norm_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.q_norm.bias\0" as &const byte, "flow probe q_norm bias\0" as &const byte);
+        block.k_norm_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.k_norm.weight\0" as &const byte, "flow probe k_norm weight\0" as &const byte);
+        block.k_norm_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.k_norm.bias\0" as &const byte, "flow probe k_norm bias\0" as &const byte);
+        block.proj_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.proj.weight\0" as &const byte, "flow probe proj weight\0" as &const byte);
+        block.proj_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "attn.proj.bias\0" as &const byte, "flow probe proj bias\0" as &const byte);
+        block.conv1_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "conv.block.1.weight\0" as &const byte, "flow probe conv1 weight\0" as &const byte);
+        block.conv1_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "conv.block.1.bias\0" as &const byte, "flow probe conv1 bias\0" as &const byte);
+        block.conv_ln_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "conv.block.3.weight\0" as &const byte, "flow probe conv ln weight\0" as &const byte);
+        block.conv_ln_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "conv.block.3.bias\0" as &const byte, "flow probe conv ln bias\0" as &const byte);
+        block.conv2_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "conv.block.6.weight\0" as &const byte, "flow probe conv2 weight\0" as &const byte);
+        block.conv2_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "conv.block.6.bias\0" as &const byte, "flow probe conv2 bias\0" as &const byte);
+        block.mlp_fc1_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "mlp.fc1.weight\0" as &const byte, "flow probe fc1 weight\0" as &const byte);
+        block.mlp_fc1_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "mlp.fc1.bias\0" as &const byte, "flow probe fc1 bias\0" as &const byte);
+        block.mlp_fc2_weight = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "mlp.fc2.weight\0" as &const byte, "flow probe fc2 weight\0" as &const byte);
+        block.mlp_fc2_bias = t2w_require_layer(table, "estimator.blocks.\0" as &const byte, i, "mlp.fc2.bias\0" as &const byte, "flow probe fc2 bias\0" as &const byte);
+        if block.ada_weight == null || block.ada_bias == null || block.q_weight == null || block.q_bias == null || block.k_weight == null || block.k_bias == null || block.v_weight == null || block.v_bias == null || block.q_norm_weight == null || block.q_norm_bias == null || block.k_norm_weight == null || block.k_norm_bias == null || block.proj_weight == null || block.proj_bias == null || block.conv1_weight == null || block.conv1_bias == null || block.conv_ln_weight == null || block.conv_ln_bias == null || block.conv2_weight == null || block.conv2_bias == null || block.mlp_fc1_weight == null || block.mlp_fc1_bias == null || block.mlp_fc2_weight == null || block.mlp_fc2_bias == null { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn t2w_copy_embedding_row(dst: &f32, emb: &TensorView, token_id: u32, hidden: usize, vocab: usize) bool {
+    if token_id as usize >= vocab {
+        _ = printf("error: token2wav token id=%u exceeds vocab=%zu\n", token_id, vocab);
+        return false;
+    }
+    var i: usize = 0;
+    while i < hidden {
+        dst[i] = qwen3_tensor_get(emb, (token_id as usize) * hidden + i);
+        i = i + 1;
+    }
+    return true;
+}
+
+fn t2w_linear_vec(dst: &f32, src: &const f32, in_dim: usize, out_dim: usize, weight: &TensorView, bias: &TensorView) void {
+    var out_index: usize = 0;
+    while out_index < out_dim {
+        var sum: f32 = 0.0;
+        if bias != null { sum = qwen3_tensor_get(bias, out_index); }
+        var in_index: usize = 0;
+        while in_index < in_dim {
+            sum = sum + src[in_index] * qwen3_tensor_get(weight, in_index * out_dim + out_index);
+            in_index = in_index + 1;
+        }
+        dst[out_index] = sum;
+        out_index = out_index + 1;
+    }
+}
+
+fn t2w_linear_seq(dst: &f32, src: &const f32, token_count: usize, in_dim: usize, out_dim: usize, weight: &TensorView, bias: &TensorView) void {
+    var token: usize = 0;
+    while token < token_count {
+        t2w_linear_vec(&dst[token * out_dim], &src[token * in_dim] as &const f32, in_dim, out_dim, weight, bias);
+        token = token + 1;
+    }
+}
+
+fn t2w_layer_norm_seq(dst: &f32, src: &const f32, token_count: usize, dim: usize, eps: f32) void {
+    var token: usize = 0;
+    while token < token_count {
+        var mean: f32 = 0.0;
+        var i: usize = 0;
+        while i < dim { mean = mean + src[token * dim + i]; i = i + 1; }
+        mean = mean / (dim as f32);
+        var var_sum: f32 = 0.0;
+        i = 0;
+        while i < dim {
+            const delta: f32 = src[token * dim + i] - mean;
+            var_sum = var_sum + delta * delta;
+            i = i + 1;
+        }
+        const inv: f32 = 1.0 / sqrtf(var_sum / (dim as f32) + eps);
+        i = 0;
+        while i < dim {
+            dst[token * dim + i] = (src[token * dim + i] - mean) * inv;
+            i = i + 1;
+        }
+        token = token + 1;
+    }
+}
+
+fn t2w_layer_norm_seq_affine(dst: &f32, src: &const f32, token_count: usize, dim: usize, weight: &TensorView, bias: &TensorView, eps: f32) void {
+    var token: usize = 0;
+    while token < token_count {
+        var mean: f32 = 0.0;
+        var i: usize = 0;
+        while i < dim { mean = mean + src[token * dim + i]; i = i + 1; }
+        mean = mean / (dim as f32);
+        var var_sum: f32 = 0.0;
+        i = 0;
+        while i < dim {
+            const delta: f32 = src[token * dim + i] - mean;
+            var_sum = var_sum + delta * delta;
+            i = i + 1;
+        }
+        const inv: f32 = 1.0 / sqrtf(var_sum / (dim as f32) + eps);
+        i = 0;
+        while i < dim {
+            dst[token * dim + i] = (src[token * dim + i] - mean) * inv * qwen3_tensor_get(weight, i) + qwen3_tensor_get(bias, i);
+            i = i + 1;
+        }
+        token = token + 1;
+    }
+}
+
+fn t2w_modulate_seq(dst: &f32, src: &const f32, token_count: usize, dim: usize, shift: &const f32, scale: &const f32) void {
+    var token: usize = 0;
+    while token < token_count {
+        var i: usize = 0;
+        while i < dim {
+            const x: f32 = src[token * dim + i];
+            dst[token * dim + i] = x + x * scale[i] + shift[i];
+            i = i + 1;
+        }
+        token = token + 1;
+    }
+}
+
+fn t2w_gate_add_inplace(dst: &f32, residual: &f32, token_count: usize, dim: usize, gate: &const f32) void {
+    var token: usize = 0;
+    while token < token_count {
+        var i: usize = 0;
+        while i < dim {
+            residual[token * dim + i] = residual[token * dim + i] + dst[token * dim + i] * gate[i];
+            i = i + 1;
+        }
+        token = token + 1;
+    }
+}
+
+fn t2w_l2_normalize(dst: &f32, src: &const f32, n: usize, eps: f32) void {
+    var sum_sq: f32 = 0.0;
+    var i: usize = 0;
+    while i < n { sum_sq = sum_sq + src[i] * src[i]; i = i + 1; }
+    const inv: f32 = 1.0 / sqrtf(sum_sq + eps);
+    i = 0;
+    while i < n { dst[i] = src[i] * inv; i = i + 1; }
+}
+
+fn t2w_build_cosine_t_span(dst: &f32, steps: usize) void {
+    var i: usize = 0;
+    while i <= steps {
+        const u: f32 = (i as f32) / (steps as f32);
+        dst[i] = 1.0 - cosf(u * (0.5 * T2W_FLOW_PI));
+        i = i + 1;
+    }
+}
+
+fn t2w_tanh_soft(x: f32) f32 {
+    const e2x: f32 = expf((2.0 as f32) * x);
+    return (e2x - (1.0 as f32)) / (e2x + (1.0 as f32));
+}
+
+fn t2w_mish(x: f32) f32 {
+    const softplus: f32 = logf((1.0 as f32) + expf(x));
+    return x * t2w_tanh_soft(softplus);
+}
+
+fn t2w_timestep_embedding(dst: &f32, dim: usize, t_value: f32) void {
+    const half: usize = dim / (2 as usize);
+    var i: usize = 0;
+    while i < half {
+        const freq: f32 = expf((0.0 as f32) - logf(10000.0 as f32) * (i as f32) / (half as f32));
+        const arg: f32 = t_value * freq;
+        dst[i] = cosf(arg);
+        dst[i + half] = sinf(arg);
+        i = i + 1;
+    }
+    if dim % (2 as usize) != 0 { dst[2 * half] = 0.0; }
+}
+
+fn t2w_apply_head_norm(seq: &f32, token_count: usize, head_count: usize, head_dim: usize, weight: &TensorView, bias: &TensorView) void {
+    var token: usize = 0;
+    while token < token_count {
+        var head: usize = 0;
+        while head < head_count {
+            const base: usize = token * head_count * head_dim + head * head_dim;
+            var mean: f32 = 0.0;
+            var i: usize = 0;
+            while i < head_dim { mean = mean + seq[base + i]; i = i + 1; }
+            mean = mean / (head_dim as f32);
+            var var_sum: f32 = 0.0;
+            i = 0;
+            while i < head_dim {
+                const delta: f32 = seq[base + i] - mean;
+                var_sum = var_sum + delta * delta;
+                i = i + 1;
+            }
+            const inv: f32 = 1.0 / sqrtf(var_sum / (head_dim as f32) + T2W_FLOW_NORM_EPS);
+            i = 0;
+            while i < head_dim {
+                seq[base + i] = (seq[base + i] - mean) * inv * qwen3_tensor_get(weight, i) + qwen3_tensor_get(bias, i);
+                i = i + 1;
+            }
+            head = head + 1;
+        }
+        token = token + 1;
+    }
+}
+
+fn t2w_attention_seq(dst: &f32, src: &const f32, token_count: usize, block: &T2WFlowMatchingBlockWeights) bool {
+    const hidden: usize = T2W_FLOW_HIDDEN;
+    const head_count: usize = T2W_FLOW_HEAD_COUNT;
+    const head_dim: usize = T2W_FLOW_HEAD_DIM;
+    const q_values: &f32 = t2w_alloc_f32(token_count * hidden, "flow-q\0" as &const byte);
+    const k_values: &f32 = t2w_alloc_f32(token_count * hidden, "flow-k\0" as &const byte);
+    const v_values: &f32 = t2w_alloc_f32(token_count * hidden, "flow-v\0" as &const byte);
+    const ctx_values: &f32 = t2w_alloc_f32(token_count * hidden, "flow-ctx\0" as &const byte);
+    const scores: &f32 = t2w_alloc_f32(token_count, "flow-scores\0" as &const byte);
+    const probs: &f32 = t2w_alloc_f32(token_count, "flow-probs\0" as &const byte);
+    if q_values == null || k_values == null || v_values == null || ctx_values == null || scores == null || probs == null {
+        if q_values != null { free(q_values as &void); }
+        if k_values != null { free(k_values as &void); }
+        if v_values != null { free(v_values as &void); }
+        if ctx_values != null { free(ctx_values as &void); }
+        if scores != null { free(scores as &void); }
+        if probs != null { free(probs as &void); }
+        return false;
+    }
+    t2w_linear_seq(q_values, src, token_count, hidden, hidden, block.q_weight, block.q_bias);
+    t2w_linear_seq(k_values, src, token_count, hidden, hidden, block.k_weight, block.k_bias);
+    t2w_linear_seq(v_values, src, token_count, hidden, hidden, block.v_weight, block.v_bias);
+    t2w_apply_head_norm(q_values, token_count, head_count, head_dim, block.q_norm_weight, block.q_norm_bias);
+    t2w_apply_head_norm(k_values, token_count, head_count, head_dim, block.k_norm_weight, block.k_norm_bias);
+    const scale: f32 = 1.0 / sqrtf(head_dim as f32);
+    var token: usize = 0;
+    while token < token_count {
+        var head: usize = 0;
+        while head < head_count {
+            var key_token: usize = 0;
+            while key_token < token_count {
+                var dot: f32 = 0.0;
+                var dim: usize = 0;
+                while dim < head_dim {
+                    const offset: usize = head * head_dim + dim;
+                    dot = dot + q_values[token * hidden + offset] * k_values[key_token * hidden + offset];
+                    dim = dim + 1;
+                }
+                scores[key_token] = dot * scale;
+                key_token = key_token + 1;
+            }
+            softmax(probs, scores as &const f32, token_count);
+            var out_dim: usize = 0;
+            while out_dim < head_dim {
+                var sum: f32 = 0.0;
+                var value_token: usize = 0;
+                while value_token < token_count {
+                    const offset2: usize = head * head_dim + out_dim;
+                    sum = sum + probs[value_token] * v_values[value_token * hidden + offset2];
+                    value_token = value_token + 1;
+                }
+                ctx_values[token * hidden + head * head_dim + out_dim] = sum;
+                out_dim = out_dim + 1;
+            }
+            head = head + 1;
+        }
+        token = token + 1;
+    }
+    t2w_linear_seq(dst, ctx_values as &const f32, token_count, hidden, hidden, block.proj_weight, block.proj_bias);
+    free(q_values as &void);
+    free(k_values as &void);
+    free(v_values as &void);
+    free(ctx_values as &void);
+    free(scores as &void);
+    free(probs as &void);
+    return true;
+}
+
+fn t2w_conv1d_causal_seq(dst: &f32, src: &const f32, token_count: usize, in_dim: usize, out_dim: usize, kernel_size: usize, weight: &TensorView, bias: &TensorView) void {
+    var token: usize = 0;
+    while token < token_count {
+        var out_index: usize = 0;
+        while out_index < out_dim {
+            var sum: f32 = 0.0;
+            if bias != null { sum = qwen3_tensor_get(bias, out_index); }
+            var k: usize = 0;
+            while k < kernel_size {
+                if token + 1 >= k + 1 {
+                    const src_token: usize = token - k;
+                    var in_index: usize = 0;
+                    while in_index < in_dim {
+                        const w_index: usize = ((k * in_dim + in_index) * out_dim) + out_index;
+                        sum = sum + src[src_token * in_dim + in_index] * qwen3_tensor_get(weight, w_index);
+                        in_index = in_index + 1;
+                    }
+                }
+                k = k + 1;
+            }
+            dst[token * out_dim + out_index] = sum;
+            out_index = out_index + 1;
+        }
+        token = token + 1;
+    }
+}
+
+fn t2w_conv_block_seq(dst: &f32, src: &const f32, token_count: usize, block: &T2WFlowMatchingBlockWeights) bool {
+    const hidden: usize = T2W_FLOW_HIDDEN;
+    const conv1: &f32 = t2w_alloc_f32(token_count * hidden, "flow-conv1\0" as &const byte);
+    const normed: &f32 = t2w_alloc_f32(token_count * hidden, "flow-convnorm\0" as &const byte);
+    if conv1 == null || normed == null {
+        if conv1 != null { free(conv1 as &void); }
+        if normed != null { free(normed as &void); }
+        return false;
+    }
+    t2w_conv1d_causal_seq(conv1, src, token_count, hidden, hidden, 3, block.conv1_weight, block.conv1_bias);
+    t2w_layer_norm_seq_affine(normed, conv1 as &const f32, token_count, hidden, block.conv_ln_weight, block.conv_ln_bias, 0.00001);
+    var i: usize = 0;
+    while i < token_count * hidden { normed[i] = t2w_mish(normed[i]); i = i + 1; }
+    t2w_conv1d_causal_seq(dst, normed as &const f32, token_count, hidden, hidden, 3, block.conv2_weight, block.conv2_bias);
+    free(conv1 as &void);
+    free(normed as &void);
+    return true;
+}
+
+fn t2w_mlp_seq(dst: &f32, src: &const f32, token_count: usize, block: &T2WFlowMatchingBlockWeights) bool {
+    const hidden_mid: usize = 2048;
+    const fc1: &f32 = t2w_alloc_f32(token_count * hidden_mid, "flow-fc1\0" as &const byte);
+    if fc1 == null { return false; }
+    t2w_linear_seq(fc1, src, token_count, T2W_FLOW_HIDDEN, hidden_mid, block.mlp_fc1_weight, block.mlp_fc1_bias);
+    var i: usize = 0;
+    while i < token_count * hidden_mid { fc1[i] = gelu(fc1[i]); i = i + 1; }
+    t2w_linear_seq(dst, fc1 as &const f32, token_count, hidden_mid, T2W_FLOW_HIDDEN, block.mlp_fc2_weight, block.mlp_fc2_bias);
+    free(fc1 as &void);
+    return true;
+}
+
+fn t2w_flow_block_forward(states: &f32, token_count: usize, c_embed: &const f32, block: &T2WFlowMatchingBlockWeights) bool {
+    const hidden: usize = T2W_FLOW_HIDDEN;
+    const work0: &f32 = t2w_alloc_f32(token_count * hidden, "flow-work0\0" as &const byte);
+    const work1: &f32 = t2w_alloc_f32(token_count * hidden, "flow-work1\0" as &const byte);
+    const ada: &f32 = t2w_alloc_f32(hidden * 9, "flow-ada\0" as &const byte);
+    const c_silu: &f32 = t2w_alloc_f32(hidden, "flow-c-silu\0" as &const byte);
+    if work0 == null || work1 == null || ada == null || c_silu == null {
+        if work0 != null { free(work0 as &void); }
+        if work1 != null { free(work1 as &void); }
+        if ada != null { free(ada as &void); }
+        if c_silu != null { free(c_silu as &void); }
+        return false;
+    }
+    var i: usize = 0;
+    while i < hidden { c_silu[i] = silu(c_embed[i]); i = i + 1; }
+    t2w_linear_vec(ada, c_silu as &const f32, hidden, hidden * 9, block.ada_weight, block.ada_bias);
+    const shift_msa: &const f32 = ada as &const f32;
+    const scale_msa: &const f32 = &ada[hidden] as &const f32;
+    const gate_msa: &const f32 = &ada[hidden * 2] as &const f32;
+    const shift_mlp: &const f32 = &ada[hidden * 3] as &const f32;
+    const scale_mlp: &const f32 = &ada[hidden * 4] as &const f32;
+    const gate_mlp: &const f32 = &ada[hidden * 5] as &const f32;
+    const shift_conv: &const f32 = &ada[hidden * 6] as &const f32;
+    const scale_conv: &const f32 = &ada[hidden * 7] as &const f32;
+    const gate_conv: &const f32 = &ada[hidden * 8] as &const f32;
+    t2w_layer_norm_seq(work0, states as &const f32, token_count, hidden, T2W_FLOW_NORM_EPS);
+    t2w_modulate_seq(work1, work0 as &const f32, token_count, hidden, shift_msa, scale_msa);
+    if !t2w_attention_seq(work0, work1 as &const f32, token_count, block) {
+        free(work0 as &void); free(work1 as &void); free(ada as &void); free(c_silu as &void);
+        return false;
+    }
+    t2w_gate_add_inplace(work0, states, token_count, hidden, gate_msa);
+    t2w_layer_norm_seq(work0, states as &const f32, token_count, hidden, T2W_FLOW_NORM_EPS);
+    t2w_modulate_seq(work1, work0 as &const f32, token_count, hidden, shift_conv, scale_conv);
+    if !t2w_conv_block_seq(work0, work1 as &const f32, token_count, block) {
+        free(work0 as &void); free(work1 as &void); free(ada as &void); free(c_silu as &void);
+        return false;
+    }
+    t2w_gate_add_inplace(work0, states, token_count, hidden, gate_conv);
+    t2w_layer_norm_seq(work0, states as &const f32, token_count, hidden, T2W_FLOW_NORM_EPS);
+    t2w_modulate_seq(work1, work0 as &const f32, token_count, hidden, shift_mlp, scale_mlp);
+    if !t2w_mlp_seq(work0, work1 as &const f32, token_count, block) {
+        free(work0 as &void); free(work1 as &void); free(ada as &void); free(c_silu as &void);
+        return false;
+    }
+    t2w_gate_add_inplace(work0, states, token_count, hidden, gate_mlp);
+    free(work0 as &void);
+    free(work1 as &void);
+    free(ada as &void);
+    free(c_silu as &void);
+    return true;
+}
+
+fn t2w_flow_final_forward(dst: &f32, states: &const f32, token_count: usize, c_embed: &const f32, weights: &T2WFlowMatchingWeights) bool {
+    const hidden: usize = T2W_FLOW_HIDDEN;
+    const ada: &f32 = t2w_alloc_f32(hidden * 2, "flow-final-ada\0" as &const byte);
+    const c_silu: &f32 = t2w_alloc_f32(hidden, "flow-final-c-silu\0" as &const byte);
+    const normed: &f32 = t2w_alloc_f32(token_count * hidden, "flow-final-norm\0" as &const byte);
+    const modded: &f32 = t2w_alloc_f32(token_count * hidden, "flow-final-modded\0" as &const byte);
+    if ada == null || c_silu == null || normed == null || modded == null {
+        if ada != null { free(ada as &void); }
+        if c_silu != null { free(c_silu as &void); }
+        if normed != null { free(normed as &void); }
+        if modded != null { free(modded as &void); }
+        return false;
+    }
+    var i: usize = 0;
+    while i < hidden { c_silu[i] = silu(c_embed[i]); i = i + 1; }
+    t2w_linear_vec(ada, c_silu as &const f32, hidden, hidden * 2, weights.final_ada_weight, weights.final_ada_bias);
+    t2w_layer_norm_seq(normed, states, token_count, hidden, T2W_FLOW_NORM_EPS);
+    t2w_modulate_seq(modded, normed as &const f32, token_count, hidden, ada as &const f32, &ada[hidden] as &const f32);
+    t2w_linear_seq(dst, modded as &const f32, token_count, hidden, T2W_FLOW_MEL, weights.final_linear_weight, weights.final_linear_bias);
+    free(ada as &void);
+    free(c_silu as &void);
+    free(normed as &void);
+    free(modded as &void);
+    return true;
+}
+
+fn t2w_build_surrogate_mu(mu: &f32, tokens: &const u32, token_count: usize, extra: &T2WFlowExtraWeights, up_rate: usize) bool {
+    const hidden: usize = T2W_FLOW_HIDDEN;
+    const emb: &f32 = t2w_alloc_f32(hidden, "flow-emb\0" as &const byte);
+    const proj: &f32 = t2w_alloc_f32(T2W_FLOW_MEL, "flow-proj\0" as &const byte);
+    if emb == null || proj == null {
+        if emb != null { free(emb as &void); }
+        if proj != null { free(proj as &void); }
+        return false;
+    }
+    var token: usize = 0;
+    while token < token_count {
+        if !t2w_copy_embedding_row(emb, extra.input_embedding, tokens[token], hidden, extra.input_embedding.shape[1] as usize) {
+            free(emb as &void);
+            free(proj as &void);
+            return false;
+        }
+        t2w_linear_vec(proj, emb as &const f32, hidden, T2W_FLOW_MEL, extra.encoder_proj_weight, extra.encoder_proj_bias);
+        var rep: usize = 0;
+        while rep < up_rate {
+            var i: usize = 0;
+            while i < T2W_FLOW_MEL {
+                mu[(token * up_rate + rep) * T2W_FLOW_MEL + i] = proj[i];
+                i = i + 1;
+            }
+            rep = rep + 1;
+        }
+        token = token + 1;
+    }
+    free(emb as &void);
+    free(proj as &void);
+    return true;
+}
+
+fn t2w_fill_deterministic_noise(dst: &f32, count: usize, temperature: f32) void {
+    var seed: u32 = 42;
+    var i: usize = 0;
+    while i < count {
+        seed = seed * (1664525 as u32) + (1013904223 as u32);
+        const u1: f32 = (((seed & (16777215 as u32)) + (1 as u32)) as f32) / (16777217.0 as f32);
+        seed = seed * (1664525 as u32) + (1013904223 as u32);
+        const u2: f32 = (((seed & (16777215 as u32)) + (1 as u32)) as f32) / (16777217.0 as f32);
+        const r: f32 = sqrtf((0.0 as f32) - (2.0 as f32) * logf(u1));
+        const theta: f32 = (2.0 * T2W_FLOW_PI) * u2;
+        dst[i] = temperature * r * cosf(theta);
+        i = i + 1;
+    }
+}
+
+fn t2w_flow_probe_usage() void {
+    _ = printf("usage: minicpm-o-uya token2wav-flow-probe <flow_matching.gguf> <flow_extra.gguf> <prompt_cache.gguf> <audio_tokens_chunk.txt>\n");
+    _ = printf("  [--token-limit N] [--block-limit N] [--n-timesteps N] [--zero-mu|--embed-mu]\n");
+}
+
+export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
+    if argc < 6 { t2w_flow_probe_usage(); return 1; }
+    const flow_matching_path: &const byte = argv[2] as &const byte;
+    const flow_extra_path: &const byte = argv[3] as &const byte;
+    const prompt_cache_path: &const byte = argv[4] as &const byte;
+    const tokens_path: &const byte = argv[5] as &const byte;
+    var probe: T2WFlowProbeConfig = t2w_flow_probe_config_init();
+    var i: i32 = 6;
+    while i < argc {
+        if strcmp(argv[i] as *const byte, "--token-limit\0" as *const byte) == 0 {
+            var pos0: usize = 0;
+            if i + 1 >= argc || !t2w_parse_u32_ascii(argv[i + 1] as &const byte, &pos0, &probe.token_limit) { t2w_flow_probe_usage(); return 1; }
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--block-limit\0" as *const byte) == 0 {
+            var pos1: usize = 0;
+            if i + 1 >= argc || !t2w_parse_u32_ascii(argv[i + 1] as &const byte, &pos1, &probe.block_limit) { t2w_flow_probe_usage(); return 1; }
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--n-timesteps\0" as *const byte) == 0 {
+            var pos2: usize = 0;
+            if i + 1 >= argc || !t2w_parse_u32_ascii(argv[i + 1] as &const byte, &pos2, &probe.n_timesteps) { t2w_flow_probe_usage(); return 1; }
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--zero-mu\0" as *const byte) == 0 {
+            probe.zero_mu = true;
+            i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--embed-mu\0" as *const byte) == 0 {
+            probe.zero_mu = false;
+            i = i + 1;
+            continue;
+        }
+        t2w_flow_probe_usage();
+        return 1;
+    }
+    var prompt_config: T2WPromptCacheConfig = t2w_prompt_cache_config_init();
+    if !t2w_load_prompt_cache_metadata(prompt_cache_path, &prompt_config) { return 1; }
+    var prompt_table: TensorWeightTable = tensor_table_init();
+    var flow_extra_table: TensorWeightTable = tensor_table_init();
+    var flow_matching_table: TensorWeightTable = tensor_table_init();
+    if !t2w_open_table(prompt_cache_path, &prompt_table) { return 1; }
+    if !t2w_open_table(flow_extra_path, &flow_extra_table) {
+        t2w_close_table(&prompt_table);
+        return 1;
+    }
+    if !t2w_open_table(flow_matching_path, &flow_matching_table) {
+        t2w_close_table(&prompt_table);
+        t2w_close_table(&flow_extra_table);
+        return 1;
+    }
+    var extra: T2WFlowExtraWeights = t2w_flow_extra_weights_init();
+    var matching: T2WFlowMatchingWeights = t2w_flow_matching_weights_init();
+    if !t2w_flow_bind_extra_weights(&flow_extra_table, &extra) || !t2w_flow_bind_matching_weights(&flow_matching_table, &matching) {
+        t2w_close_table(&prompt_table);
+        t2w_close_table(&flow_extra_table);
+        t2w_close_table(&flow_matching_table);
+        return 1;
+    }
+    const spk_cb: &TensorView = t2w_require(&prompt_table, "prompt_cache.spk_cb\0" as &const byte, "flow probe spk_cb\0" as &const byte);
+    if spk_cb == null {
+        t2w_close_table(&prompt_table);
+        t2w_close_table(&flow_extra_table);
+        t2w_close_table(&flow_matching_table);
+        return 1;
+    }
+    var tokens: [u32: 8192] = [];
+    var token_count: usize = 0;
+    if !t2w_parse_tokens_csv(tokens_path, &tokens[0], &token_count) {
+        t2w_close_table(&prompt_table);
+        t2w_close_table(&flow_extra_table);
+        t2w_close_table(&flow_matching_table);
+        return 1;
+    }
+    if token_count == 0 {
+        _ = printf("error: token2wav flow probe got empty token file %s\n", tokens_path);
+        t2w_close_table(&prompt_table);
+        t2w_close_table(&flow_extra_table);
+        t2w_close_table(&flow_matching_table);
+        return 1;
+    }
+    var tokens_used: usize = token_count;
+    if probe.token_limit > 0 && tokens_used > probe.token_limit as usize { tokens_used = probe.token_limit as usize; }
+    var blocks_used: usize = matching.block_count as usize;
+    if probe.block_limit > 0 && blocks_used > probe.block_limit as usize { blocks_used = probe.block_limit as usize; }
+    var n_timesteps: usize = prompt_config.n_timesteps as usize;
+    if probe.n_timesteps > 0 { n_timesteps = probe.n_timesteps as usize; }
+    if n_timesteps == 0 { n_timesteps = 1; }
+    var up_rate: usize = 2;
+    if prompt_config.up_rate != 0 { up_rate = prompt_config.up_rate as usize; }
+    const mel_frames: usize = tokens_used * up_rate;
+    const temperature: f32 = t2w_bits_f32(prompt_config.temperature_bits);
+    const spk_norm: &f32 = t2w_alloc_f32(T2W_FLOW_SPK, "flow-spk-norm\0" as &const byte);
+    const spk_proj: &f32 = t2w_alloc_f32(T2W_FLOW_MEL, "flow-spk-proj\0" as &const byte);
+    const mu: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-mu\0" as &const byte);
+    const cond: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-cond\0" as &const byte);
+    const x_noise: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-noise\0" as &const byte);
+    const x_cur: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-state\0" as &const byte);
+    const x_cat: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_IN, "flow-x-cat\0" as &const byte);
+    const hidden: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_HIDDEN, "flow-hidden\0" as &const byte);
+    const t_freq: &f32 = t2w_alloc_f32(T2W_FLOW_T_EMBED, "flow-t-freq\0" as &const byte);
+    const t_embed1: &f32 = t2w_alloc_f32(T2W_FLOW_HIDDEN, "flow-t-embed1\0" as &const byte);
+    const t_embed2: &f32 = t2w_alloc_f32(T2W_FLOW_HIDDEN, "flow-t-embed2\0" as &const byte);
+    const mel_out: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-out\0" as &const byte);
+    const t_span: &f32 = t2w_alloc_f32(n_timesteps + (1 as usize), "flow-t-span\0" as &const byte);
+    if spk_norm == null || spk_proj == null || mu == null || cond == null || x_noise == null || x_cur == null || x_cat == null || hidden == null || t_freq == null || t_embed1 == null || t_embed2 == null || mel_out == null || t_span == null {
+        if spk_norm != null { free(spk_norm as &void); }
+        if spk_proj != null { free(spk_proj as &void); }
+        if mu != null { free(mu as &void); }
+        if cond != null { free(cond as &void); }
+        if x_noise != null { free(x_noise as &void); }
+        if x_cur != null { free(x_cur as &void); }
+        if x_cat != null { free(x_cat as &void); }
+        if hidden != null { free(hidden as &void); }
+        if t_freq != null { free(t_freq as &void); }
+        if t_embed1 != null { free(t_embed1 as &void); }
+        if t_embed2 != null { free(t_embed2 as &void); }
+        if mel_out != null { free(mel_out as &void); }
+        if t_span != null { free(t_span as &void); }
+        t2w_close_table(&prompt_table);
+        t2w_close_table(&flow_extra_table);
+        t2w_close_table(&flow_matching_table);
+        return 1;
+    }
+    t2w_l2_normalize(spk_norm, spk_cb.data as &const f32, T2W_FLOW_SPK, 0.000000000001 as f32);
+    t2w_linear_vec(spk_proj, spk_norm as &const f32, T2W_FLOW_SPK, T2W_FLOW_MEL, extra.spk_affine_weight, extra.spk_affine_bias);
+    var zero_i: usize = 0;
+    while zero_i < mel_frames * T2W_FLOW_MEL {
+        mu[zero_i] = 0.0;
+        cond[zero_i] = 0.0;
+        zero_i = zero_i + 1;
+    }
+    if !probe.zero_mu {
+        if !t2w_build_surrogate_mu(mu, &tokens[0] as &const u32, tokens_used, &extra, up_rate) {
+            free(spk_norm as &void); free(spk_proj as &void); free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
+            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+            return 1;
+        }
+    }
+    t2w_fill_deterministic_noise(x_noise, mel_frames * T2W_FLOW_MEL, temperature);
+    var copy_i: usize = 0;
+    while copy_i < mel_frames * T2W_FLOW_MEL { x_cur[copy_i] = x_noise[copy_i]; copy_i = copy_i + 1; }
+    t2w_build_cosine_t_span(t_span, n_timesteps);
+    var step: usize = 0;
+    while step < n_timesteps {
+        var frame: usize = 0;
+        while frame < mel_frames {
+            var ch: usize = 0;
+            while ch < T2W_FLOW_MEL {
+                x_cat[frame * T2W_FLOW_IN + ch] = x_cur[frame * T2W_FLOW_MEL + ch];
+                x_cat[frame * T2W_FLOW_IN + T2W_FLOW_MEL + ch] = mu[frame * T2W_FLOW_MEL + ch];
+                x_cat[frame * T2W_FLOW_IN + T2W_FLOW_MEL * 2 + ch] = spk_proj[ch];
+                x_cat[frame * T2W_FLOW_IN + T2W_FLOW_MEL * 3 + ch] = cond[frame * T2W_FLOW_MEL + ch];
+                ch = ch + 1;
+            }
+            frame = frame + 1;
+        }
+        t2w_timestep_embedding(t_freq, T2W_FLOW_T_EMBED, t_span[step]);
+        t2w_linear_vec(t_embed1, t_freq as &const f32, T2W_FLOW_T_EMBED, T2W_FLOW_HIDDEN, matching.t_embed1_weight, matching.t_embed1_bias);
+        var ti: usize = 0;
+        while ti < T2W_FLOW_HIDDEN { t_embed1[ti] = silu(t_embed1[ti]); ti = ti + 1; }
+        t2w_linear_vec(t_embed2, t_embed1 as &const f32, T2W_FLOW_HIDDEN, T2W_FLOW_HIDDEN, matching.t_embed2_weight, matching.t_embed2_bias);
+        t2w_linear_seq(hidden, x_cat as &const f32, mel_frames, T2W_FLOW_IN, T2W_FLOW_HIDDEN, matching.in_proj_weight, matching.in_proj_bias);
+        var block_index: usize = 0;
+        while block_index < blocks_used {
+            if !t2w_flow_block_forward(hidden, mel_frames, t_embed2 as &const f32, &matching.blocks[block_index]) {
+                free(spk_norm as &void); free(spk_proj as &void); free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
+                t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+                return 1;
+            }
+            block_index = block_index + 1;
+        }
+        if !t2w_flow_final_forward(mel_out, hidden as &const f32, mel_frames, t_embed2 as &const f32, &matching) {
+            free(spk_norm as &void); free(spk_proj as &void); free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
+            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+            return 1;
+        }
+        const dt: f32 = t_span[step + 1] - t_span[step];
+        var mel_index: usize = 0;
+        while mel_index < mel_frames * T2W_FLOW_MEL {
+            x_cur[mel_index] = x_cur[mel_index] + mel_out[mel_index] * dt;
+            mel_index = mel_index + 1;
+        }
+        step = step + 1;
+    }
+    var mode: &const byte = "embed-mu\0" as &const byte;
+    if probe.zero_mu { mode = "zero-mu\0" as &const byte; }
+    var out1: f32 = 0.0;
+    var out2: f32 = 0.0;
+    if mel_frames * T2W_FLOW_MEL > 1 { out1 = x_cur[1]; }
+    if mel_frames * T2W_FLOW_MEL > 2 { out2 = x_cur[2]; }
+    _ = printf("token2wav flow probe: mode=%s tokens_total=%zu tokens_used=%zu blocks=%zu/%u mel_frames=%zu n_timesteps=%zu temperature_bits=0x%x\n", mode, token_count, tokens_used, blocks_used, matching.block_count, mel_frames, n_timesteps, prompt_config.temperature_bits);
+    _ = printf("token2wav flow probe: up_rate=%u pre_lookahead=%u cfg_rate=0.0 checksum_spk=0x%x checksum_mu=0x%x checksum_noise=0x%x checksum_out=0x%x\n", prompt_config.up_rate, prompt_config.pre_lookahead, t2w_checksum_f32(spk_proj as &const f32, T2W_FLOW_MEL), t2w_checksum_f32(mu as &const f32, mel_frames * T2W_FLOW_MEL), t2w_checksum_f32(x_noise as &const f32, mel_frames * T2W_FLOW_MEL), t2w_checksum_f32(x_cur as &const f32, mel_frames * T2W_FLOW_MEL));
+    _ = printf("token2wav flow probe: t_span[0]=%.6f t_span[last]=%.6f out0=%.6f out1=%.6f out2=%.6f\n", t_span[0], t_span[n_timesteps], x_cur[0], out1, out2);
+    _ = printf("token2wav flow probe: PASS\n");
+    free(spk_norm as &void);
+    free(spk_proj as &void);
+    free(mu as &void);
+    free(cond as &void);
+    free(x_noise as &void);
+    free(x_cur as &void);
+    free(x_cat as &void);
+    free(hidden as &void);
+    free(t_freq as &void);
+    free(t_embed1 as &void);
+    free(t_embed2 as &void);
+    free(mel_out as &void);
+    free(t_span as &void);
+    t2w_close_table(&prompt_table);
+    t2w_close_table(&flow_extra_table);
+    t2w_close_table(&flow_matching_table);
     return 0;
 }

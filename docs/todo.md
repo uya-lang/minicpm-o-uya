@@ -523,6 +523,10 @@
   - [x] 新增 `token2wav-prompt-cache-probe`，可读取 `prompt_cache.gguf` metadata 与 cache tensor checksum。
   - [x] 新增 `token2wav-window-probe`，可按 `chunk_total=28` / `chunk_main=25` / `pre_lookahead=3` 打印真实 token 窗口计划。
 - [ ] 实现 token2mel/flow matching 推理图需要的 attention、conv、norm、sampling/noise schedule。
+  - [x] `flow_matching` bind 已补齐 `bias/q_norm.bias/conv bias/mlp bias/final bias` 等张量校验，不再只检查主 weight。
+  - [x] 新增 `token2wav-flow-probe` / `make token2wav-flow-probe`，可在官方 `flow_matching.gguf` + `flow_extra.gguf` + `prompt_cache.gguf` 上跑 reference `speaker affine + timestep embed + attention + conv + MLP + final linear`。
+  - [x] `token2wav-flow-probe` 当前支持 `--token-limit`、`--block-limit`、`--n-timesteps`、`--zero-mu|--embed-mu`，便于在小窗口上先验证数学链路。
+  - [ ] 当前 probe 仍使用 surrogate `mu`，还未接入 `encoder.gguf` 的真实 conformer/upsample forward。
 - [ ] 实现 hifigan2 vocoder forward，输出 24 kHz mono PCM。
 - [ ] 实现流式 WAV chunk 写入，并支持最终 concat 成完整回答 wav。
 - [ ] 支持 CPU reference 后端；GPU/多线程优化另设后续任务。

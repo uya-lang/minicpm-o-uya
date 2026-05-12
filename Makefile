@@ -5,7 +5,7 @@ RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 AUDIO2AUDIO_REAL_ENCODE_PROBE_FLAG := $(if $(MINICPM_O_REAL_ENCODE_PROBE),--encode-probe,)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind token2wav-prompt-cache-probe token2wav-window-probe tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind token2wav-prompt-cache-probe token2wav-window-probe token2wav-flow-probe tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
 
 build: build-release
 
@@ -243,6 +243,21 @@ token2wav-window-probe: build
 		exit 2; \
 	fi
 	$(OUT) token2wav-window-probe "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf/prompt_cache.gguf" "$(MINICPM_O_AUDIO_TOKENS_TXT)"
+
+token2wav-flow-probe: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_AUDIO_TOKENS_TXT)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_AUDIO_TOKENS_TXT=/path/to/audio_tokens_chunk.txt [MINICPM_O_T2W_TOKEN_LIMIT=2] [MINICPM_O_T2W_BLOCK_LIMIT=2] [MINICPM_O_T2W_N_TIMESTEPS=5] [MINICPM_O_T2W_ZERO_MU=1] make token2wav-flow-probe"; \
+		exit 2; \
+	fi
+	$(OUT) token2wav-flow-probe \
+		"$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf/flow_matching.gguf" \
+		"$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf/flow_extra.gguf" \
+		"$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf/prompt_cache.gguf" \
+		"$(MINICPM_O_AUDIO_TOKENS_TXT)" \
+		--token-limit "$${MINICPM_O_T2W_TOKEN_LIMIT:-2}" \
+		--block-limit "$${MINICPM_O_T2W_BLOCK_LIMIT:-2}" \
+		--n-timesteps "$${MINICPM_O_T2W_N_TIMESTEPS:-5}" \
+		$$(if [ "$${MINICPM_O_T2W_ZERO_MU:-0}" = "1" ]; then printf '%s' --zero-mu; else printf '%s' --embed-mu; fi)
 
 tts-condition-probe: build
 	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_TTS_TOKEN_IDS)" ] || [ -z "$(MINICPM_O_TTS_HIDDEN_BIN)" ]; then \

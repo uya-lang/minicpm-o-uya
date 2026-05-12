@@ -62,6 +62,7 @@ Generated files:
 - `tts-token-align` is manual and wraps the simplex probe with per-chunk `count`, `prefix_match`, and `exact` summaries against a reference `tts_wav` directory. It supports non-strict exploratory comparison and strict exact mode for future seeded baselines.
 - `token2wav-prompt-cache-probe` is manual and validates prompt-cache metadata plus cache tensor checksums from the official `prompt_cache.gguf`.
 - `token2wav-window-probe` is manual and prints the `chunk_total=28`, `chunk_main=25`, `pre_lookahead=3` feed schedule for a real `audio_tokens_chunk.txt`.
+- `token2wav-flow-probe` is manual and runs a lightweight reference `flow_matching` forward on official `flow_matching.gguf` and `flow_extra.gguf`, using prompt-cache speaker embedding plus a truncated token window. It is intentionally a probe, not yet the full conformer-token2mel path.
 - `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
 - `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.
 - `audio2audio-fixture` for PCM/mel audio input through audio encoder, speech decoder, vocoder, and WAV output.

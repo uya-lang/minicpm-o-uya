@@ -63,7 +63,7 @@ Expected success marker:
 
 ```text
 audio2audio-real: audit-only PASS files=9
-audio2audio-real: inference_supported=false next=audio-encoder-forward-and-tts-bind
+audio2audio-real: inference_supported=false next=token2wav-flow-forward-and-hifigan-forward
 ```
 
 When audio inputs are supplied, the audit additionally prints `audio2audio-real input protocol`, per-file `audio input[ref]` / `audio input[user]` summaries, sample checksum, duration, peak, and RMS. Non-16 kHz mono files fail fast with an explicit transcode/downmix diagnostic. The same check can be run with:
@@ -284,7 +284,7 @@ Current bind coverage:
 - `hifigan2.gguf`: `conv_pre.*`, `conv_post.*`, `ups.*`, `source_downs.*`, `m_source.*`, `f0_predictor.*`
 - `prompt_cache.gguf`: all 5 official cache tensors
 
-This is still bind-only coverage: no token2wav / flow / HiFiGAN forward math is claimed yet.
+This is still not a waveform generator yet, but it is no longer only bind-side inventory. `token2wav-flow-probe` now runs a lightweight reference `flow_matching` forward on official `flow_matching.gguf` and `flow_extra.gguf`, using prompt-cache `spk_cb`, cosine timestep schedule, and a truncated token window. The current probe still uses surrogate `mu` (`embed-mu` or `zero-mu`) instead of the real `encoder.gguf` conformer output.
 
 Uya now also has two prompt-cache-side probes that prepare the next forward step:
 
@@ -295,6 +295,13 @@ build/minicpm-o-uya token2wav-prompt-cache-probe \
 build/minicpm-o-uya token2wav-window-probe \
   models/MiniCPM-o-4_5-gguf/token2wav-gguf/prompt_cache.gguf \
   llama.cpp-omni/tools/omni/output/round_000/tts_wav/audio_tokens_chunk_0.txt
+
+build/minicpm-o-uya token2wav-flow-probe \
+  models/MiniCPM-o-4_5-gguf/token2wav-gguf/flow_matching.gguf \
+  models/MiniCPM-o-4_5-gguf/token2wav-gguf/flow_extra.gguf \
+  models/MiniCPM-o-4_5-gguf/token2wav-gguf/prompt_cache.gguf \
+  llama.cpp-omni/tools/omni/output/round_000/tts_wav/audio_tokens_chunk_0.txt \
+  --token-limit 2 --block-limit 2 --n-timesteps 3 --embed-mu
 ```
 
 Current `prompt_cache` probe reports:
@@ -314,15 +321,23 @@ Current `window` probe reports the actual `28/25` streaming calls, for example o
 - `window[1]`: `start=25 end=53`
 - `window[2]`: final tail `start=50 end=61`
 
+Current `flow` probe reports:
+
+- truncated token/window size used for the probe
+- truncated block count used for the probe
+- prompt-cache-derived `temperature_bits`, `up_rate`, and `pre_lookahead`
+- checksums for projected speaker vector, surrogate `mu`, initial noise, and final output
+- `t_span[0]` and `t_span[last]` for the cosine schedule
+
 ## Current Uya Status
 
-`audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, or `--test-prefix prefix --count N` for the llama.cpp-omni convention where `0000` is reference voice and `0001..` are user turns. The next implementation layer is to run the official audio encoder forward and bind the remaining TTS/token2wav tensor families discovered by audit:
+`audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, or `--test-prefix prefix --count N` for the llama.cpp-omni convention where `0000` is reference voice and `0001..` are user turns. The next implementation layer is to replace the current surrogate `mu` flow probe with real `encoder.gguf -> mu` and then wire HiFiGAN2:
 
 - Audio encoder: bind complete, and `audio-real-encode-probe` now runs correctness-first `conv + transformer + projector + pool` forward for short real clips; it is still too slow for practical long-turn inference.
 - TTS model: bind-only complete for `emb_code.*`, `emb_text.*`, decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, and `head_code.*`; `tts-condition-probe` now aligns `emb_text + projector_semantic + normalize + merge` against `llama.cpp-omni`, while decode/cache forward still pending.
 - Projector: `linear1.*`, `linear2.*`
 - Token2wav encoder: bind-only complete for `after_norm.*`, `embed.*`, `encoders.*`, `pre_lookahead_layer.*`, `up_embed.*`, `up_encoders.*`, and `up_layer.*`
-- Flow matching: bind-only complete for `estimator.in_proj.*`, `estimator.t_embedder.*`, `estimator.blocks.*`, and `estimator.final_layer.*`
+- Flow matching: bind complete for `estimator.in_proj.*`, `estimator.t_embedder.*`, `estimator.blocks.*`, and `estimator.final_layer.*`; `token2wav-flow-probe` now runs reference `speaker affine + timestep embed + DiT/CFM` math on official weights, but still with surrogate `mu`
 - Flow extra: bind-only complete for `input_embedding.*`, `encoder_proj.*`, and `spk_embed_affine_layer.*`
 - HiFiGAN2: bind-only complete for `conv_pre.*`, `conv_post.*`, `ups.*`, `source_downs.*`, `m_source.*`, and `f0_predictor.*`
 - Prompt cache: bind-only complete for all 5 official `prompt_cache.*` tensors

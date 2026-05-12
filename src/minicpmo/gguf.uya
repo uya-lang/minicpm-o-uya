@@ -1597,10 +1597,10 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
     } }
     if audit_only {
         _ = printf("audio2audio-real: audit-only PASS files=9\n");
-        _ = printf("audio2audio-real: inference_supported=false next=audio-encoder-forward-and-tts-bind\n");
+        _ = printf("audio2audio-real: inference_supported=false next=token2wav-flow-forward-and-hifigan-forward\n");
         return 0;
     }
     _ = printf("error: audio2audio-real inference is not implemented yet; use --audit-only to validate bundle and input protocol\n");
-    _ = printf("audio2audio-real: inference_supported=false next=bind-audio-encoder-forward\n");
+    _ = printf("audio2audio-real: inference_supported=false next=token2wav-flow-forward-and-hifigan-forward\n");
     return 1;
 }
