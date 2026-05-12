@@ -271,7 +271,7 @@ export fn vocoder_decode_tokens(config: &VocoderConfig, weights: &VocoderWeights
     return true;
 }
 
-fn speech_waveform_analyze(waveform: &SpeechWaveform) bool {
+export fn speech_waveform_analyze(waveform: &SpeechWaveform) bool {
     if waveform.sample_count == 0 { return false; }
     var sum_squares: f32 = 0.0 as f32;
     waveform.peak = 0.0 as f32;
@@ -309,7 +309,7 @@ fn speech_put_ascii4(buffer: &byte, offset: usize, a: byte, b: byte, c: byte, d:
     buffer[offset] = a; buffer[offset + 1] = b; buffer[offset + 2] = c; buffer[offset + 3] = d;
 }
 
-fn speech_wav_write(path: &const byte, waveform: &SpeechWaveform) bool {
+export fn speech_wav_write(path: &const byte, waveform: &SpeechWaveform) bool {
     const file: &FILE = fopen(path, "wb\0" as &const byte);
     if file == null { _ = printf("error: cannot open wav path=%s\n", path); return false; }
     const data_bytes: u32 = (waveform.sample_count as u32) * 2;
@@ -344,14 +344,14 @@ fn speech_wav_write(path: &const byte, waveform: &SpeechWaveform) bool {
     return fclose(file) == 0;
 }
 
-fn speech_checksum_u32(values: &const u32, count: usize) u32 {
+export fn speech_checksum_u32(values: &const u32, count: usize) u32 {
     var hash: u32 = 2166136261;
     var value_index: usize = 0;
     while value_index < count { hash = (hash ^ values[value_index]) * 16777619; value_index = value_index + 1; }
     return hash;
 }
 
-fn speech_checksum_waveform(waveform: &SpeechWaveform) u32 {
+export fn speech_checksum_waveform(waveform: &SpeechWaveform) u32 {
     var hash: u32 = 2166136261;
     var sample_index: usize = 0;
     while sample_index < waveform.sample_count {

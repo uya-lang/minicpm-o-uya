@@ -54,6 +54,7 @@ Generated files:
 - `vision-fixture` for raw image tensor smoke, RGB preprocessing, image/video manifest handling, tile counts, and checksum stability.
 - `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
 - `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.
+- `audio2audio-fixture` for PCM/mel audio input through audio encoder, speech decoder, vocoder, and WAV output.
 - `omni-fixture` for mixed manifest parsing, placeholder spans, media embedding counts, and prompt compilation.
 - `omni-chat-fixture` for blocking text and manifest turns, context preservation, and explicit unsupported speech output diagnostics.
 - `stream-chat-fixture` for stream queue, audio ring buffer, partial callbacks, backpressure, interrupt, and pending speech cleanup diagnostics.
@@ -75,6 +76,8 @@ Generation smoke coverage uses the deterministic tiny Qwen3-like fixture to vali
 Vision smoke coverage uses tiny raw image fixtures to validate patch embedding, one-block vision transformer behavior, resampler/projector binding, image embedding span injection, stable checksum `0xb5a01b45`, placeholder/span alignment, RGB resize/crop-pad/normalize checksum `0xea7fa412`, image manifest parity, video manifest frame/tile counts, and 2D position embedding interpolation.
 
 Audio smoke coverage binds the tiny conv/front-end, one transformer block, output norm, projector, and `<audio>` embedding injection path. Current checks include raw checksum `0xbca0dcc`, embedding checksum `0x625ac595`, non-zero logits diff, PCM preprocessing, and clear missing-branch errors.
+
+Audio-to-audio smoke coverage runs `audio2audio-smoke` from `UYAP` PCM input through mel preprocessing, audio encoder, Qwen prompt prefill, speech token generation, vocoder decode, and WAV writing. It validates the audio-conditioned logits differ from text-only logits, writes a RIFF/WAVE file, and checks sample rate/data bytes.
 
 Speech smoke coverage validates prompt-to-token setup, deterministic decoder features, vocoder sample generation, optional WAV writing, and unsupported/missing speech tensor diagnostics without claiming natural audio quality.
 
@@ -121,6 +124,7 @@ build/minicpm-o-uya tensors "$MINICPM_O_GGUF" --mmap
 build/minicpm-o-uya qwen3-bind "$MINICPM_O_TEXT_GGUF"
 build/minicpm-o-uya vision-smoke "$MINICPM_O_GGUF" "$MINICPM_O_IMAGE_RAW"
 build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
+build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_TEXT_GGUF" --n-prompt 512 --n-gen 128 --repetitions 5 --threads 28

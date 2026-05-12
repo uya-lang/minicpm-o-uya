@@ -4,7 +4,7 @@ OUT := build/minicpm-o-uya
 RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit clean FORCE
 
 build: build-release
 
@@ -20,7 +20,7 @@ build-release:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -167,6 +167,17 @@ speech-fixture: FORCE build fixtures
 	grep -q "speech waveform: samples=64 sample_rate=24000 rms=0.320025 peak=0.377256 range=\[0.203898,0.377256\] checksum=0x9f956c35" /tmp/minicpm-o-uya-speech.out
 	grep -q "speech wav: path=/tmp/minicpm-o-uya-speech.wav bytes=172" /tmp/minicpm-o-uya-speech.out
 	python3 -c 'from pathlib import Path; b=Path("/tmp/minicpm-o-uya-speech.wav").read_bytes(); assert len(b)==172 and b[:4]==b"RIFF" and b[8:12]==b"WAVE" and int.from_bytes(b[24:28],"little")==24000 and int.from_bytes(b[40:44],"little")==128'
+
+audio2audio-fixture: FORCE build fixtures
+	$(OUT) audio2audio-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_audio.pcm /tmp/minicpm-o-uya-audio2audio.wav >/tmp/minicpm-o-uya-audio2audio.out
+	grep -q "audio2audio-smoke: PASS" /tmp/minicpm-o-uya-audio2audio.out
+	grep -q "audio2audio input: source=uyap-pcm input_frames=7 frames=1 mel_bins=4" /tmp/minicpm-o-uya-audio2audio.out
+	grep -q "audio2audio audio: placeholders=1 span=1 embedding_checksum=" /tmp/minicpm-o-uya-audio2audio.out
+	grep -q "diff_l1=" /tmp/minicpm-o-uya-audio2audio.out
+	grep -q "audio2audio speech: prompt_tokens=4 generated=4" /tmp/minicpm-o-uya-audio2audio.out
+	grep -q "audio2audio waveform: samples=64 sample_rate=24000" /tmp/minicpm-o-uya-audio2audio.out
+	grep -q "audio2audio wav: path=/tmp/minicpm-o-uya-audio2audio.wav bytes=172" /tmp/minicpm-o-uya-audio2audio.out
+	python3 -c 'from pathlib import Path; b=Path("/tmp/minicpm-o-uya-audio2audio.wav").read_bytes(); assert len(b)==172 and b[:4]==b"RIFF" and b[8:12]==b"WAVE" and int.from_bytes(b[24:28],"little")==24000 and int.from_bytes(b[40:44],"little")==128'
 
 minicpmo-audit: build
 	@if [ -z "$(MINICPM_O_GGUF)" ]; then \

@@ -48,6 +48,7 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `vision-preprocess-smoke <model.gguf> <image.rgb\|manifest>` | RGB/manifest preprocessing smoke | `UYRG`, `UYIM`, `UYVM`; no PNG/JPEG/MP4 decoding |
 | `audio-smoke <model.gguf> <audio.raw>` | Audio encoder smoke | `UYAM` log-mel F32 input |
 | `audio-preprocess-smoke <audio.pcm>` | PCM to tiny log-mel preprocessing smoke | `UYAP` PCM fixture input |
+| `audio2audio-smoke <model.gguf> <audio.pcm\|audio.raw> [out.wav]` | Audio input to WAV smoke | PCM/mel -> audio encoder -> speech/vocoder WAV |
 | `speech-smoke <model.gguf> <prompt> [out.wav]` | Speech/vocoder smoke | Deterministic tiny WAV output only |
 | `omni-smoke <model.gguf> <manifest.json>` | Compile mixed text/image/audio/speech manifest | Fixed test JSON schema |
 | `omni-chat <model.gguf>` | Blocking omni REPL | Text and manifest turns; speech output is queued/diagnosed, not full duplex |
@@ -81,7 +82,7 @@ Sampler arguments accepted by `generate` are validated by the tiny sampler path;
 | Image manifest | `UYIM` | `vision-preprocess-smoke` | Embedded `UYRG` images, tile metadata |
 | Video manifest | `UYVM` | `vision-preprocess-smoke` | Embedded `UYRG` frames; no video codec decoding |
 | Log-mel audio | `UYAM` | `audio-smoke` | Little-endian F32 mel bins |
-| PCM audio | `UYAP` | `audio-preprocess-smoke` | Tiny PCM fixture for preprocessing smoke |
+| PCM audio | `UYAP` | `audio-preprocess-smoke`, `audio2audio-smoke` | Tiny PCM fixture for preprocessing smoke |
 | Omni JSON | JSON | `omni-smoke`, `stream-chat`, `bench` | Fixed tiny schema generated in `tests/fixtures` |
 | WAV | RIFF/WAVE | `speech-smoke` output | Deterministic tiny vocoder smoke output |
 
@@ -101,7 +102,7 @@ Sampler arguments accepted by `generate` are validated by the tiny sampler path;
 - No guarantee of full MiniCPM-o production generation for arbitrary real GGUF layouts.
 - `omni-chat` is blocking and preserves text output; speech output is reported as unsupported/queued there.
 - `stream-chat` is a deterministic queue/ring/interruption prototype, not a production full-duplex assistant.
-- `speech-smoke` writes a tiny deterministic WAV and does not claim natural vocoder quality.
+- `speech-smoke` and `audio2audio-smoke` write tiny deterministic WAVs and do not claim natural vocoder quality.
 - Unknown tensor names, missing branches, unknown dtypes, or unsupported chat templates are compatibility work items, not silent fallbacks.
 
 ## External Model Smoke
@@ -126,6 +127,7 @@ build/minicpm-o-uya tensors "$MINICPM_O_GGUF" --mmap
 build/minicpm-o-uya qwen3-bind "$MINICPM_O_TEXT_GGUF"
 build/minicpm-o-uya vision-smoke "$MINICPM_O_GGUF" "$MINICPM_O_IMAGE_RAW"
 build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
+build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_TEXT_GGUF" --n-prompt 512 --n-gen 128 --repetitions 5 --threads 28
