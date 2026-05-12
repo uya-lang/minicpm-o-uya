@@ -235,7 +235,7 @@ bench-fixture: FORCE build fixtures
 	grep -q "bench text_prompt:" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench text_decode:" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench memory: peak_estimate_bytes=" /tmp/minicpm-o-uya-bench-real.out
-	grep -q "bench optimize: hot_matvec=q8_0_parallel_c kv_cache=contiguous rope=precomputed sampler=fixed-seed" /tmp/minicpm-o-uya-bench-real.out
+	grep -q "bench optimize: hot_matvec=q8_0_uya_parallel kv_cache=contiguous rope=precomputed sampler=fixed-seed" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench reference_error: n/a mode=real-timing" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench: PASS" /tmp/minicpm-o-uya-bench-real.out
 

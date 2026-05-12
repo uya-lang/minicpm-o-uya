@@ -52,12 +52,6 @@ use minicpmo.tokenizer.tokenizer_init;
 use minicpmo.tokenizer.tokenizer_load;
 use minicpmo.tokenizer.tokenizer_piece;
 
-@c_import("qwen3_kernels.c", "-O3 -march=native -pthread", "-pthread");
-
-extern fn qwen3_q8_0_matvec_range_c(dst: &f32, matrix_data: &const byte, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) void;
-extern fn qwen3_q8_0_matvec_parallel_c(dst: &f32, matrix_data: &const byte, x: &const f32, in_dim: usize, out_dim: usize, thread_count: usize) i32;
-extern fn qwen3_q8_0_thread_pool_shutdown_c() void;
-
 const QWEN3_GGUF_MAGIC: u32 = 0x46554747;
 const QWEN3_GGUF_TYPE_UINT32: u32 = 4;
 const QWEN3_GGUF_TYPE_INT32: u32 = 5;
@@ -574,7 +568,29 @@ fn qwen3_set_thread_count(threads: u32) void {
 }
 
 fn qwen3_q8_0_matvec_range(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) void {
-    qwen3_q8_0_matvec_range_c(dst, matrix.data, x, in_dim, out_start, out_end);
+    const blocks_per_row: usize = in_dim / (32 as usize);
+    const row_bytes: usize = blocks_per_row * (34 as usize);
+    var j: usize = out_start;
+    while j < out_end {
+        const row_base: usize = j * row_bytes;
+        var sum: f32 = 0.0;
+        var block: usize = 0;
+        while block < blocks_per_row {
+            const block_base: usize = row_base + block * (34 as usize);
+            const scale_bits: u16 = qwen3_read_u16_at(matrix.data, block_base);
+            const scale: f32 = f16_load_f32(scale_bits);
+            const qs: &const i8 = &matrix.data[block_base + (2 as usize)] as &const i8;
+            const xb: &const f32 = &x[block * (32 as usize)];
+            var k: usize = 0;
+            while k < (32 as usize) {
+                sum = sum + xb[k] * scale * (qs[k] as f32);
+                k = k + 1;
+            }
+            block = block + 1;
+        }
+        dst[j] = sum;
+        j = j + 1;
+    }
 }
 
 fn qwen3_q8_0_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) bool {
@@ -612,7 +628,6 @@ fn qwen3_matvec_parallel(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: 
     if count < 2 || out_dim < (64 as usize) { return false; }
     if count > QWEN3_MAX_THREADS { count = QWEN3_MAX_THREADS; }
     if count > out_dim { count = out_dim; }
-    if q8 && qwen3_q8_0_matvec_parallel_c(dst, matrix.data, x, in_dim, out_dim, count) != 0 { return true; }
     var tasks: [Qwen3MatvecTask: 64] = [];
     var threads: [pthread_t: 64] = [];
     var launched: [bool: 64] = [];
@@ -1170,7 +1185,6 @@ fn qwen3_runtime_free(runtime: &Qwen3Runtime) void {
     if runtime.rope_cos != null { free(runtime.rope_cos as &void); }
     if runtime.rope_sin != null { free(runtime.rope_sin as &void); }
     if runtime.prompt_ids != null { free(runtime.prompt_ids as &void); }
-    qwen3_q8_0_thread_pool_shutdown_c();
     runtime[0] = qwen3_runtime_init();
 }
 
@@ -1502,7 +1516,7 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
     qwen3_bench_print_rate("text_prompt\0" as &const byte, prompt_units, prompt_micros, "tokens\0" as &const byte, bench.repetitions);
     qwen3_bench_print_rate("text_decode\0" as &const byte, decode_units, decode_micros, "tokens\0" as &const byte, bench.repetitions);
     _ = printf("bench memory: peak_estimate_bytes=%llu weights_mmap=%llu runtime=%llu kv=%llu rope=%llu prompt_ids=%llu logits=%llu\n", peak_bytes, summary_file_size, runtime_bytes, kv_layout.total_bytes, rope_bytes, prompt_bytes, logits_bytes);
-    _ = printf("bench optimize: hot_matvec=q8_0_parallel_c kv_cache=contiguous rope=precomputed sampler=fixed-seed\n");
+    _ = printf("bench optimize: hot_matvec=q8_0_uya_parallel kv_cache=contiguous rope=precomputed sampler=fixed-seed\n");
     _ = printf("bench reference_error: n/a mode=real-timing\n");
     _ = printf("bench: PASS\n");
     return 0;
