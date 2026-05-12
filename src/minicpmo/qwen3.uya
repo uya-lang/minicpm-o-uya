@@ -332,6 +332,35 @@ fn qwen3_dtype_supported(dtype: TensorDType) bool {
     return false;
 }
 
+fn qwen3_dtype_runtime_matvec_supported(dtype: TensorDType) bool {
+    if dtype == TensorDType.F32 || dtype == TensorDType.F16 || dtype == TensorDType.BF16 || dtype == TensorDType.Q8_0 { return true; }
+    return false;
+}
+
+fn qwen3_check_runtime_tensor_dtype(view: &TensorView, role: &const byte, layer: u32) bool {
+    if qwen3_dtype_runtime_matvec_supported(view.dtype) { return true; }
+    _ = printf("error: qwen3 runtime layer=%u tensor=%s role=%s dtype=%s parsed=true matvec=false candidate=implement real GGML K-quant dot before text generation\n", layer, &view.name[0], role, tensor_dtype_name(view.dtype));
+    return false;
+}
+
+fn qwen3_validate_runtime_matvec_dtypes(weights: &Qwen3Weights) bool {
+    if !qwen3_check_runtime_tensor_dtype(weights.token_embedding, "token_embedding\0" as &const byte, 0) { return false; }
+    if !qwen3_check_runtime_tensor_dtype(weights.output, "lm_head\0" as &const byte, weights.layer_count) { return false; }
+    var layer: u32 = 0;
+    while layer < weights.layer_count {
+        const lw: &Qwen3LayerWeights = &weights.layers[layer as usize];
+        if !qwen3_check_runtime_tensor_dtype(lw.q_proj, "attn_q\0" as &const byte, layer) { return false; }
+        if !qwen3_check_runtime_tensor_dtype(lw.k_proj, "attn_k\0" as &const byte, layer) { return false; }
+        if !qwen3_check_runtime_tensor_dtype(lw.v_proj, "attn_v\0" as &const byte, layer) { return false; }
+        if !qwen3_check_runtime_tensor_dtype(lw.o_proj, "attn_o\0" as &const byte, layer) { return false; }
+        if !qwen3_check_runtime_tensor_dtype(lw.gate_proj, "ffn_gate\0" as &const byte, layer) { return false; }
+        if !qwen3_check_runtime_tensor_dtype(lw.up_proj, "ffn_up\0" as &const byte, layer) { return false; }
+        if !qwen3_check_runtime_tensor_dtype(lw.down_proj, "ffn_down\0" as &const byte, layer) { return false; }
+        layer = layer + 1;
+    }
+    return true;
+}
+
 fn qwen3_print_shape(view: &TensorView) void {
     _ = printf("[");
     var i: u32 = 0;
@@ -1386,6 +1415,7 @@ fn qwen3_open_runtime(path: &const byte, config: &Qwen3Config, table: &TensorWei
     if !tensor_weight_table_attach_mmap(path, table) { return false; }
     weights[0] = qwen3_weights_init();
     if !qwen3_bind_weights(table, config, weights) { tensor_weight_table_detach_mmap(table); return false; }
+    if !qwen3_validate_runtime_matvec_dtypes(weights) { tensor_weight_table_detach_mmap(table); return false; }
     tok[0] = tokenizer_init();
     if !tokenizer_load(path, tok) { tensor_weight_table_detach_mmap(table); return false; }
     runtime[0] = qwen3_runtime_init();

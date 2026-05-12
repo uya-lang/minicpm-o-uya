@@ -440,6 +440,7 @@
 - [x] 将 Qwen3 forward 上限从 tiny/smoke cap 提升到 MiniCPM-o 4.5 需要的实际尺寸：`hidden=4096`、`layers=36`、`ffn=12288`、`vocab≈151748`、`ctx>=4096`。
 - [x] 把大数组从栈上固定数组迁移到 heap/scratch arena，避免 8B 模型运行时栈爆。
 - [ ] 实现/验证 Q4_K、Q5_K、Q6_K、Q8_K、IQ 系列在真实 matvec 中可用，而不只是 parser/byte-size 可识别。
+  - [x] 运行时区分 parser 支持和 matvec 支持；真实 Q4_K/Q6_K 模型会明确报 `parsed=true matvec=false`，避免静默错误输出。
 - [ ] 支持 Qwen3/MiniCPM-o 4.5 的 rope、q/k norm、GQA、KV cache layout 和 chat template。
 - [ ] 支持 prompt prefill 分块、decode step、sampler、stop token、hidden state capture。
 - [ ] 增加 text-only 对齐用例：同一 prompt 下与 llama.cpp top-k logits 或 token 序列对照。

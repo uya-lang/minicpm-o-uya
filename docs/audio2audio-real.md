@@ -47,6 +47,7 @@ Each file audit also prints a compact inventory with tensor count, dtype distrib
 Audit diagnostics include candidate next actions for unknown dtype, unclassified tensor prefixes, and key alias shape mismatches. The current shape sanity checks cover representative official MiniCPM-o 4.5 audio, TTS, projector, token2wav, HiFiGAN2, and prompt-cache tensors. A shape mismatch is treated as unsupported until the alias table or expected shape is updated.
 
 The Qwen3 text path now accepts the MiniCPM-o 4.5 text dimensions used by `MiniCPM-o-4_5-Q4_K_M.gguf`: `hidden=4096`, `layers=36`, `ffn=12288`, `ctx>=4096`, and `vocab=151748`. Large forward workspaces and logits buffers are heap-backed rather than fixed stack arrays.
+Runtime text generation intentionally rejects parsed-but-not-yet-executable K-quant tensors such as Q4_K until real GGML K-quant dot kernels are implemented; the diagnostic includes `parsed=true matvec=false`.
 
 ## Required GGUF Files
 
