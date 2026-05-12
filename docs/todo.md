@@ -440,14 +440,21 @@
 - [x] 将 Qwen3 forward 上限从 tiny/smoke cap 提升到 MiniCPM-o 4.5 需要的实际尺寸：`hidden=4096`、`layers=36`、`ffn=12288`、`vocab≈151748`、`ctx>=4096`。
 - [x] 把大数组从栈上固定数组迁移到 heap/scratch arena，避免 8B 模型运行时栈爆。
 - [ ] 实现/验证 Q4_K、Q5_K、Q6_K、Q8_K、IQ 系列在真实 matvec 中可用，而不只是 parser/byte-size 可识别。
-  - [x] 运行时区分 parser 支持和 matvec 支持；真实 Q4_K/Q6_K 模型会明确报 `parsed=true matvec=false`，避免静默错误输出。
+  - [x] 运行时区分 parser 支持和 matvec 支持，避免静默错误输出。
+  - [x] 实现 GGML 布局的 Q4_K/Q5_K/Q6_K fused matvec，并覆盖 Q4_K/Q5_K/Q6_K token embedding 行反量化。
+  - [x] 官方 `MiniCPM-o-4_5-Q4_K_M.gguf` 可执行 text-only `generate --max-new-tokens 1`。
+  - [ ] 补 Q8_K、IQ 系列真实 matvec，或在官方路径确认未命中时保留显式 unsupported。
 - [ ] 支持 Qwen3/MiniCPM-o 4.5 的 rope、q/k norm、GQA、KV cache layout 和 chat template。
+  - [x] 当前 forward 已包含 q/k norm、GQA 维度、KV cache 和预计算 RoPE 的基本执行路径，能跑官方模型 smoke。
+  - [ ] 与 llama.cpp 对齐 RoPE scaling/chat template/stop token 细节。
 - [ ] 支持 prompt prefill 分块、decode step、sampler、stop token、hidden state capture。
+  - [x] text-only prompt prefill、decode step、sampler 和 stop token smoke 可执行。
+  - [ ] 为 audio-to-audio 接出 LLM hidden state capture。
 - [ ] 增加 text-only 对齐用例：同一 prompt 下与 llama.cpp top-k logits 或 token 序列对照。
 
 验收标准：
 
-- Uya 能加载官方 `MiniCPM-o-4_5-Q4_K_M.gguf` 并完成 text-only prefill/decode。
+- [x] Uya 能加载官方 `MiniCPM-o-4_5-Q4_K_M.gguf` 并完成 text-only prefill/decode smoke。
 - 同一 text prompt 下，Uya 与 llama.cpp 的前若干 token 或 top-k logits 在可解释误差内。
 - 运行时内存分配、KV cache bytes、load time、prefill/decode tokens/s 可观测。
 

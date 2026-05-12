@@ -117,7 +117,7 @@ struct Qwen3MatvecTask {
     in_dim: usize,
     out_start: usize,
     out_end: usize,
-    q8: bool,
+    dtype: TensorDType,
 }
 
 struct Qwen3Runtime {
@@ -333,7 +333,8 @@ fn qwen3_dtype_supported(dtype: TensorDType) bool {
 }
 
 fn qwen3_dtype_runtime_matvec_supported(dtype: TensorDType) bool {
-    if dtype == TensorDType.F32 || dtype == TensorDType.F16 || dtype == TensorDType.BF16 || dtype == TensorDType.Q8_0 { return true; }
+    if dtype == TensorDType.F32 || dtype == TensorDType.F16 || dtype == TensorDType.BF16 { return true; }
+    if dtype == TensorDType.Q8_0 || dtype == TensorDType.Q4_K || dtype == TensorDType.Q5_K || dtype == TensorDType.Q6_K { return true; }
     return false;
 }
 
@@ -550,6 +551,297 @@ export fn qwen3_tensor_get(view: &TensorView, index: usize) f32 {
     return 0.0 as f32;
 }
 
+
+fn qwen3_q4_k_scale_min(j: i32, scales: &const byte, scale: &u8, minv: &u8) void {
+    if j < 4 {
+        scale[0] = scales[j as usize] & (63 as byte);
+        minv[0] = scales[(j + 4) as usize] & (63 as byte);
+    } else {
+        scale[0] = (scales[(j + 4) as usize] & (15 as byte)) | ((scales[(j - 4) as usize] >> 6) << 4);
+        minv[0] = (scales[(j + 4) as usize] >> 4) | ((scales[j as usize] >> 6) << 4);
+    }
+}
+
+fn qwen3_q4_k_dot_row(matrix: &TensorView, row: usize, x: &const f32, in_dim: usize) f32 {
+    const qk: usize = 256;
+    const block_bytes: usize = 144;
+    const blocks_per_row: usize = in_dim / qk;
+    const row_base: usize = row * blocks_per_row * block_bytes;
+    var sum: f32 = 0.0;
+    var block: usize = 0;
+    while block < blocks_per_row {
+        const base: usize = row_base + block * block_bytes;
+        const d: f32 = f16_load_f32(qwen3_read_u16_at(matrix.data, base));
+        const dmin: f32 = f16_load_f32(qwen3_read_u16_at(matrix.data, base + (2 as usize)));
+        const scales: &const byte = &matrix.data[base + (4 as usize)];
+        const qs: &const byte = &matrix.data[base + (16 as usize)];
+        const xb: &const f32 = &x[block * qk];
+        var is: i32 = 0;
+        var group: usize = 0;
+        while group < 4 {
+            var sc: u8 = 0;
+            var mn: u8 = 0;
+            qwen3_q4_k_scale_min(is, scales, &sc, &mn);
+            const d1: f32 = d * (sc as f32);
+            const m1: f32 = dmin * (mn as f32);
+            qwen3_q4_k_scale_min(is + 1, scales, &sc, &mn);
+            const d2: f32 = d * (sc as f32);
+            const m2: f32 = dmin * (mn as f32);
+            const qbase: usize = group * (32 as usize);
+            var l: usize = 0;
+            while l < (32 as usize) {
+                sum = sum + xb[group * (64 as usize) + l] * (d1 * ((qs[qbase + l] & (15 as byte)) as f32) - m1);
+                l = l + 1;
+            }
+            l = 0;
+            while l < (32 as usize) {
+                sum = sum + xb[group * (64 as usize) + (32 as usize) + l] * (d2 * ((qs[qbase + l] >> 4) as f32) - m2);
+                l = l + 1;
+            }
+            is = is + 2;
+            group = group + 1;
+        }
+        block = block + 1;
+    }
+    return sum;
+}
+
+fn qwen3_q5_k_dot_row(matrix: &TensorView, row: usize, x: &const f32, in_dim: usize) f32 {
+    const qk: usize = 256;
+    const block_bytes: usize = 176;
+    const blocks_per_row: usize = in_dim / qk;
+    const row_base: usize = row * blocks_per_row * block_bytes;
+    var sum: f32 = 0.0;
+    var block: usize = 0;
+    while block < blocks_per_row {
+        const base: usize = row_base + block * block_bytes;
+        const d: f32 = f16_load_f32(qwen3_read_u16_at(matrix.data, base));
+        const dmin: f32 = f16_load_f32(qwen3_read_u16_at(matrix.data, base + (2 as usize)));
+        const scales: &const byte = &matrix.data[base + (4 as usize)];
+        const qh: &const byte = &matrix.data[base + (16 as usize)];
+        const qs: &const byte = &matrix.data[base + (48 as usize)];
+        const xb: &const f32 = &x[block * qk];
+        var is: i32 = 0;
+        var group: usize = 0;
+        var u1: byte = 1 as byte;
+        var u2: byte = 2 as byte;
+        while group < 4 {
+            var sc: u8 = 0;
+            var mn: u8 = 0;
+            qwen3_q4_k_scale_min(is, scales, &sc, &mn);
+            const d1: f32 = d * (sc as f32);
+            const m1: f32 = dmin * (mn as f32);
+            qwen3_q4_k_scale_min(is + 1, scales, &sc, &mn);
+            const d2: f32 = d * (sc as f32);
+            const m2: f32 = dmin * (mn as f32);
+            const qbase: usize = group * (32 as usize);
+            var l: usize = 0;
+            while l < (32 as usize) {
+                var high: f32 = 0.0;
+                if (qh[l] & u1) != (0 as byte) { high = 16.0; }
+                sum = sum + xb[group * (64 as usize) + l] * (d1 * (((qs[qbase + l] & (15 as byte)) as f32) + high) - m1);
+                l = l + 1;
+            }
+            l = 0;
+            while l < (32 as usize) {
+                var high: f32 = 0.0;
+                if (qh[l] & u2) != (0 as byte) { high = 16.0; }
+                sum = sum + xb[group * (64 as usize) + (32 as usize) + l] * (d2 * (((qs[qbase + l] >> 4) as f32) + high) - m2);
+                l = l + 1;
+            }
+            is = is + 2;
+            u1 = ((u1 as u32) << 2) as byte;
+            u2 = ((u2 as u32) << 2) as byte;
+            group = group + 1;
+        }
+        block = block + 1;
+    }
+    return sum;
+}
+
+fn qwen3_q6_k_dot_row(matrix: &TensorView, row: usize, x: &const f32, in_dim: usize) f32 {
+    const qk: usize = 256;
+    const block_bytes: usize = 210;
+    const blocks_per_row: usize = in_dim / qk;
+    const row_base: usize = row * blocks_per_row * block_bytes;
+    var sum: f32 = 0.0;
+    var block: usize = 0;
+    while block < blocks_per_row {
+        const base: usize = row_base + block * block_bytes;
+        const ql: &const byte = &matrix.data[base];
+        const qh: &const byte = &matrix.data[base + (128 as usize)];
+        const sc: &const i8 = &matrix.data[base + (192 as usize)] as &const i8;
+        const d: f32 = f16_load_f32(qwen3_read_u16_at(matrix.data, base + (208 as usize)));
+        const xb: &const f32 = &x[block * qk];
+        var n: usize = 0;
+        while n < (256 as usize) {
+            var l: usize = 0;
+            while l < (32 as usize) {
+                const isv: usize = l / (16 as usize);
+                const q1: i32 = (((ql[n / (2 as usize) + l] & (15 as byte)) as i32) | ((((qh[n / (4 as usize) + l] >> 0) & (3 as byte)) as i32) << 4)) - 32;
+                const q2: i32 = (((ql[n / (2 as usize) + l + (32 as usize)] & (15 as byte)) as i32) | ((((qh[n / (4 as usize) + l] >> 2) & (3 as byte)) as i32) << 4)) - 32;
+                const q3: i32 = (((ql[n / (2 as usize) + l] >> 4) as i32) | ((((qh[n / (4 as usize) + l] >> 4) & (3 as byte)) as i32) << 4)) - 32;
+                const q4: i32 = (((ql[n / (2 as usize) + l + (32 as usize)] >> 4) as i32) | ((((qh[n / (4 as usize) + l] >> 6) & (3 as byte)) as i32) << 4)) - 32;
+                sum = sum + xb[n + l] * d * (sc[n / (16 as usize) + isv + 0] as f32) * (q1 as f32);
+                sum = sum + xb[n + (32 as usize) + l] * d * (sc[n / (16 as usize) + isv + 2] as f32) * (q2 as f32);
+                sum = sum + xb[n + (64 as usize) + l] * d * (sc[n / (16 as usize) + isv + 4] as f32) * (q3 as f32);
+                sum = sum + xb[n + (96 as usize) + l] * d * (sc[n / (16 as usize) + isv + 6] as f32) * (q4 as f32);
+                l = l + 1;
+            }
+            n = n + (128 as usize);
+        }
+        block = block + 1;
+    }
+    return sum;
+}
+
+fn qwen3_k_matvec_range(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) bool {
+    if in_dim % (256 as usize) != 0 { return false; }
+    var j: usize = out_start;
+    while j < out_end {
+        if matrix.dtype == TensorDType.Q4_K { dst[j] = qwen3_q4_k_dot_row(matrix, j, x, in_dim); }
+        else if matrix.dtype == TensorDType.Q5_K { dst[j] = qwen3_q5_k_dot_row(matrix, j, x, in_dim); }
+        else if matrix.dtype == TensorDType.Q6_K { dst[j] = qwen3_q6_k_dot_row(matrix, j, x, in_dim); }
+        else { return false; }
+        j = j + 1;
+    }
+    return true;
+}
+
+fn qwen3_q5_k_copy_row(dst: &f32, emb: &TensorView, row: usize, hidden: usize) bool {
+    if hidden % (256 as usize) != 0 { return false; }
+    const qk: usize = 256;
+    const block_bytes: usize = 176;
+    const blocks_per_row: usize = hidden / qk;
+    const row_base: usize = row * blocks_per_row * block_bytes;
+    var block: usize = 0;
+    while block < blocks_per_row {
+        const base: usize = row_base + block * block_bytes;
+        const d: f32 = f16_load_f32(qwen3_read_u16_at(emb.data, base));
+        const dmin: f32 = f16_load_f32(qwen3_read_u16_at(emb.data, base + (2 as usize)));
+        const scales: &const byte = &emb.data[base + (4 as usize)];
+        const qh: &const byte = &emb.data[base + (16 as usize)];
+        const qs: &const byte = &emb.data[base + (48 as usize)];
+        const out_base: usize = block * qk;
+        var is: i32 = 0;
+        var group: usize = 0;
+        var u1: byte = 1 as byte;
+        var u2: byte = 2 as byte;
+        while group < 4 {
+            var sc: u8 = 0;
+            var mn: u8 = 0;
+            qwen3_q4_k_scale_min(is, scales, &sc, &mn);
+            const d1: f32 = d * (sc as f32);
+            const m1: f32 = dmin * (mn as f32);
+            qwen3_q4_k_scale_min(is + 1, scales, &sc, &mn);
+            const d2: f32 = d * (sc as f32);
+            const m2: f32 = dmin * (mn as f32);
+            const qbase: usize = group * (32 as usize);
+            var l: usize = 0;
+            while l < (32 as usize) {
+                var high: f32 = 0.0;
+                if (qh[l] & u1) != (0 as byte) { high = 16.0; }
+                dst[out_base + group * (64 as usize) + l] = d1 * (((qs[qbase + l] & (15 as byte)) as f32) + high) - m1;
+                l = l + 1;
+            }
+            l = 0;
+            while l < (32 as usize) {
+                var high: f32 = 0.0;
+                if (qh[l] & u2) != (0 as byte) { high = 16.0; }
+                dst[out_base + group * (64 as usize) + (32 as usize) + l] = d2 * (((qs[qbase + l] >> 4) as f32) + high) - m2;
+                l = l + 1;
+            }
+            is = is + 2;
+            u1 = ((u1 as u32) << 2) as byte;
+            u2 = ((u2 as u32) << 2) as byte;
+            group = group + 1;
+        }
+        block = block + 1;
+    }
+    return true;
+}
+
+fn qwen3_q6_k_copy_row(dst: &f32, emb: &TensorView, row: usize, hidden: usize) bool {
+    if hidden % (256 as usize) != 0 { return false; }
+    const qk: usize = 256;
+    const block_bytes: usize = 210;
+    const blocks_per_row: usize = hidden / qk;
+    const row_base: usize = row * blocks_per_row * block_bytes;
+    var block: usize = 0;
+    while block < blocks_per_row {
+        const base: usize = row_base + block * block_bytes;
+        const ql: &const byte = &emb.data[base];
+        const qh: &const byte = &emb.data[base + (128 as usize)];
+        const sc: &const i8 = &emb.data[base + (192 as usize)] as &const i8;
+        const d: f32 = f16_load_f32(qwen3_read_u16_at(emb.data, base + (208 as usize)));
+        const out_base: usize = block * qk;
+        var n: usize = 0;
+        while n < (256 as usize) {
+            var l: usize = 0;
+            while l < (32 as usize) {
+                const isv: usize = l / (16 as usize);
+                const q1: i32 = (((ql[n / (2 as usize) + l] & (15 as byte)) as i32) | ((((qh[n / (4 as usize) + l] >> 0) & (3 as byte)) as i32) << 4)) - 32;
+                const q2: i32 = (((ql[n / (2 as usize) + l + (32 as usize)] & (15 as byte)) as i32) | ((((qh[n / (4 as usize) + l] >> 2) & (3 as byte)) as i32) << 4)) - 32;
+                const q3: i32 = (((ql[n / (2 as usize) + l] >> 4) as i32) | ((((qh[n / (4 as usize) + l] >> 4) & (3 as byte)) as i32) << 4)) - 32;
+                const q4: i32 = (((ql[n / (2 as usize) + l + (32 as usize)] >> 4) as i32) | ((((qh[n / (4 as usize) + l] >> 6) & (3 as byte)) as i32) << 4)) - 32;
+                dst[out_base + n + l] = d * (sc[n / (16 as usize) + isv + 0] as f32) * (q1 as f32);
+                dst[out_base + n + (32 as usize) + l] = d * (sc[n / (16 as usize) + isv + 2] as f32) * (q2 as f32);
+                dst[out_base + n + (64 as usize) + l] = d * (sc[n / (16 as usize) + isv + 4] as f32) * (q3 as f32);
+                dst[out_base + n + (96 as usize) + l] = d * (sc[n / (16 as usize) + isv + 6] as f32) * (q4 as f32);
+                l = l + 1;
+            }
+            n = n + (128 as usize);
+        }
+        block = block + 1;
+    }
+    return true;
+}
+
+fn qwen3_q4_k_copy_row(dst: &f32, emb: &TensorView, row: usize, hidden: usize) bool {
+    if hidden % (256 as usize) != 0 { return false; }
+    var i: usize = 0;
+    while i < hidden { dst[i] = 0.0; i = i + 1; }
+    const qk: usize = 256;
+    const block_bytes: usize = 144;
+    const blocks_per_row: usize = hidden / qk;
+    const row_base: usize = row * blocks_per_row * block_bytes;
+    var block: usize = 0;
+    while block < blocks_per_row {
+        const base: usize = row_base + block * block_bytes;
+        const d: f32 = f16_load_f32(qwen3_read_u16_at(emb.data, base));
+        const dmin: f32 = f16_load_f32(qwen3_read_u16_at(emb.data, base + (2 as usize)));
+        const scales: &const byte = &emb.data[base + (4 as usize)];
+        const qs: &const byte = &emb.data[base + (16 as usize)];
+        const out_base: usize = block * qk;
+        var is: i32 = 0;
+        var group: usize = 0;
+        while group < 4 {
+            var sc: u8 = 0;
+            var mn: u8 = 0;
+            qwen3_q4_k_scale_min(is, scales, &sc, &mn);
+            const d1: f32 = d * (sc as f32);
+            const m1: f32 = dmin * (mn as f32);
+            qwen3_q4_k_scale_min(is + 1, scales, &sc, &mn);
+            const d2: f32 = d * (sc as f32);
+            const m2: f32 = dmin * (mn as f32);
+            const qbase: usize = group * (32 as usize);
+            var l: usize = 0;
+            while l < (32 as usize) {
+                dst[out_base + group * (64 as usize) + l] = d1 * ((qs[qbase + l] & (15 as byte)) as f32) - m1;
+                l = l + 1;
+            }
+            l = 0;
+            while l < (32 as usize) {
+                dst[out_base + group * (64 as usize) + (32 as usize) + l] = d2 * ((qs[qbase + l] >> 4) as f32) - m2;
+                l = l + 1;
+            }
+            is = is + 2;
+            group = group + 1;
+        }
+        block = block + 1;
+    }
+    return true;
+}
 export fn qwen3_check_forward_caps(config: &Qwen3Config) bool {
     const q_dim: u32 = config.head_count * config.head_dim;
     const kv_dim: u32 = config.kv_head_count * config.head_dim;
@@ -565,6 +857,9 @@ export fn qwen3_check_forward_caps(config: &Qwen3Config) bool {
 
 fn qwen3_copy_embedding(dst: &f32, emb: &TensorView, token_id: u32, hidden: usize, vocab: usize) void {
     _ = vocab;
+    if emb.dtype == TensorDType.Q4_K && qwen3_q4_k_copy_row(dst, emb, token_id as usize, hidden) { return; }
+    if emb.dtype == TensorDType.Q5_K && qwen3_q5_k_copy_row(dst, emb, token_id as usize, hidden) { return; }
+    if emb.dtype == TensorDType.Q6_K && qwen3_q6_k_copy_row(dst, emb, token_id as usize, hidden) { return; }
     var i: usize = 0;
     while i < hidden {
         dst[i] = qwen3_tensor_get(emb, (token_id as usize) * hidden + i);
@@ -644,15 +939,17 @@ fn qwen3_dense_matvec_range(dst: &f32, matrix: &TensorView, x: &const f32, in_di
 
 fn qwen3_matvec_worker(arg: &void) &void {
     const task: &Qwen3MatvecTask = arg as &Qwen3MatvecTask;
-    if task.q8 {
+    if task.dtype == TensorDType.Q8_0 {
         qwen3_q8_0_matvec_range(task.dst, task.matrix, task.x, task.in_dim, task.out_start, task.out_end);
+    } else if task.dtype == TensorDType.Q4_K || task.dtype == TensorDType.Q5_K || task.dtype == TensorDType.Q6_K {
+        _ = qwen3_k_matvec_range(task.dst, task.matrix, task.x, task.in_dim, task.out_start, task.out_end);
     } else {
         qwen3_dense_matvec_range(task.dst, task.matrix, task.x, task.in_dim, task.out_start, task.out_end);
     }
     return null;
 }
 
-fn qwen3_matvec_parallel(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize, q8: bool) bool {
+fn qwen3_matvec_parallel(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize, dtype: TensorDType) bool {
     var count: usize = qwen3_thread_count;
     if count < 2 || out_dim < (64 as usize) { return false; }
     if count > QWEN3_MAX_THREADS { count = QWEN3_MAX_THREADS; }
@@ -664,7 +961,7 @@ fn qwen3_matvec_parallel(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: 
     while j < count {
         const start: usize = (out_dim * j) / count;
         const end: usize = (out_dim * (j + (1 as usize))) / count;
-        tasks[j] = Qwen3MatvecTask{ dst: dst, matrix: matrix, x: x, in_dim: in_dim, out_start: start, out_end: end, q8: q8 };
+        tasks[j] = Qwen3MatvecTask{ dst: dst, matrix: matrix, x: x, in_dim: in_dim, out_start: start, out_end: end, dtype: dtype };
         if pthread_create(&threads[j], null, &qwen3_matvec_worker as &void, &tasks[j] as &void) == 0 {
             launched[j] = true;
         } else {
@@ -686,10 +983,14 @@ fn qwen3_matvec_parallel(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: 
 
 fn qwen3_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) void {
     if matrix.dtype == TensorDType.Q8_0 {
-        if in_dim % (32 as usize) == 0 && qwen3_matvec_parallel(dst, matrix, x, in_dim, out_dim, true) { return; }
+        if in_dim % (32 as usize) == 0 && qwen3_matvec_parallel(dst, matrix, x, in_dim, out_dim, TensorDType.Q8_0) { return; }
         if qwen3_q8_0_matvec_view(dst, matrix, x, in_dim, out_dim) { return; }
     }
-    if qwen3_matvec_parallel(dst, matrix, x, in_dim, out_dim, false) { return; }
+    if matrix.dtype == TensorDType.Q4_K || matrix.dtype == TensorDType.Q5_K || matrix.dtype == TensorDType.Q6_K {
+        if in_dim % (256 as usize) == 0 && qwen3_matvec_parallel(dst, matrix, x, in_dim, out_dim, matrix.dtype) { return; }
+        if qwen3_k_matvec_range(dst, matrix, x, in_dim, 0, out_dim) { return; }
+    }
+    if qwen3_matvec_parallel(dst, matrix, x, in_dim, out_dim, matrix.dtype) { return; }
     qwen3_dense_matvec_range(dst, matrix, x, in_dim, 0, out_dim);
 }
 
