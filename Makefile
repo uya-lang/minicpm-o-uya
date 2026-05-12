@@ -4,7 +4,7 @@ OUT := build/minicpm-o-uya
 RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio2audio-real-audit audio2audio-real-input-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind audio2audio-real-audit audio2audio-real-input-audit clean FORCE
 
 build: build-release
 
@@ -204,6 +204,20 @@ minicpmo-audit: build
 		exit 2; \
 	fi
 	$(OUT) audit "$(MINICPM_O_GGUF)"
+
+audio-real-bind: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf make audio-real-bind"; \
+		exit 2; \
+	fi
+	$(OUT) audio-bind "$(MINICPM_O_REAL_BUNDLE)/audio/MiniCPM-o-4_5-audio-F16.gguf"
+
+tts-real-bind: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf make tts-real-bind"; \
+		exit 2; \
+	fi
+	$(OUT) tts-bind "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf"
 
 audio2audio-real-audit: build
 	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ]; then \

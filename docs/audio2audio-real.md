@@ -45,13 +45,25 @@ build/minicpm-o-uya audio2audio-real --audit-only \
   --ref-audio outputs/complex_case2/complex2_0000.wav \
   --input-audio outputs/complex_case2/complex2_0001.wav \
   --out outputs/uya_audio2audio_answer.wav
+
+# llama.cpp-omni style multi-file protocol also works in audit mode:
+# prefix_0000.wav is the reference voice, prefix_0001.wav.. are user turns.
+build/minicpm-o-uya audio2audio-real --audit-only \
+  --llm models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+  --audio models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf \
+  --tts models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf \
+  --projector models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-projector-F16.gguf \
+  --token2wav-dir models/MiniCPM-o-4_5-gguf/token2wav-gguf \
+  --test-prefix outputs/complex_case2/complex2 \
+  --count 2 \
+  --out outputs/uya_audio2audio_answer.wav
 ```
 
 Expected success marker:
 
 ```text
 audio2audio-real: audit-only PASS files=9
-audio2audio-real: inference_supported=false next=bind-official-tensors
+audio2audio-real: inference_supported=false next=audio-encoder-forward-and-tts-bind
 ```
 
 When audio inputs are supplied, the audit additionally prints `audio2audio-real input protocol`, per-file `audio input[ref]` / `audio input[user]` summaries, sample checksum, duration, peak, and RMS. Non-16 kHz mono files fail fast with an explicit transcode/downmix diagnostic. The same check can be run with:
@@ -63,7 +75,7 @@ MINICPM_O_REAL_USER_AUDIO=outputs/complex_case2/complex2_0001.wav \
 make audio2audio-real-input-audit
 ```
 
-Each file audit also prints a compact inventory with tensor count, dtype distribution, name-prefix counts, and first tensor shape samples. For the official bundle this highlights the next binding groups, for example `encoder.*`, `emb_code.*`, `linear1.*`, `estimator.*`, `conv_post.*`, and `prompt_cache.*`.
+Each file audit also prints a compact inventory with tensor count, dtype distribution, name-prefix counts, and first tensor shape samples. The audio file is additionally checked with `audio-bind`, which binds the official `encoder.conv*`, 24 `encoder.blocks.*` transformer layers, `encoder.ln_post.*`, and `audio_projector.linear{1,2}.*` tensors. The current official audio bind checks 371 tensors. The TTS file is additionally checked with `tts-bind`, which binds `emb_code.*`, `emb_text.*`, the 20-layer decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, `head_code.*`, and checks 193 tensors. The remaining binding groups are token2wav families such as `estimator.*`, `conv_post.*`, and `prompt_cache.*`.
 
 Audit diagnostics include candidate next actions for unknown dtype, unclassified tensor prefixes, and key alias shape mismatches. The current shape sanity checks cover representative official MiniCPM-o 4.5 audio, TTS, projector, token2wav, HiFiGAN2, and prompt-cache tensors. A shape mismatch is treated as unsupported until the alias table or expected shape is updated.
 
@@ -129,10 +141,10 @@ After alias classification, these token2wav files should have zero unknown tenso
 
 ## Current Uya Status
 
-`audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, or `--input-prefix prefix` which resolves to `prefix_0000.wav` for reference voice and `prefix_0001.wav` for user speech. The next implementation layer is to bind the official tensor families discovered by audit:
+`audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, or `--test-prefix prefix --count N` for the llama.cpp-omni convention where `0000` is reference voice and `0001..` are user turns. The next implementation layer is to run the official audio encoder forward and bind the remaining TTS/token2wav tensor families discovered by audit:
 
-- Audio encoder: `encoder.*`
-- TTS model: `emb_code.*` and model-specific decoder tensors
+- Audio encoder: bind-only complete for `encoder.*` and `audio_projector.*`; forward kernels still pending.
+- TTS model: bind-only complete for `emb_code.*`, `emb_text.*`, decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, and `head_code.*`; decode/cache forward still pending.
 - Projector: `linear1.*`, `linear2.*`
 - Token2wav encoder: `after_norm.*` and encoder blocks
 - Flow matching: `estimator.*`
@@ -153,6 +165,18 @@ build/minicpm-o-uya audio2audio-real \
   --token2wav-dir models/MiniCPM-o-4_5-gguf/token2wav-gguf \
   --ref-audio outputs/complex_case2/complex2_0000.wav \
   --input-audio outputs/complex_case2/complex2_0001.wav \
+  --out outputs/uya_audio2audio_answer.wav
+
+# llama.cpp-omni style multi-file protocol also works in audit mode:
+# prefix_0000.wav is the reference voice, prefix_0001.wav.. are user turns.
+build/minicpm-o-uya audio2audio-real --audit-only \
+  --llm models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+  --audio models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf \
+  --tts models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf \
+  --projector models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-projector-F16.gguf \
+  --token2wav-dir models/MiniCPM-o-4_5-gguf/token2wav-gguf \
+  --test-prefix outputs/complex_case2/complex2 \
+  --count 2 \
   --out outputs/uya_audio2audio_answer.wav
 ```
 

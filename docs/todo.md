@@ -466,6 +466,8 @@
 - [ ] 移除 tiny audio cap，支持真实用户语音长度和多 chunk 输入。
   - [x] 输入 probe 流式扫描真实 WAV/UYAP，不受 tiny mel cap 限制；真实 mel/audio encoder forward 仍待接入。
 - [ ] 绑定官方 audio encoder tensors，并实现对应 conv/transformer/projector forward。
+  - [x] `audio-bind`/`audio2audio-real --audit-only` 已绑定官方 `encoder.conv*`、24 层 `encoder.blocks.*`、`encoder.ln_post.*`、`audio_projector.linear{1,2}.*`，共 371 个 tensor。
+  - [ ] 实现官方 conv + transformer + projector forward，并输出 embedding shape/n_pos/checksum。
 - [ ] 实现正确 prompt 协议：reference audio 进入 system prompt，user audio 进入 `<|im_start|>user` turn。
   - [x] `audio2audio-real --audit-only` 已区分 `ref_audio` 和 `user_audio`，并在协议日志中输出两者路径。
 - [x] 支持 `prefix_0000.wav`/`prefix_0001.wav` 测试格式，也支持显式 `--ref-audio`/`--user-audio` 参数。
@@ -480,7 +482,8 @@
 
 ### 21.5 LLM -> TTS audio token 生成
 
-- [ ] 实现 TTS GGUF 权重加载：`emb_code.0.weight`、`emb_text.weight`、`projector_semantic.*`、`projector_spk.*`、`head_code.0.weight`。
+- [x] 实现 TTS GGUF 权重加载/绑定审计：`emb_code.0.weight`、`emb_text.weight`、`projector_semantic.*`、`projector_spk.*`、`head_code.0.weight`。
+  - [x] `tts-bind`/`audio2audio-real --audit-only` 已绑定官方 TTS decoder 20 层 `blk.*`、embedding/projector/head，共 193 个 tensor。
 - [ ] 实现 LLM hidden states 到 TTS conditioning embedding 的 projector path。
 - [ ] 实现 TTS prefill/decode cache，与 audio_bos、audio_eos、audio token vocabulary 对齐。
 - [ ] 实现 chunked text/hidden-state queue：LLM 每个文本 chunk 同步送入 TTS。
@@ -516,8 +519,9 @@
 - [x] 新增真实 CLI，不复用 smoke 名称：`audio2audio-real`。
 - [x] 支持显式分文件参数：`--llm`、`--audio`、`--tts`、`--projector`、`--token2wav-dir`。
 - [x] 支持输入参数：`--ref-audio`、`--user-audio`/`--input-audio`、`--out`。
-- [ ] 支持 llama.cpp-omni 测试格式：`--test-prefix PREFIX --count N`，其中 `0000` 是 ref，`0001..` 是 user turn。
+- [x] 支持 llama.cpp-omni 测试格式：`--test-prefix PREFIX --count N`，其中 `0000` 是 ref，`0001..` 是 user turn。
   - [x] 支持单轮 `--input-prefix PREFIX`，自动解析 `PREFIX_0000.wav` 为 ref、`PREFIX_0001.wav` 为 user。
+  - [x] `--test-prefix PREFIX --count N` 会逐个 probe `PREFIX_0001.wav..PREFIX_%04u.wav`，用于多 user turn 输入审计。
 - [ ] 输出回答文本、answer wav、turn wav、audio token chunks、timing log。
 - [ ] 增加 `--text-only`、`--no-tts`、`--dump-hidden`、`--dump-embeddings` 诊断模式。
 - [ ] 所有真实模型命令默认要求显式路径，不从仓库内隐式下载模型。
@@ -552,6 +556,8 @@ build/minicpm-o-uya audio2audio-real \
 验收标准：
 
 - `make test` 仍只跑 tiny fixture。
+- `MINICPM_O_REAL_BUNDLE=/path make audio-real-bind` 可手动跑官方 audio encoder bind-only。
+- `MINICPM_O_REAL_BUNDLE=/path make tts-real-bind` 可手动跑官方 TTS bind-only。
 - `MINICPM_O_REAL_BUNDLE=/path make audio2audio-real-audit` 可手动跑真实模型。
 - 每个性能回归都有日志和指标，便于比较 Uya 与 llama.cpp-omni。
 

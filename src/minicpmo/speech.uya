@@ -10,6 +10,7 @@ use minicpmo.tensor.TensorView;
 use minicpmo.tensor.TensorWeightTable;
 use minicpmo.tensor.tensor_dtype_name;
 use minicpmo.tensor.tensor_lookup;
+use minicpmo.tensor.tensor_build_layer_name;
 use minicpmo.tensor.tensor_table_init;
 use minicpmo.tensor.tensor_weight_table_attach_mmap;
 use minicpmo.tensor.tensor_weight_table_detach_mmap;
@@ -108,6 +109,134 @@ fn speech_check_matrix(view: &TensorView, in_dim: u32, out_dim: u32, label: &con
     if view.n_dims == 2 && view.shape[0] == in_dim as u64 && view.shape[1] == out_dim as u64 { return true; }
     _ = printf("error: speech tensor=%s label=%s bad shape expected=[%u,%u]\n", &view.name[0], label, in_dim, out_dim);
     return false;
+}
+
+fn speech_check_vec(view: &TensorView, len: u32, label: &const byte) bool {
+    if !(view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 || view.dtype == TensorDType.BF16) {
+        _ = printf("error: speech tensor=%s label=%s unsupported dtype=%s\n", &view.name[0], label, tensor_dtype_name(view.dtype));
+        return false;
+    }
+    if view.n_dims == 1 && view.shape[0] == len as u64 { return true; }
+    _ = printf("error: speech tensor=%s label=%s bad shape expected=[%u]\n", &view.name[0], label, len);
+    return false;
+}
+
+fn speech_require_tensor(table: &TensorWeightTable, name: &const byte, label: &const byte) &TensorView {
+    const view: &TensorView = tensor_lookup(table, name);
+    if view == null { _ = printf("error: tts bind missing tensor %s label=%s\n", name, label); }
+    return view;
+}
+
+fn speech_lookup_layer(table: &TensorWeightTable, layer: u32, suffix: &const byte) &TensorView {
+    var name: [byte: 96] = [];
+    if !tensor_build_layer_name(layer, suffix, &name[0], @len(name)) { return null; }
+    return tensor_lookup(table, &name[0] as &const byte);
+}
+
+fn speech_require_layer(table: &TensorWeightTable, layer: u32, suffix: &const byte, label: &const byte) &TensorView {
+    var name: [byte: 96] = [];
+    if !tensor_build_layer_name(layer, suffix, &name[0], @len(name)) { _ = printf("error: tts bind layer name too long layer=%u suffix=%s\n", layer, suffix); return null; }
+    return speech_require_tensor(table, &name[0] as &const byte, label);
+}
+
+fn speech_count_tts_layers(table: &TensorWeightTable) u32 {
+    var layer_count: u32 = 0;
+    while layer_count < 64 {
+        if speech_lookup_layer(table, layer_count, "attn_q.weight\0" as &const byte) == null { return layer_count; }
+        layer_count = layer_count + 1;
+    }
+    return layer_count;
+}
+
+fn speech_tts_matrix(table: &TensorWeightTable, name: &const byte, in_dim: u32, out_dim: u32, label: &const byte, checked: &u32) bool {
+    const view: &TensorView = speech_require_tensor(table, name, label);
+    if view == null { return false; }
+    if !speech_check_matrix(view, in_dim, out_dim, label) { return false; }
+    checked[0] = checked[0] + 1;
+    return true;
+}
+
+fn speech_tts_vec(table: &TensorWeightTable, name: &const byte, len: u32, label: &const byte, checked: &u32) bool {
+    const view: &TensorView = speech_require_tensor(table, name, label);
+    if view == null { return false; }
+    if !speech_check_vec(view, len, label) { return false; }
+    checked[0] = checked[0] + 1;
+    return true;
+}
+
+fn speech_tts_layer_matrix(table: &TensorWeightTable, layer: u32, suffix: &const byte, in_dim: u32, out_dim: u32, label: &const byte, checked: &u32) bool {
+    const view: &TensorView = speech_require_layer(table, layer, suffix, label);
+    if view == null { return false; }
+    if !speech_check_matrix(view, in_dim, out_dim, label) { return false; }
+    checked[0] = checked[0] + 1;
+    return true;
+}
+
+fn speech_tts_layer_vec(table: &TensorWeightTable, layer: u32, suffix: &const byte, len: u32, label: &const byte, checked: &u32) bool {
+    const view: &TensorView = speech_require_layer(table, layer, suffix, label);
+    if view == null { return false; }
+    if !speech_check_vec(view, len, label) { return false; }
+    checked[0] = checked[0] + 1;
+    return true;
+}
+
+export fn speech_tts_bind_file(path: &const byte) bool {
+    var table: TensorWeightTable = tensor_table_init();
+    if !tensor_weight_table_load(path, &table) { return false; }
+    const token_embd: &TensorView = speech_require_tensor(&table, "token_embd.weight\0" as &const byte, "tts token embedding\0" as &const byte);
+    if token_embd == null || token_embd.n_dims != 2 { return false; }
+    const hidden: u32 = token_embd.shape[0] as u32;
+    const combined_vocab: u32 = token_embd.shape[1] as u32;
+    const emb_code: &TensorView = speech_require_tensor(&table, "emb_code.0.weight\0" as &const byte, "codec embedding\0" as &const byte);
+    const emb_text: &TensorView = speech_require_tensor(&table, "emb_text.weight\0" as &const byte, "text embedding\0" as &const byte);
+    if emb_code == null || emb_code.n_dims != 2 || emb_text == null || emb_text.n_dims != 2 { return false; }
+    const codec_vocab: u32 = emb_code.shape[1] as u32;
+    const text_vocab: u32 = emb_text.shape[1] as u32;
+    const first_gate: &TensorView = speech_lookup_layer(&table, 0, "ffn_gate.weight\0" as &const byte);
+    if first_gate == null || first_gate.n_dims != 2 { _ = printf("error: tts bind missing first ffn_gate weight\n"); return false; }
+    const ffn: u32 = first_gate.shape[1] as u32;
+    const semantic1: &TensorView = tensor_lookup(&table, "projector_semantic.linear1.weight\0" as &const byte);
+    if semantic1 == null || semantic1.n_dims != 2 { _ = printf("error: tts bind missing projector_semantic.linear1.weight\n"); return false; }
+    const llm_hidden: u32 = semantic1.shape[0] as u32;
+    const layer_count: u32 = speech_count_tts_layers(&table);
+    if hidden == 0 || codec_vocab == 0 || text_vocab == 0 || ffn == 0 || llm_hidden == 0 || layer_count == 0 { _ = printf("error: tts bind incomplete hidden=%u codec_vocab=%u text_vocab=%u ffn=%u llm_hidden=%u layers=%u\n", hidden, codec_vocab, text_vocab, ffn, llm_hidden, layer_count); return false; }
+    var checked: u32 = 0;
+    if !speech_tts_matrix(&table, "emb_code.0.weight\0" as &const byte, hidden, codec_vocab, "codec embedding\0" as &const byte, &checked) { return false; }
+    if !speech_tts_matrix(&table, "emb_text.weight\0" as &const byte, hidden, text_vocab, "text embedding\0" as &const byte, &checked) { return false; }
+    if !speech_tts_matrix(&table, "token_embd.weight\0" as &const byte, hidden, combined_vocab, "combined token embedding\0" as &const byte, &checked) { return false; }
+    var layer: u32 = 0;
+    while layer < layer_count {
+        if !speech_tts_layer_vec(&table, layer, "attn_norm.weight\0" as &const byte, hidden, "attn norm\0" as &const byte, &checked) { return false; }
+        if !speech_tts_layer_matrix(&table, layer, "attn_q.weight\0" as &const byte, hidden, hidden, "attn q\0" as &const byte, &checked) { return false; }
+        if !speech_tts_layer_matrix(&table, layer, "attn_k.weight\0" as &const byte, hidden, hidden, "attn k\0" as &const byte, &checked) { return false; }
+        if !speech_tts_layer_matrix(&table, layer, "attn_v.weight\0" as &const byte, hidden, hidden, "attn v\0" as &const byte, &checked) { return false; }
+        if !speech_tts_layer_matrix(&table, layer, "attn_output.weight\0" as &const byte, hidden, hidden, "attn output\0" as &const byte, &checked) { return false; }
+        if !speech_tts_layer_vec(&table, layer, "ffn_norm.weight\0" as &const byte, hidden, "ffn norm\0" as &const byte, &checked) { return false; }
+        if !speech_tts_layer_matrix(&table, layer, "ffn_gate.weight\0" as &const byte, hidden, ffn, "ffn gate\0" as &const byte, &checked) { return false; }
+        if !speech_tts_layer_matrix(&table, layer, "ffn_up.weight\0" as &const byte, hidden, ffn, "ffn up\0" as &const byte, &checked) { return false; }
+        if !speech_tts_layer_matrix(&table, layer, "ffn_down.weight\0" as &const byte, ffn, hidden, "ffn down\0" as &const byte, &checked) { return false; }
+        layer = layer + 1;
+    }
+    if !speech_tts_vec(&table, "output_norm.weight\0" as &const byte, hidden, "output norm\0" as &const byte, &checked) { return false; }
+    if !speech_tts_matrix(&table, "projector_semantic.linear1.weight\0" as &const byte, llm_hidden, hidden, "semantic projector linear1 weight\0" as &const byte, &checked) { return false; }
+    if !speech_tts_vec(&table, "projector_semantic.linear1.bias\0" as &const byte, hidden, "semantic projector linear1 bias\0" as &const byte, &checked) { return false; }
+    if !speech_tts_matrix(&table, "projector_semantic.linear2.weight\0" as &const byte, hidden, hidden, "semantic projector linear2 weight\0" as &const byte, &checked) { return false; }
+    if !speech_tts_vec(&table, "projector_semantic.linear2.bias\0" as &const byte, hidden, "semantic projector linear2 bias\0" as &const byte, &checked) { return false; }
+    if !speech_tts_matrix(&table, "projector_spk.linear1.weight\0" as &const byte, llm_hidden, hidden, "speaker projector linear1 weight\0" as &const byte, &checked) { return false; }
+    if !speech_tts_vec(&table, "projector_spk.linear1.bias\0" as &const byte, hidden, "speaker projector linear1 bias\0" as &const byte, &checked) { return false; }
+    if !speech_tts_matrix(&table, "projector_spk.linear2.weight\0" as &const byte, hidden, hidden, "speaker projector linear2 weight\0" as &const byte, &checked) { return false; }
+    if !speech_tts_vec(&table, "projector_spk.linear2.bias\0" as &const byte, hidden, "speaker projector linear2 bias\0" as &const byte, &checked) { return false; }
+    if !speech_tts_matrix(&table, "head_code.0.weight\0" as &const byte, codec_vocab, hidden, "codec output head\0" as &const byte, &checked) { return false; }
+    _ = printf("tts-real config: hidden=%u layers=%u heads=12 ffn=%u codec_vocab=%u text_vocab=%u combined_vocab=%u llm_hidden=%u\n", hidden, layer_count, ffn, codec_vocab, text_vocab, combined_vocab, llm_hidden);
+    _ = printf("tts-real bind: emb_code=emb_code.0.weight emb_text=emb_text.weight token_embd=token_embd.weight head=head_code.0.weight checked_tensors=%u\n", checked);
+    _ = printf("tts-real projectors: semantic=projector_semantic.linear1/2 speaker=projector_spk.linear1/2 layers=%u\n", layer_count);
+    _ = printf("tts-real bind: PASS\n");
+    return true;
+}
+
+export fn speech_tts_bind_cli(path: &const byte) i32 {
+    if !speech_tts_bind_file(path) { return 1; }
+    return 0;
 }
 
 fn speech_read_u16_at(data: &const byte, offset: usize) u16 {

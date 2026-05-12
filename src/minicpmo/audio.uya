@@ -234,6 +234,12 @@ fn audio_apply_u32_metadata(config: &AudioConfig, key: &const byte, value: u32) 
     if audio_cstr_eq(key, "audio.attention.head_count\0" as &const byte) { config.head_count = value; return; }
     if audio_cstr_eq(key, "audio.feed_forward_length\0" as &const byte) { config.intermediate_size = value; return; }
     if audio_cstr_eq(key, "audio.projector.output_length\0" as &const byte) { config.llm_hidden_size = value; return; }
+    if audio_cstr_eq(key, "encoder_attention_heads\0" as &const byte) { config.head_count = value; return; }
+    if audio_cstr_eq(key, "encoder_ffn_dim\0" as &const byte) { config.intermediate_size = value; return; }
+    if audio_cstr_eq(key, "encoder_layers\0" as &const byte) { config.layer_count = value; return; }
+    if audio_cstr_eq(key, "num_hidden_layers\0" as &const byte) && config.layer_count == 0 { config.layer_count = value; return; }
+    if audio_cstr_eq(key, "d_model\0" as &const byte) { config.hidden_size = value; return; }
+    if audio_cstr_eq(key, "n_mel\0" as &const byte) { config.mel_bin_count = value; return; }
     if audio_cstr_eq(key, "minicpmo.media.audio_token_id\0" as &const byte) { config.audio_token_id = value; config.has_audio_token_id = true; return; }
 }
 
@@ -741,6 +747,199 @@ fn audio_lookup_layer(table: &TensorWeightTable, layer: u32, suffix: &const byte
     var name: [byte: 96] = [];
     if !audio_build_layer_name(layer, suffix, &name[0], @len(name)) { return null; }
     return tensor_lookup(table, &name[0] as &const byte);
+}
+
+fn audio_build_real_layer_name(layer: u32, suffix: &const byte, dest: &byte, dest_cap: usize) bool {
+    if dest_cap < 80 { return false; }
+    _ = sprintf(dest as *byte, "encoder.blocks.%u.%s", layer, suffix);
+    return true;
+}
+
+fn audio_lookup_real_layer(table: &TensorWeightTable, layer: u32, suffix: &const byte) &TensorView {
+    var name: [byte: 128] = [];
+    if !audio_build_real_layer_name(layer, suffix, &name[0], @len(name)) { return null; }
+    return tensor_lookup(table, &name[0] as &const byte);
+}
+
+fn audio_count_real_layers_from_tensors(table: &TensorWeightTable) u32 {
+    var layer_count: u32 = 0;
+    while layer_count < 64 {
+        if audio_lookup_real_layer(table, layer_count, "attn.query.weight\0" as &const byte) == null { return layer_count; }
+        layer_count = layer_count + 1;
+    }
+    return layer_count;
+}
+
+fn audio_check_vec_loose(view: &TensorView, len: u32, label: &const byte) bool {
+    if !audio_check_dtype(view, label) { return false; }
+    if view.n_dims == 1 && view.shape[0] == len as u64 { return true; }
+    if view.n_dims == 2 && view.shape[0] == 1 && view.shape[1] == len as u64 { return true; }
+    _ = printf("error: audio bind tensor=%s label=%s bad shape got=", &view.name[0], label);
+    audio_print_shape(view);
+    _ = printf(" expected=[%u] or [1,%u]\n", len, len);
+    return false;
+}
+
+fn audio_check_conv1_real(view: &TensorView, mel_bins: u32, hidden: u32) bool {
+    if !audio_check_dtype(view, "real conv1 weight\0" as &const byte) { return false; }
+    if view.n_dims == 3 && view.shape[0] == 3 && view.shape[1] == mel_bins as u64 && view.shape[2] == hidden as u64 { return true; }
+    _ = printf("error: audio bind tensor=%s label=real conv1 bad shape got=", &view.name[0]);
+    audio_print_shape(view);
+    _ = printf(" expected=[3,%u,%u]\n", mel_bins, hidden);
+    return false;
+}
+
+fn audio_check_conv2_real(view: &TensorView, hidden: u32) bool {
+    if !audio_check_dtype(view, "real conv2 weight\0" as &const byte) { return false; }
+    if view.n_dims == 3 && view.shape[0] == 3 && view.shape[1] == hidden as u64 && view.shape[2] == hidden as u64 { return true; }
+    _ = printf("error: audio bind tensor=%s label=real conv2 bad shape got=", &view.name[0]);
+    audio_print_shape(view);
+    _ = printf(" expected=[3,%u,%u]\n", hidden, hidden);
+    return false;
+}
+
+fn audio_check_position_real(view: &TensorView, frames: u32, hidden: u32) bool {
+    if !audio_check_dtype(view, "real positional embedding\0" as &const byte) { return false; }
+    if view.n_dims == 2 && ((view.shape[0] == hidden as u64 && view.shape[1] == frames as u64) || (view.shape[0] == frames as u64 && view.shape[1] == hidden as u64)) { return true; }
+    _ = printf("error: audio bind tensor=%s label=real positional embedding bad shape got=", &view.name[0]);
+    audio_print_shape(view);
+    _ = printf(" expected=[%u,%u] or [%u,%u]\n", hidden, frames, frames, hidden);
+    return false;
+}
+
+fn audio_require_tensor(table: &TensorWeightTable, name: &const byte, label: &const byte) &TensorView {
+    const view: &TensorView = tensor_lookup(table, name);
+    if view == null { _ = printf("error: audio bind missing tensor %s label=%s\n", name, label); }
+    return view;
+}
+
+fn audio_require_real_layer(table: &TensorWeightTable, layer: u32, suffix: &const byte, label: &const byte) &TensorView {
+    var name: [byte: 128] = [];
+    if !audio_build_real_layer_name(layer, suffix, &name[0], @len(name)) { _ = printf("error: audio bind layer name too long layer=%u suffix=%s\n", layer, suffix); return null; }
+    return audio_require_tensor(table, &name[0] as &const byte, label);
+}
+
+fn audio_real_complete_config(config: &AudioConfig, table: &TensorWeightTable) bool {
+    const conv1: &TensorView = tensor_lookup(table, "encoder.conv1.weight\0" as &const byte);
+    if conv1 == null { _ = printf("error: audio real bind missing tensor encoder.conv1.weight\n"); return false; }
+    if conv1.n_dims == 3 {
+        if config.mel_bin_count == 0 { config.mel_bin_count = conv1.shape[1] as u32; }
+        if config.hidden_size == 0 { config.hidden_size = conv1.shape[2] as u32; }
+    }
+    const pos: &TensorView = tensor_lookup(table, "encoder.positional_embedding\0" as &const byte);
+    if pos == null { _ = printf("error: audio real bind missing tensor encoder.positional_embedding\n"); return false; }
+    if pos.n_dims == 2 && config.frame_count == 0 {
+        if config.hidden_size > 0 && pos.shape[0] == config.hidden_size as u64 { config.frame_count = pos.shape[1] as u32; }
+        else { config.frame_count = pos.shape[0] as u32; }
+    }
+    const projector2: &TensorView = tensor_lookup(table, "audio_projector.linear2.weight\0" as &const byte);
+    if projector2 == null { _ = printf("error: audio real bind missing tensor audio_projector.linear2.weight\n"); return false; }
+    if projector2.n_dims == 2 && config.llm_hidden_size == 0 { config.llm_hidden_size = projector2.shape[1] as u32; }
+    if config.layer_count == 0 { config.layer_count = audio_count_real_layers_from_tensors(table); }
+    const mlp0: &TensorView = audio_lookup_real_layer(table, 0, "mlp.0.weight\0" as &const byte);
+    if mlp0 != null && mlp0.n_dims == 2 && config.intermediate_size == 0 { config.intermediate_size = mlp0.shape[1] as u32; }
+    if config.head_count == 0 { config.head_count = 1; }
+    if config.frame_count == 0 || config.mel_bin_count == 0 || config.hidden_size == 0 || config.layer_count == 0 || config.head_count == 0 || config.intermediate_size == 0 || config.llm_hidden_size == 0 {
+        _ = printf("error: audio real config incomplete frames=%u mel_bins=%u hidden=%u layers=%u heads=%u ffn=%u llm_hidden=%u\n", config.frame_count, config.mel_bin_count, config.hidden_size, config.layer_count, config.head_count, config.intermediate_size, config.llm_hidden_size);
+        return false;
+    }
+    if config.hidden_size % config.head_count != 0 { _ = printf("error: audio real hidden_size=%u not divisible by head_count=%u\n", config.hidden_size, config.head_count); return false; }
+    config.head_dim = config.hidden_size / config.head_count;
+    return true;
+}
+
+fn audio_check_real_matrix(table: &TensorWeightTable, name: &const byte, in_dim: u32, out_dim: u32, label: &const byte, checked: &u32) bool {
+    const view: &TensorView = audio_require_tensor(table, name, label);
+    if view == null { return false; }
+    if !audio_check_matrix(view, in_dim, out_dim, label) { return false; }
+    checked[0] = checked[0] + 1;
+    return true;
+}
+
+fn audio_check_real_vec(table: &TensorWeightTable, name: &const byte, len: u32, label: &const byte, checked: &u32) bool {
+    const view: &TensorView = audio_require_tensor(table, name, label);
+    if view == null { return false; }
+    if !audio_check_vec_loose(view, len, label) { return false; }
+    checked[0] = checked[0] + 1;
+    return true;
+}
+
+fn audio_check_real_layer_matrix(table: &TensorWeightTable, layer: u32, suffix: &const byte, in_dim: u32, out_dim: u32, label: &const byte, checked: &u32) bool {
+    const view: &TensorView = audio_require_real_layer(table, layer, suffix, label);
+    if view == null { return false; }
+    if !audio_check_matrix(view, in_dim, out_dim, label) { return false; }
+    checked[0] = checked[0] + 1;
+    return true;
+}
+
+fn audio_check_real_layer_vec(table: &TensorWeightTable, layer: u32, suffix: &const byte, len: u32, label: &const byte, checked: &u32) bool {
+    const view: &TensorView = audio_require_real_layer(table, layer, suffix, label);
+    if view == null { return false; }
+    if !audio_check_vec_loose(view, len, label) { return false; }
+    checked[0] = checked[0] + 1;
+    return true;
+}
+
+fn audio_real_bind_check(table: &TensorWeightTable, config: &AudioConfig, checked: &u32) bool {
+    checked[0] = 0;
+    var view: &TensorView = audio_require_tensor(table, "encoder.conv1.weight\0" as &const byte, "conv1 weight\0" as &const byte);
+    if view == null || !audio_check_conv1_real(view, config.mel_bin_count, config.hidden_size) { return false; }
+    checked[0] = checked[0] + 1;
+    if !audio_check_real_vec(table, "encoder.conv1.bias\0" as &const byte, config.hidden_size, "conv1 bias\0" as &const byte, checked) { return false; }
+    view = audio_require_tensor(table, "encoder.conv2.weight\0" as &const byte, "conv2 weight\0" as &const byte);
+    if view == null || !audio_check_conv2_real(view, config.hidden_size) { return false; }
+    checked[0] = checked[0] + 1;
+    if !audio_check_real_vec(table, "encoder.conv2.bias\0" as &const byte, config.hidden_size, "conv2 bias\0" as &const byte, checked) { return false; }
+    view = audio_require_tensor(table, "encoder.positional_embedding\0" as &const byte, "positional embedding\0" as &const byte);
+    if view == null || !audio_check_position_real(view, config.frame_count, config.hidden_size) { return false; }
+    checked[0] = checked[0] + 1;
+    if !audio_check_real_vec(table, "encoder.ln_post.weight\0" as &const byte, config.hidden_size, "ln_post weight\0" as &const byte, checked) { return false; }
+    if !audio_check_real_vec(table, "encoder.ln_post.bias\0" as &const byte, config.hidden_size, "ln_post bias\0" as &const byte, checked) { return false; }
+    if !audio_check_real_matrix(table, "audio_projector.linear1.weight\0" as &const byte, config.hidden_size, config.llm_hidden_size, "audio projector linear1 weight\0" as &const byte, checked) { return false; }
+    if !audio_check_real_vec(table, "audio_projector.linear1.bias\0" as &const byte, config.llm_hidden_size, "audio projector linear1 bias\0" as &const byte, checked) { return false; }
+    if !audio_check_real_matrix(table, "audio_projector.linear2.weight\0" as &const byte, config.llm_hidden_size, config.llm_hidden_size, "audio projector linear2 weight\0" as &const byte, checked) { return false; }
+    if !audio_check_real_vec(table, "audio_projector.linear2.bias\0" as &const byte, config.llm_hidden_size, "audio projector linear2 bias\0" as &const byte, checked) { return false; }
+    var layer: u32 = 0;
+    while layer < config.layer_count {
+        if !audio_check_real_layer_vec(table, layer, "attn_ln.weight\0" as &const byte, config.hidden_size, "attn_ln weight\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_vec(table, layer, "attn_ln.bias\0" as &const byte, config.hidden_size, "attn_ln bias\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_matrix(table, layer, "attn.query.weight\0" as &const byte, config.hidden_size, config.hidden_size, "attn query weight\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_vec(table, layer, "attn.query.bias\0" as &const byte, config.hidden_size, "attn query bias\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_matrix(table, layer, "attn.key.weight\0" as &const byte, config.hidden_size, config.hidden_size, "attn key weight\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_matrix(table, layer, "attn.value.weight\0" as &const byte, config.hidden_size, config.hidden_size, "attn value weight\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_vec(table, layer, "attn.value.bias\0" as &const byte, config.hidden_size, "attn value bias\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_matrix(table, layer, "attn.out.weight\0" as &const byte, config.hidden_size, config.hidden_size, "attn out weight\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_vec(table, layer, "attn.out.bias\0" as &const byte, config.hidden_size, "attn out bias\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_vec(table, layer, "mlp_ln.weight\0" as &const byte, config.hidden_size, "mlp_ln weight\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_vec(table, layer, "mlp_ln.bias\0" as &const byte, config.hidden_size, "mlp_ln bias\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_matrix(table, layer, "mlp.0.weight\0" as &const byte, config.hidden_size, config.intermediate_size, "mlp 0 weight\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_vec(table, layer, "mlp.0.bias\0" as &const byte, config.intermediate_size, "mlp 0 bias\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_matrix(table, layer, "mlp.2.weight\0" as &const byte, config.intermediate_size, config.hidden_size, "mlp 2 weight\0" as &const byte, checked) { return false; }
+        if !audio_check_real_layer_vec(table, layer, "mlp.2.bias\0" as &const byte, config.hidden_size, "mlp 2 bias\0" as &const byte, checked) { return false; }
+        layer = layer + 1;
+    }
+    return true;
+}
+
+export fn audio_real_bind_file(path: &const byte) bool {
+    var config: AudioConfig = audio_config_init();
+    if !audio_config_load_metadata(path, &config) { return false; }
+    var table: TensorWeightTable = tensor_table_init();
+    if !tensor_weight_table_load(path, &table) { return false; }
+    if !audio_real_complete_config(&config, &table) { return false; }
+    var checked: u32 = 0;
+    if !audio_real_bind_check(&table, &config, &checked) { return false; }
+    _ = printf("audio-real config: frames=%u mel_bins=%u hidden=%u layers=%u heads=%u head_dim=%u ffn=%u llm_hidden=%u\n", config.frame_count, config.mel_bin_count, config.hidden_size, config.layer_count, config.head_count, config.head_dim, config.intermediate_size, config.llm_hidden_size);
+    _ = printf("audio-real bind: conv1=encoder.conv1.weight conv2=encoder.conv2.weight pos=encoder.positional_embedding projector=audio_projector.linear1/2 checked_tensors=%u layers=%u\n", checked, config.layer_count);
+    _ = printf("audio-real layer[0]: attn_ln=encoder.blocks.0.attn_ln.weight q=encoder.blocks.0.attn.query.weight k=encoder.blocks.0.attn.key.weight v=encoder.blocks.0.attn.value.weight\n");
+    _ = printf("audio-real layer[0]: out=encoder.blocks.0.attn.out.weight mlp0=encoder.blocks.0.mlp.0.weight mlp2=encoder.blocks.0.mlp.2.weight\n");
+    _ = printf("audio-real bind: PASS\n");
+    return true;
+}
+
+export fn audio_real_bind_cli(path: &const byte) i32 {
+    if !audio_real_bind_file(path) { return 1; }
+    return 0;
 }
 
 fn audio_count_layers_from_tensors(table: &TensorWeightTable) u32 {
