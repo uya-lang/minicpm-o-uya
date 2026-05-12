@@ -6,6 +6,7 @@ use minicpmo.audio.audio_real_encode_probe_file;
 use minicpmo.audio.audio_real_preprocess_probe_file;
 use minicpmo.audio.audio_real_bind_file;
 use minicpmo.speech.speech_tts_bind_file;
+use minicpmo.token2wav.token2wav_bind_dir_cli;
 use minicpmo.binary.BinaryReader;
 use minicpmo.binary.binary_close;
 use minicpmo.binary.binary_open;
@@ -1565,6 +1566,7 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
     } else { ok = false; }
 
     if !ok { return 1; }
+    if token2wav_bind_dir_cli(token2wav_dir) != 0 { return 1; }
     if test_prefix != null {
         _ = printf("audio2audio-real test protocol: prefix=%s count=%u ref_audio=%s user_turns=%u\n", test_prefix, test_count, ref_audio_path, test_count - 1);
         if out_path != null { _ = printf("audio2audio-real output target: %s\n", out_path); }

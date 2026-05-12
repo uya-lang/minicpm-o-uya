@@ -53,6 +53,7 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `audio-real-preprocess-probe <audio.wav\|audio.uyap.pcm>` | Real MiniCPM-o preprocessing plan | 100 ms align, center pad, conv/pool token planning |
 | `audio-real-mel-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real numeric mel probe | Supports `--dump-f32 out.uyml` for full-array alignment |
 | `audio-real-encode-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real audio encoder forward probe | Correctness-first `conv + transformer + projector + pool` path |
+| `token2wav-bind <token2wav-gguf-dir>` | Real token2wav/HiFiGAN bind-only validation | Validates official `encoder`/`flow_*`/`hifigan2`/`prompt_cache` layouts |
 | `tts-condition-probe <tts.gguf> <projector.gguf> <llm_token_ids.txt> <llm_hidden_states.bin>` | Real TTS conditioning merge probe | `emb_text + projector_semantic + L2 normalize + merge`; optional merged/condition dump |
 | `tts-simplex-probe <tts.gguf> <projector.gguf> <llm_debug_dir>` | Real TTS decoder/audio-token probe | Official TTS decoder KV cache + assistant prompt prefill + chunked audio token dump |
 | `make tts-token-align` | Real TTS token compare helper | Runs simplex probe and reports per-chunk count/prefix/exact match vs `audio_tokens_chunk_*.txt` |
@@ -67,6 +68,8 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `quant-smoke` | Quant kernel golden smoke | Selected GGML quant types |
 
 Sampler arguments accepted by `generate` are validated by the tiny sampler path; unsupported or malformed values fail early instead of silently changing behavior.
+
+For official split MiniCPM-o 4.5 bundles, `token2wav-bind <dir>` now validates the five `token2wav-gguf` files as a real bind-only step, not just an audit inventory.
 
 `bench` now has two modes: the original `<model.gguf> <manifest.json>` smoke path stays deterministic for regression tests, while `bench <model.gguf> [bench args...]` runs a real text benchmark intended for apples-to-apples comparison with `llama-bench`.
 
@@ -144,6 +147,7 @@ build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.w
 build/minicpm-o-uya audio-real-encode-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya tts-condition-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_token_ids.txt /path/to/llm_hidden_states.bin --dump-merged /tmp/minicpm-o-uya-merged.bin
 build/minicpm-o-uya tts-simplex-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_debug --count 4 --out-dir /tmp/minicpm-o-uya-ttsprobe
+build/minicpm-o-uya token2wav-bind /path/to/token2wav-gguf
 MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_TTS_LLM_DEBUG_DIR=/path/to/llm_debug MINICPM_O_TTS_COMPARE_DIR=/path/to/tts_wav make tts-token-align
 build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_TEXT_GGUF" --audio-model "$MINICPM_O_AUDIO_GGUF" --speech-model "$MINICPM_O_SPEECH_GGUF" --vocoder-model "$MINICPM_O_VOCODER_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"

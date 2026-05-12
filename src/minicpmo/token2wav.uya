@@ -1,0 +1,291 @@
+use libc.printf;
+use libc.snprintf;
+use libc.strcmp;
+use minicpmo.tensor.TensorDType;
+use minicpmo.tensor.TensorView;
+use minicpmo.tensor.TensorWeightTable;
+use minicpmo.tensor.tensor_dtype_name;
+use minicpmo.tensor.tensor_lookup;
+use minicpmo.tensor.tensor_table_init;
+use minicpmo.tensor.tensor_weight_table_attach_mmap;
+use minicpmo.tensor.tensor_weight_table_detach_mmap;
+use minicpmo.tensor.tensor_weight_table_load;
+
+fn t2w_dtype_supported(dtype: TensorDType) bool {
+    return dtype == TensorDType.F32 || dtype == TensorDType.F16 || dtype == TensorDType.BF16;
+}
+
+fn t2w_check_vec(view: &TensorView, len: u64, label: &const byte) bool {
+    if !t2w_dtype_supported(view.dtype) {
+        _ = printf("error: token2wav tensor=%s label=%s unsupported dtype=%s\n", &view.name[0], label, tensor_dtype_name(view.dtype));
+        return false;
+    }
+    if view.n_dims == 1 && view.shape[0] == len { return true; }
+    _ = printf("error: token2wav tensor=%s label=%s bad shape expected=[%llu]\n", &view.name[0], label, len);
+    return false;
+}
+
+fn t2w_check_matrix(view: &TensorView, d0: u64, d1: u64, label: &const byte) bool {
+    if !t2w_dtype_supported(view.dtype) {
+        _ = printf("error: token2wav tensor=%s label=%s unsupported dtype=%s\n", &view.name[0], label, tensor_dtype_name(view.dtype));
+        return false;
+    }
+    if view.n_dims == 2 && view.shape[0] == d0 && view.shape[1] == d1 { return true; }
+    _ = printf("error: token2wav tensor=%s label=%s bad shape expected=[%llu,%llu]\n", &view.name[0], label, d0, d1);
+    return false;
+}
+
+fn t2w_check_tensor3(view: &TensorView, d0: u64, d1: u64, d2: u64, label: &const byte) bool {
+    if !t2w_dtype_supported(view.dtype) {
+        _ = printf("error: token2wav tensor=%s label=%s unsupported dtype=%s\n", &view.name[0], label, tensor_dtype_name(view.dtype));
+        return false;
+    }
+    if view.n_dims == 3 && view.shape[0] == d0 && view.shape[1] == d1 && view.shape[2] == d2 { return true; }
+    _ = printf("error: token2wav tensor=%s label=%s bad shape expected=[%llu,%llu,%llu]\n", &view.name[0], label, d0, d1, d2);
+    return false;
+}
+
+fn t2w_check_tensor4(view: &TensorView, d0: u64, d1: u64, d2: u64, d3: u64, label: &const byte) bool {
+    if !t2w_dtype_supported(view.dtype) {
+        _ = printf("error: token2wav tensor=%s label=%s unsupported dtype=%s\n", &view.name[0], label, tensor_dtype_name(view.dtype));
+        return false;
+    }
+    if view.n_dims == 4 && view.shape[0] == d0 && view.shape[1] == d1 && view.shape[2] == d2 && view.shape[3] == d3 { return true; }
+    _ = printf("error: token2wav tensor=%s label=%s bad shape expected=[%llu,%llu,%llu,%llu]\n", &view.name[0], label, d0, d1, d2, d3);
+    return false;
+}
+
+fn t2w_require(table: &TensorWeightTable, name: &const byte, label: &const byte) &TensorView {
+    const view: &TensorView = tensor_lookup(table, name);
+    if view == null { _ = printf("error: token2wav missing tensor %s label=%s\n", name, label); }
+    return view;
+}
+
+fn t2w_join_path(out: &byte, cap: usize, dir: &const byte, leaf: &const byte) bool {
+    const written: i32 = snprintf(out as *byte, cap, "%s/%s\0" as *const byte, dir, leaf);
+    if written < 0 || (written as usize) >= cap {
+        _ = printf("error: token2wav path too long for %s/%s\n", dir, leaf);
+        return false;
+    }
+    return true;
+}
+
+fn t2w_build_layer_name(out: &byte, cap: usize, prefix: &const byte, index: u32, suffix: &const byte) bool {
+    const written: i32 = snprintf(out as *byte, cap, "%s%u.%s\0" as *const byte, prefix, index, suffix);
+    return written >= 0 && (written as usize) < cap;
+}
+
+fn t2w_lookup_layer(table: &TensorWeightTable, prefix: &const byte, index: u32, suffix: &const byte) &TensorView {
+    var name: [byte: 160] = [];
+    if !t2w_build_layer_name(&name[0], @len(name), prefix, index, suffix) { return null; }
+    return tensor_lookup(table, &name[0] as &const byte);
+}
+
+fn t2w_count_layers(table: &TensorWeightTable, prefix: &const byte, suffix: &const byte, cap: u32) u32 {
+    var count: u32 = 0;
+    while count < cap {
+        if t2w_lookup_layer(table, prefix, count, suffix) == null { return count; }
+        count = count + 1;
+    }
+    return count;
+}
+
+fn t2w_require_layer(table: &TensorWeightTable, prefix: &const byte, index: u32, suffix: &const byte, label: &const byte) &TensorView {
+    var name: [byte: 160] = [];
+    if !t2w_build_layer_name(&name[0], @len(name), prefix, index, suffix) {
+        _ = printf("error: token2wav layer path too long prefix=%s index=%u suffix=%s\n", prefix, index, suffix);
+        return null;
+    }
+    return t2w_require(table, &name[0] as &const byte, label);
+}
+
+fn t2w_open_table(path: &const byte, table: &TensorWeightTable) bool {
+    table[0] = tensor_table_init();
+    if !tensor_weight_table_load(path, table) { return false; }
+    if !tensor_weight_table_attach_mmap(path, table) { return false; }
+    return true;
+}
+
+fn t2w_close_table(table: &TensorWeightTable) void {
+    tensor_weight_table_detach_mmap(table);
+}
+
+fn t2w_bind_encoder_file(path: &const byte) bool {
+    var table: TensorWeightTable = tensor_table_init();
+    if !t2w_open_table(path, &table) { return false; }
+    var ok: bool = true;
+    const after_bias: &TensorView = t2w_require(&table, "after_norm.bias\0" as &const byte, "encoder after_norm bias\0" as &const byte);
+    const after_weight: &TensorView = t2w_require(&table, "after_norm.weight\0" as &const byte, "encoder after_norm weight\0" as &const byte);
+    const embed0_w: &TensorView = t2w_require(&table, "embed.out.0.weight\0" as &const byte, "encoder embed0 weight\0" as &const byte);
+    const embed1_w: &TensorView = t2w_require(&table, "embed.out.1.weight\0" as &const byte, "encoder embed1 weight\0" as &const byte);
+    const up_embed0_w: &TensorView = t2w_require(&table, "up_embed.out.0.weight\0" as &const byte, "encoder up_embed0 weight\0" as &const byte);
+    const pre1_w: &TensorView = t2w_require(&table, "pre_lookahead_layer.conv1.weight\0" as &const byte, "encoder pre_lookahead conv1\0" as &const byte);
+    const pre2_w: &TensorView = t2w_require(&table, "pre_lookahead_layer.conv2.weight\0" as &const byte, "encoder pre_lookahead conv2\0" as &const byte);
+    const up_layer_w: &TensorView = t2w_require(&table, "up_layer.conv.weight\0" as &const byte, "encoder up_layer conv\0" as &const byte);
+    if after_bias == null || after_weight == null || embed0_w == null || embed1_w == null || up_embed0_w == null || pre1_w == null || pre2_w == null || up_layer_w == null { ok = false; }
+    if ok && !t2w_check_vec(after_bias, 512, "encoder after_norm bias\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_vec(after_weight, 512, "encoder after_norm weight\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(embed0_w, 512, 512, "encoder embed0 weight\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_vec(embed1_w, 512, "encoder embed1 weight\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(up_embed0_w, 512, 512, "encoder up_embed0 weight\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(pre1_w, 4, 512, 512, "encoder pre_lookahead conv1\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(pre2_w, 3, 512, 512, "encoder pre_lookahead conv2\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(up_layer_w, 5, 512, 512, "encoder up_layer conv\0" as &const byte) { ok = false; }
+    const encoder_count: u32 = t2w_count_layers(&table, "encoders.\0" as &const byte, "self_attn.linear_q.weight\0" as &const byte, 32);
+    const up_encoder_count: u32 = t2w_count_layers(&table, "up_encoders.\0" as &const byte, "self_attn.linear_q.weight\0" as &const byte, 16);
+    if encoder_count == 0 || up_encoder_count == 0 {
+        _ = printf("error: token2wav encoder missing layered blocks encoders=%u up_encoders=%u\n", encoder_count, up_encoder_count);
+        ok = false;
+    }
+    var i: u32 = 0;
+    while ok && i < encoder_count {
+        if !t2w_check_matrix(t2w_require_layer(&table, "encoders.\0" as &const byte, i, "feed_forward.w_1.weight\0" as &const byte, "encoder ff1\0" as &const byte), 512, 2048, "encoder ff1\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "encoders.\0" as &const byte, i, "feed_forward.w_2.weight\0" as &const byte, "encoder ff2\0" as &const byte), 2048, 512, "encoder ff2\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "encoders.\0" as &const byte, i, "self_attn.linear_q.weight\0" as &const byte, "encoder q\0" as &const byte), 512, 512, "encoder q\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "encoders.\0" as &const byte, i, "self_attn.linear_k.weight\0" as &const byte, "encoder k\0" as &const byte), 512, 512, "encoder k\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "encoders.\0" as &const byte, i, "self_attn.linear_v.weight\0" as &const byte, "encoder v\0" as &const byte), 512, 512, "encoder v\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "encoders.\0" as &const byte, i, "self_attn.linear_out.weight\0" as &const byte, "encoder out\0" as &const byte), 512, 512, "encoder out\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "encoders.\0" as &const byte, i, "self_attn.linear_pos.weight\0" as &const byte, "encoder pos\0" as &const byte), 512, 512, "encoder pos\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "encoders.\0" as &const byte, i, "self_attn.pos_bias_u\0" as &const byte, "encoder pos_bias_u\0" as &const byte), 64, 8, "encoder pos_bias_u\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "encoders.\0" as &const byte, i, "self_attn.pos_bias_v\0" as &const byte, "encoder pos_bias_v\0" as &const byte), 64, 8, "encoder pos_bias_v\0" as &const byte) { ok = false; break; }
+        i = i + 1;
+    }
+    i = 0;
+    while ok && i < up_encoder_count {
+        if !t2w_check_matrix(t2w_require_layer(&table, "up_encoders.\0" as &const byte, i, "feed_forward.w_1.weight\0" as &const byte, "up_encoder ff1\0" as &const byte), 512, 2048, "up_encoder ff1\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "up_encoders.\0" as &const byte, i, "feed_forward.w_2.weight\0" as &const byte, "up_encoder ff2\0" as &const byte), 2048, 512, "up_encoder ff2\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "up_encoders.\0" as &const byte, i, "self_attn.linear_q.weight\0" as &const byte, "up_encoder q\0" as &const byte), 512, 512, "up_encoder q\0" as &const byte) { ok = false; break; }
+        i = i + 1;
+    }
+    if ok {
+        _ = printf("token2wav encoder: hidden=512 ffn=2048 encoders=%u up_encoders=%u pre_lookahead=2 up_layer=1\n", encoder_count, up_encoder_count);
+        _ = printf("token2wav encoder: PASS\n");
+    }
+    t2w_close_table(&table);
+    return ok;
+}
+
+fn t2w_bind_flow_extra_file(path: &const byte) bool {
+    var table: TensorWeightTable = tensor_table_init();
+    if !t2w_open_table(path, &table) { return false; }
+    var ok: bool = true;
+    if !t2w_check_matrix(t2w_require(&table, "input_embedding.weight\0" as &const byte, "flow_extra input_embedding\0" as &const byte), 512, 6561, "flow_extra input_embedding\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(t2w_require(&table, "spk_embed_affine_layer.weight\0" as &const byte, "flow_extra spk weight\0" as &const byte), 192, 80, "flow_extra spk weight\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_vec(t2w_require(&table, "spk_embed_affine_layer.bias\0" as &const byte, "flow_extra spk bias\0" as &const byte), 80, "flow_extra spk bias\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(t2w_require(&table, "encoder_proj.weight\0" as &const byte, "flow_extra encoder_proj weight\0" as &const byte), 512, 80, "flow_extra encoder_proj weight\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_vec(t2w_require(&table, "encoder_proj.bias\0" as &const byte, "flow_extra encoder_proj bias\0" as &const byte), 80, "flow_extra encoder_proj bias\0" as &const byte) { ok = false; }
+    if ok {
+        _ = printf("token2wav flow_extra: hidden=512 spk_embed=192 mel=80 codec_vocab=6561\n");
+        _ = printf("token2wav flow_extra: PASS\n");
+    }
+    t2w_close_table(&table);
+    return ok;
+}
+
+fn t2w_bind_flow_matching_file(path: &const byte) bool {
+    var table: TensorWeightTable = tensor_table_init();
+    if !t2w_open_table(path, &table) { return false; }
+    var ok: bool = true;
+    const block_count: u32 = t2w_count_layers(&table, "estimator.blocks.\0" as &const byte, "attn.to_q.weight\0" as &const byte, 64);
+    if block_count == 0 {
+        _ = printf("error: token2wav flow_matching missing estimator blocks\n");
+        ok = false;
+    }
+    if ok && !t2w_check_matrix(t2w_require(&table, "estimator.in_proj.weight\0" as &const byte, "flow_matching in_proj weight\0" as &const byte), 320, 512, "flow_matching in_proj weight\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_vec(t2w_require(&table, "estimator.in_proj.bias\0" as &const byte, "flow_matching in_proj bias\0" as &const byte), 512, "flow_matching in_proj bias\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(t2w_require(&table, "estimator.t_embedder.mlp.0.weight\0" as &const byte, "flow_matching t_embedder 0\0" as &const byte), 256, 512, "flow_matching t_embedder 0\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(t2w_require(&table, "estimator.t_embedder.mlp.2.weight\0" as &const byte, "flow_matching t_embedder 2\0" as &const byte), 512, 512, "flow_matching t_embedder 2\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(t2w_require(&table, "estimator.final_layer.adaLN_modulation.1.weight\0" as &const byte, "flow_matching final ada weight\0" as &const byte), 512, 1024, "flow_matching final ada weight\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(t2w_require(&table, "estimator.final_layer.linear.weight\0" as &const byte, "flow_matching final linear weight\0" as &const byte), 512, 80, "flow_matching final linear weight\0" as &const byte) { ok = false; }
+    var i: u32 = 0;
+    while ok && i < block_count {
+        if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "adaLN_modulation.1.weight\0" as &const byte, "flow_matching ada weight\0" as &const byte), 512, 4608, "flow_matching ada weight\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.q_norm.weight\0" as &const byte, "flow_matching q_norm\0" as &const byte), 64, "flow_matching q_norm\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.k_norm.weight\0" as &const byte, "flow_matching k_norm\0" as &const byte), 64, "flow_matching k_norm\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.to_q.weight\0" as &const byte, "flow_matching q\0" as &const byte), 512, 512, "flow_matching q\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.to_k.weight\0" as &const byte, "flow_matching k\0" as &const byte), 512, 512, "flow_matching k\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.to_v.weight\0" as &const byte, "flow_matching v\0" as &const byte), 512, 512, "flow_matching v\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "attn.proj.weight\0" as &const byte, "flow_matching proj\0" as &const byte), 512, 512, "flow_matching proj\0" as &const byte) { ok = false; break; }
+        if !t2w_check_tensor3(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "conv.block.1.weight\0" as &const byte, "flow_matching conv1\0" as &const byte), 3, 512, 512, "flow_matching conv1\0" as &const byte) { ok = false; break; }
+        if !t2w_check_vec(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "conv.block.3.weight\0" as &const byte, "flow_matching conv3\0" as &const byte), 512, "flow_matching conv3\0" as &const byte) { ok = false; break; }
+        if !t2w_check_tensor3(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "conv.block.6.weight\0" as &const byte, "flow_matching conv6\0" as &const byte), 3, 512, 512, "flow_matching conv6\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "mlp.fc1.weight\0" as &const byte, "flow_matching fc1\0" as &const byte), 512, 2048, "flow_matching fc1\0" as &const byte) { ok = false; break; }
+        if !t2w_check_matrix(t2w_require_layer(&table, "estimator.blocks.\0" as &const byte, i, "mlp.fc2.weight\0" as &const byte, "flow_matching fc2\0" as &const byte), 2048, 512, "flow_matching fc2\0" as &const byte) { ok = false; break; }
+        i = i + 1;
+    }
+    if ok {
+        _ = printf("token2wav flow_matching: hidden=512 blocks=%u heads_dim=64 in_proj=320 final_mel=80\n", block_count);
+        _ = printf("token2wav flow_matching: PASS\n");
+    }
+    t2w_close_table(&table);
+    return ok;
+}
+
+fn t2w_bind_hifigan2_file(path: &const byte) bool {
+    var table: TensorWeightTable = tensor_table_init();
+    if !t2w_open_table(path, &table) { return false; }
+    var ok: bool = true;
+    const up_count: u32 = t2w_count_layers(&table, "ups.\0" as &const byte, "weight\0" as &const byte, 8);
+    const resblock_count: u32 = t2w_count_layers(&table, "resblocks.\0" as &const byte, "convs1.0.weight\0" as &const byte, 32);
+    const source_resblock_count: u32 = t2w_count_layers(&table, "source_resblocks.\0" as &const byte, "convs1.0.weight\0" as &const byte, 16);
+    const source_down_count: u32 = t2w_count_layers(&table, "source_downs.\0" as &const byte, "weight\0" as &const byte, 8);
+    if up_count == 0 || resblock_count == 0 || source_resblock_count == 0 || source_down_count == 0 {
+        _ = printf("error: token2wav hifigan2 missing grouped tensors ups=%u resblocks=%u source_resblocks=%u source_downs=%u\n", up_count, resblock_count, source_resblock_count, source_down_count);
+        ok = false;
+    }
+    if ok && !t2w_check_tensor3(t2w_require(&table, "conv_pre.weight\0" as &const byte, "hifigan conv_pre\0" as &const byte), 7, 80, 512, "hifigan conv_pre\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(t2w_require(&table, "conv_post.weight\0" as &const byte, "hifigan conv_post\0" as &const byte), 7, 64, 18, "hifigan conv_post\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(t2w_require(&table, "ups.0.weight\0" as &const byte, "hifigan ups0\0" as &const byte), 16, 256, 512, "hifigan ups0\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(t2w_require(&table, "ups.1.weight\0" as &const byte, "hifigan ups1\0" as &const byte), 11, 128, 256, "hifigan ups1\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(t2w_require(&table, "ups.2.weight\0" as &const byte, "hifigan ups2\0" as &const byte), 7, 64, 128, "hifigan ups2\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(t2w_require(&table, "source_downs.0.weight\0" as &const byte, "hifigan source_down0\0" as &const byte), 30, 18, 256, "hifigan source_down0\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(t2w_require(&table, "source_downs.1.weight\0" as &const byte, "hifigan source_down1\0" as &const byte), 6, 18, 128, "hifigan source_down1\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(t2w_require(&table, "source_downs.2.weight\0" as &const byte, "hifigan source_down2\0" as &const byte), 1, 18, 64, "hifigan source_down2\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(t2w_require(&table, "m_source.l_linear.weight\0" as &const byte, "hifigan m_source\0" as &const byte), 9, 1, "hifigan m_source\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(t2w_require(&table, "f0_predictor.classifier.weight\0" as &const byte, "hifigan f0 classifier\0" as &const byte), 512, 1, "hifigan f0 classifier\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor3(t2w_require(&table, "f0_predictor.condnet.0.weight\0" as &const byte, "hifigan condnet0\0" as &const byte), 3, 80, 512, "hifigan condnet0\0" as &const byte) { ok = false; }
+    if ok {
+        _ = printf("token2wav hifigan2: ups=%u resblocks=%u source_resblocks=%u source_downs=%u channels=512->256->128->64\n", up_count, resblock_count, source_resblock_count, source_down_count);
+        _ = printf("token2wav hifigan2: PASS\n");
+    }
+    t2w_close_table(&table);
+    return ok;
+}
+
+fn t2w_bind_prompt_cache_file(path: &const byte) bool {
+    var table: TensorWeightTable = tensor_table_init();
+    if !t2w_open_table(path, &table) { return false; }
+    var ok: bool = true;
+    if !t2w_check_vec(t2w_require(&table, "prompt_cache.spk_cb\0" as &const byte, "prompt_cache spk_cb\0" as &const byte), 192, "prompt_cache spk_cb\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_matrix(t2w_require(&table, "prompt_cache.conformer_cnn_cache\0" as &const byte, "prompt_cache conformer_cnn_cache\0" as &const byte), 512, 6, "prompt_cache conformer_cnn_cache\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor4(t2w_require(&table, "prompt_cache.conformer_att_cache\0" as &const byte, "prompt_cache conformer_att_cache\0" as &const byte), 128, 302, 8, 10, "prompt_cache conformer_att_cache\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor4(t2w_require(&table, "prompt_cache.estimator_cnn_cache\0" as &const byte, "prompt_cache estimator_cnn_cache\0" as &const byte), 1024, 2, 80, 2, "prompt_cache estimator_cnn_cache\0" as &const byte) { ok = false; }
+    if ok && !t2w_check_tensor4(t2w_require(&table, "prompt_cache.estimator_att_cache\0" as &const byte, "prompt_cache estimator_att_cache\0" as &const byte), 128, 302, 640, 2, "prompt_cache estimator_att_cache\0" as &const byte) { ok = false; }
+    if ok {
+        _ = printf("token2wav prompt_cache: speaker=192 conformer_cache=512x6 estimator_cache=128x302x640x2\n");
+        _ = printf("token2wav prompt_cache: PASS\n");
+    }
+    t2w_close_table(&table);
+    return ok;
+}
+
+fn t2w_bind_usage() void {
+    _ = printf("usage: minicpm-o-uya token2wav-bind <token2wav-gguf-dir>\n");
+}
+
+export fn token2wav_bind_dir_cli(dir: &const byte) i32 {
+    var path: [byte: 512] = [];
+    if !t2w_join_path(&path[0], @len(path), dir, "encoder.gguf\0" as &const byte) { return 1; }
+    if !t2w_bind_encoder_file(&path[0] as &const byte) { return 1; }
+    if !t2w_join_path(&path[0], @len(path), dir, "flow_matching.gguf\0" as &const byte) { return 1; }
+    if !t2w_bind_flow_matching_file(&path[0] as &const byte) { return 1; }
+    if !t2w_join_path(&path[0], @len(path), dir, "flow_extra.gguf\0" as &const byte) { return 1; }
+    if !t2w_bind_flow_extra_file(&path[0] as &const byte) { return 1; }
+    if !t2w_join_path(&path[0], @len(path), dir, "hifigan2.gguf\0" as &const byte) { return 1; }
+    if !t2w_bind_hifigan2_file(&path[0] as &const byte) { return 1; }
+    if !t2w_join_path(&path[0], @len(path), dir, "prompt_cache.gguf\0" as &const byte) { return 1; }
+    if !t2w_bind_prompt_cache_file(&path[0] as &const byte) { return 1; }
+    _ = printf("token2wav bind: PASS dir=%s files=5\n", dir);
+    return 0;
+}
+

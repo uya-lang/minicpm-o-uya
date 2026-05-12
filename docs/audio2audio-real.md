@@ -268,6 +268,24 @@ The official `token2wav-gguf` directory currently audits as:
 
 After alias classification, these token2wav files should have zero unknown tensors in audit output. Kernel support is still pending; this table only establishes names and shapes for binding.
 
+Uya now also has a bind-only bundle command:
+
+```sh
+build/minicpm-o-uya token2wav-bind models/MiniCPM-o-4_5-gguf/token2wav-gguf
+# or
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf make token2wav-real-bind
+```
+
+Current bind coverage:
+
+- `encoder.gguf`: `after_norm.*`, `embed.*`, `encoders.*`, `pre_lookahead_layer.*`, `up_embed.*`, `up_encoders.*`, `up_layer.*`
+- `flow_matching.gguf`: `estimator.in_proj.*`, `estimator.t_embedder.*`, all detected `estimator.blocks.*`, and `estimator.final_layer.*`
+- `flow_extra.gguf`: `input_embedding.*`, `encoder_proj.*`, `spk_embed_affine_layer.*`
+- `hifigan2.gguf`: `conv_pre.*`, `conv_post.*`, `ups.*`, `source_downs.*`, `m_source.*`, `f0_predictor.*`
+- `prompt_cache.gguf`: all 5 official cache tensors
+
+This is still bind-only coverage: no token2wav / flow / HiFiGAN forward math is claimed yet.
+
 ## Current Uya Status
 
 `audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, or `--test-prefix prefix --count N` for the llama.cpp-omni convention where `0000` is reference voice and `0001..` are user turns. The next implementation layer is to run the official audio encoder forward and bind the remaining TTS/token2wav tensor families discovered by audit:
@@ -275,11 +293,11 @@ After alias classification, these token2wav files should have zero unknown tenso
 - Audio encoder: bind complete, and `audio-real-encode-probe` now runs correctness-first `conv + transformer + projector + pool` forward for short real clips; it is still too slow for practical long-turn inference.
 - TTS model: bind-only complete for `emb_code.*`, `emb_text.*`, decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, and `head_code.*`; `tts-condition-probe` now aligns `emb_text + projector_semantic + normalize + merge` against `llama.cpp-omni`, while decode/cache forward still pending.
 - Projector: `linear1.*`, `linear2.*`
-- Token2wav encoder: `after_norm.*` and encoder blocks
-- Flow matching: `estimator.*`
-- Flow extra: `input_embedding.*`
-- HiFiGAN2: `conv_pre.*`, `ups.*`, `resblocks.*`, `conv_post.*`
-- Prompt cache: `prompt_cache.*`
+- Token2wav encoder: bind-only complete for `after_norm.*`, `embed.*`, `encoders.*`, `pre_lookahead_layer.*`, `up_embed.*`, `up_encoders.*`, and `up_layer.*`
+- Flow matching: bind-only complete for `estimator.in_proj.*`, `estimator.t_embedder.*`, `estimator.blocks.*`, and `estimator.final_layer.*`
+- Flow extra: bind-only complete for `input_embedding.*`, `encoder_proj.*`, and `spk_embed_affine_layer.*`
+- HiFiGAN2: bind-only complete for `conv_pre.*`, `conv_post.*`, `ups.*`, `source_downs.*`, `m_source.*`, and `f0_predictor.*`
+- Prompt cache: bind-only complete for all 5 official `prompt_cache.*` tensors
 
 ## Acceptance
 

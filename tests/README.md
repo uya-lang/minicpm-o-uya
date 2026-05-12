@@ -83,7 +83,7 @@ Generation smoke coverage uses the deterministic tiny Qwen3-like fixture to vali
 
 Vision smoke coverage uses tiny raw image fixtures to validate patch embedding, one-block vision transformer behavior, resampler/projector binding, image embedding span injection, stable checksum `0xb5a01b45`, placeholder/span alignment, RGB resize/crop-pad/normalize checksum `0xea7fa412`, image manifest parity, video manifest frame/tile counts, and 2D position embedding interpolation.
 
-Audio smoke coverage binds the tiny conv/front-end, one transformer block, output norm, projector, and `<audio>` embedding injection path. Current checks include raw checksum `0xbca0dcc`, embedding checksum `0x625ac595`, non-zero logits diff, PCM preprocessing, real 16 kHz mono WAV/UYAP input probing with explicit rejection of unsupported sample rates/channels, and clear missing-branch errors. Real MiniCPM-o audio GGUF binding is covered by the manual `MINICPM_O_REAL_BUNDLE=/path make audio-real-bind` target. Real TTS GGUF binding is covered by `MINICPM_O_REAL_BUNDLE=/path make tts-real-bind`.
+Audio smoke coverage binds the tiny conv/front-end, one transformer block, output norm, projector, and `<audio>` embedding injection path. Current checks include raw checksum `0xbca0dcc`, embedding checksum `0x625ac595`, non-zero logits diff, PCM preprocessing, real 16 kHz mono WAV/UYAP input probing with explicit rejection of unsupported sample rates/channels, and clear missing-branch errors. Real MiniCPM-o audio GGUF binding is covered by the manual `MINICPM_O_REAL_BUNDLE=/path make audio-real-bind` target. Real TTS GGUF binding is covered by `MINICPM_O_REAL_BUNDLE=/path make tts-real-bind`. Real token2wav / HiFiGAN bind-only coverage is covered by `MINICPM_O_REAL_BUNDLE=/path make token2wav-real-bind`.
 
 Real TTS conditioning coverage is manual because it depends on external `llama.cpp-omni` `llm_debug` artifacts. The current local `chunk_{0..3}` projector/merge alignment results are all in the `1e-8` mean-absolute range with `max_abs=2.384e-7`.
 Real TTS decoder coverage is also manual. The current Uya simplex probe can generate non-empty audio token chunks from the same `llm_debug` inputs, but exact token replay against the saved local `round_000/tts_wav` files is not yet treated as deterministic because that baseline was generated without a pinned sampler seed.
@@ -141,6 +141,7 @@ build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
 build/minicpm-o-uya audio-real-preprocess-probe /path/to/user.wav
 build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya audio-real-encode-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
+build/minicpm-o-uya token2wav-bind /path/to/token2wav-gguf
 build/minicpm-o-uya tts-condition-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_token_ids.txt /path/to/llm_hidden_states.bin --dump-merged /tmp/minicpm-o-uya-merged.bin
 build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_TEXT_GGUF" --audio-model "$MINICPM_O_AUDIO_GGUF" --speech-model "$MINICPM_O_SPEECH_GGUF" --vocoder-model "$MINICPM_O_VOCODER_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"

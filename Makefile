@@ -5,7 +5,7 @@ RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 AUDIO2AUDIO_REAL_ENCODE_PROBE_FLAG := $(if $(MINICPM_O_REAL_ENCODE_PROBE),--encode-probe,)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
 
 build: build-release
 
@@ -222,6 +222,13 @@ tts-real-bind: build
 		exit 2; \
 	fi
 	$(OUT) tts-bind "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf"
+
+token2wav-real-bind: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf make token2wav-real-bind"; \
+		exit 2; \
+	fi
+	$(OUT) token2wav-bind "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf"
 
 tts-condition-probe: build
 	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_TTS_TOKEN_IDS)" ] || [ -z "$(MINICPM_O_TTS_HIDDEN_BIN)" ]; then \
