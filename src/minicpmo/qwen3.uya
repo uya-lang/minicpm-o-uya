@@ -62,12 +62,12 @@ const QWEN3_GGUF_TYPE_UINT64: u32 = 10;
 const QWEN3_GGUF_TYPE_INT64: u32 = 11;
 const QWEN3_GGUF_TYPE_FLOAT64: u32 = 12;
 const QWEN3_MAX_LAYERS: usize = 64;
-const QWEN3_FORWARD_MAX_LAYERS: usize = 32;
+const QWEN3_FORWARD_MAX_LAYERS: usize = 36;
 const QWEN3_FORWARD_MAX_CONTEXT: usize = 4096;
 const QWEN3_FORWARD_COMPAT_CONTEXT: usize = 256;
-const QWEN3_FORWARD_MAX_HIDDEN: usize = 1024;
-const QWEN3_FORWARD_MAX_FFN: usize = 3072;
-const QWEN3_FORWARD_MAX_QDIM: usize = 2048;
+const QWEN3_FORWARD_MAX_HIDDEN: usize = 4096;
+const QWEN3_FORWARD_MAX_FFN: usize = 12288;
+const QWEN3_FORWARD_MAX_QDIM: usize = 4096;
 const QWEN3_FORWARD_MAX_KVDIM: usize = 1024;
 const QWEN3_FORWARD_MAX_VOCAB: usize = 160000;
 const QWEN3_FORWARD_MAX_PROMPT: usize = 256;
@@ -1251,13 +1251,22 @@ fn qwen3_bench_decode_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runti
     return true;
 }
 
+fn qwen3_alloc_logits() &f32 {
+    var logits: &f32 = calloc(QWEN3_FORWARD_MAX_VOCAB, 4) as &f32;
+    if logits == null {
+        _ = printf("error: qwen3 logits allocation failed vocab_cap=%zu\n", QWEN3_FORWARD_MAX_VOCAB);
+    }
+    return logits;
+}
+
 fn qwen3_bench_warmup(model_path: &const byte, bench: &Qwen3BenchConfig) bool {
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
     var weights: Qwen3Weights = qwen3_weights_init();
     var tok: Tokenizer = tokenizer_init();
     var runtime: Qwen3Runtime = qwen3_runtime_init();
-    var logits: [f32: QWEN3_FORWARD_MAX_VOCAB] = [];
+    var logits: &f32 = qwen3_alloc_logits();
+    if logits == null { return false; }
     var seed_ids: [u32: QWEN3_BENCH_SEED_CAP] = [];
     var seed_count: usize = 0;
     if !qwen3_open_runtime(model_path, &config, &table, &weights, &tok, &runtime) { return false; }
@@ -1284,9 +1293,10 @@ fn qwen3_bench_warmup(model_path: &const byte, bench: &Qwen3BenchConfig) bool {
         qwen3_close_runtime(&table, &tok, &runtime);
         return false;
     }
-    const ok: bool = qwen3_append_prompt_ids(&config, &weights, &runtime, prompt_ids as &const u32, bench.prompt_tokens as usize, &logits[0]) && qwen3_bench_decode_tokens(&config, &weights, &runtime, &logits[0], &seed_ids[0], seed_count, bench.gen_tokens as usize);
+    const ok: bool = qwen3_append_prompt_ids(&config, &weights, &runtime, prompt_ids as &const u32, bench.prompt_tokens as usize, logits) && qwen3_bench_decode_tokens(&config, &weights, &runtime, logits, &seed_ids[0], seed_count, bench.gen_tokens as usize);
     free(prompt_ids as &void);
     qwen3_close_runtime(&table, &tok, &runtime);
+    free(logits as &void);
     return ok;
 }
 
@@ -1472,29 +1482,37 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
         var weights: Qwen3Weights = qwen3_weights_init();
         var tok: Tokenizer = tokenizer_init();
         var runtime: Qwen3Runtime = qwen3_runtime_init();
-        var logits: [f32: QWEN3_FORWARD_MAX_VOCAB] = [];
+        var logits: &f32 = qwen3_alloc_logits();
+        if logits == null {
+            free(prompt_ids as &void);
+            return 1;
+        }
         if !qwen3_open_runtime(argv[2] as &const byte, &config, &table, &weights, &tok, &runtime) {
+            free(logits as &void);
             free(prompt_ids as &void);
             return 1;
         }
         const prompt_start: u64 = qwen3_bench_clock_micros();
-        if !qwen3_append_prompt_ids(&config, &weights, &runtime, prompt_ids as &const u32, bench.prompt_tokens as usize, &logits[0]) {
+        if !qwen3_append_prompt_ids(&config, &weights, &runtime, prompt_ids as &const u32, bench.prompt_tokens as usize, logits) {
             free(prompt_ids as &void);
             qwen3_close_runtime(&table, &tok, &runtime);
+            free(logits as &void);
             return 1;
         }
         prompt_micros = prompt_micros + qwen3_bench_elapsed_micros(prompt_start, qwen3_bench_clock_micros());
         prompt_units = prompt_units + (bench.prompt_tokens as u64);
 
         const decode_start: u64 = qwen3_bench_clock_micros();
-        if !qwen3_bench_decode_tokens(&config, &weights, &runtime, &logits[0], &seed_ids[0], seed_count, bench.gen_tokens as usize) {
+        if !qwen3_bench_decode_tokens(&config, &weights, &runtime, logits, &seed_ids[0], seed_count, bench.gen_tokens as usize) {
             free(prompt_ids as &void);
             qwen3_close_runtime(&table, &tok, &runtime);
+            free(logits as &void);
             return 1;
         }
         decode_micros = decode_micros + qwen3_bench_elapsed_micros(decode_start, qwen3_bench_clock_micros());
         decode_units = decode_units + (bench.gen_tokens as u64);
         qwen3_close_runtime(&table, &tok, &runtime);
+        free(logits as &void);
         rep = rep + 1;
     }
     free(prompt_ids as &void);
@@ -1539,19 +1557,21 @@ export fn qwen3_generate_cli(path: &const byte, prompt: &const byte) i32 {
     var weights: Qwen3Weights = qwen3_weights_init();
     var tok: Tokenizer = tokenizer_init();
     var runtime: Qwen3Runtime = qwen3_runtime_init();
-    var logits: [f32: QWEN3_FORWARD_MAX_VOCAB] = [];
-    if !qwen3_prepare_runtime(path, prompt, &config, &table, &weights, &tok, &runtime, &logits[0]) { return 1; }
+    var logits: &f32 = qwen3_alloc_logits();
+    if logits == null { return 1; }
+    if !qwen3_prepare_runtime(path, prompt, &config, &table, &weights, &tok, &runtime, logits) { free(logits as &void); return 1; }
     var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
     if tok.eos_id != QWEN3_TOKENIZER_UNKNOWN_ID { sampler.stop_token = tok.eos_id; }
     _ = printf("generate prompt_tokens:");
     var i: usize = 0;
     while i < runtime.prompt_count { _ = printf(" %u", runtime.prompt_ids[i]); i = i + 1; }
     _ = printf("\n");
-    const rc: i32 = qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, &logits[0], "generated text\0" as &const byte, false);
+    const rc: i32 = qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, logits, "generated text\0" as &const byte, false);
     if rc == 0 {
         _ = printf("logits[0..4]: %.6f %.6f %.6f %.6f %.6f\n", logits[0] as f64, logits[1] as f64, logits[2] as f64, logits[3] as f64, logits[4] as f64);
     }
     tensor_weight_table_detach_mmap(&table);
+    free(logits as &void);
     return rc;
 }
 
@@ -1562,24 +1582,27 @@ export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
     var weights: Qwen3Weights = qwen3_weights_init();
     var tok: Tokenizer = tokenizer_init();
     var runtime: Qwen3Runtime = qwen3_runtime_init();
-    var logits: [f32: QWEN3_FORWARD_MAX_VOCAB] = [];
+    var logits: &f32 = qwen3_alloc_logits();
+    if logits == null { return 1; }
     var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
-    if !qwen3_parse_sampler_args(argc, argv, 4, &sampler) { _ = printf("error: invalid generate sampler args\n"); return 1; }
+    if !qwen3_parse_sampler_args(argc, argv, 4, &sampler) { _ = printf("error: invalid generate sampler args\n"); free(logits as &void); return 1; }
     qwen3_set_thread_count(sampler.threads);
     if !qwen3_open_runtime(argv[2] as &const byte, &config, &table, &weights, &tok, &runtime) { return 1; }
     if sampler.stop_on_eos && tok.eos_id != QWEN3_TOKENIZER_UNKNOWN_ID { sampler.stop_token = tok.eos_id; }
     runtime.seed = sampler.seed;
-    if !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, argv[3] as &const byte, &logits[0]) {
+    if !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, argv[3] as &const byte, logits) {
         qwen3_runtime_free(&runtime);
         tensor_weight_table_detach_mmap(&table);
+        free(logits as &void);
         return 1;
     }
     _ = printf("generate prompt_tokens:");
     var i: usize = 0;
     while i < runtime.prompt_count { _ = printf(" %u", runtime.prompt_ids[i]); i = i + 1; }
     _ = printf("\n");
-    const rc: i32 = qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, &logits[0], "generated text\0" as &const byte, false);
+    const rc: i32 = qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, logits, "generated text\0" as &const byte, false);
     tensor_weight_table_detach_mmap(&table);
+    free(logits as &void);
     return rc;
 }
 
@@ -1602,7 +1625,8 @@ export fn qwen3_chat_cli(argc: i32, argv: & &byte) i32 {
     if sampler.max_new_tokens == 0 { sampler.max_new_tokens = QWEN3_CHAT_DEFAULT_MAX_NEW_TOKENS; }
     qwen3_set_thread_count(sampler.threads);
     runtime.seed = sampler.seed;
-    var logits: [f32: QWEN3_FORWARD_MAX_VOCAB] = [];
+    var logits: &f32 = qwen3_alloc_logits();
+    if logits == null { tensor_weight_table_detach_mmap(&table); return 1; }
     var line: [byte: QWEN3_CHAT_LINE_CAP] = [];
     var turn_prompt: [byte: QWEN3_CHAT_TURN_CAP] = [];
     var close_previous_assistant: bool = false;
@@ -1616,16 +1640,19 @@ export fn qwen3_chat_cli(argc: i32, argv: & &byte) i32 {
         if !tokenizer_format_chat_prompt(&tok, &line[0] as &const byte, close_previous_assistant, &turn_prompt[0], QWEN3_CHAT_TURN_CAP) {
             _ = printf("error: formatted chat prompt exceeds buffer cap=%zu\n", QWEN3_CHAT_TURN_CAP);
             tensor_weight_table_detach_mmap(&table);
+            free(logits as &void);
             return 1;
         }
-        if !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, &turn_prompt[0] as &const byte, &logits[0]) {
+        if !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, &turn_prompt[0] as &const byte, logits) {
             tensor_weight_table_detach_mmap(&table);
+            free(logits as &void);
             return 1;
         }
-        if qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, &logits[0], "assistant text\0" as &const byte, true) != 0 { tensor_weight_table_detach_mmap(&table); return 1; }
+        if qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, logits, "assistant text\0" as &const byte, true) != 0 { tensor_weight_table_detach_mmap(&table); free(logits as &void); return 1; }
         close_previous_assistant = true;
         _ = printf("chat> ");
     }
     tensor_weight_table_detach_mmap(&table);
+    free(logits as &void);
     return 0;
 }

@@ -427,7 +427,7 @@
 - [x] 为 audio encoder 建立官方 tensor alias 表。
 - [x] 为 TTS GGUF 建立 `emb_code`、`emb_text`、`projector_semantic`、`projector_spk`、`head_code` 绑定表。
 - [x] 为 token2wav 建立 encoder、flow_matching、flow_extra、hifigan2、prompt_cache 绑定表。
-- [ ] 对缺失 tensor、未知 dtype、shape mismatch 输出具体分支名和候选 alias。
+- [x] 对缺失 tensor、未知 dtype、shape mismatch 输出具体分支名和候选 alias。
 
 验收标准：
 
@@ -437,8 +437,8 @@
 
 ### 21.3 Qwen3 8B 真实 LLM forward
 
-- [ ] 将 Qwen3 forward 上限从 tiny/smoke cap 提升到 MiniCPM-o 4.5 需要的实际尺寸：`hidden=4096`、`layers=36`、`ffn=12288`、`vocab≈151748`、`ctx>=4096`。
-- [ ] 把大数组从栈上固定数组迁移到 heap/scratch arena，避免 8B 模型运行时栈爆。
+- [x] 将 Qwen3 forward 上限从 tiny/smoke cap 提升到 MiniCPM-o 4.5 需要的实际尺寸：`hidden=4096`、`layers=36`、`ffn=12288`、`vocab≈151748`、`ctx>=4096`。
+- [x] 把大数组从栈上固定数组迁移到 heap/scratch arena，避免 8B 模型运行时栈爆。
 - [ ] 实现/验证 Q4_K、Q5_K、Q6_K、Q8_K、IQ 系列在真实 matvec 中可用，而不只是 parser/byte-size 可识别。
 - [ ] 支持 Qwen3/MiniCPM-o 4.5 的 rope、q/k norm、GQA、KV cache layout 和 chat template。
 - [ ] 支持 prompt prefill 分块、decode step、sampler、stop token、hidden state capture。

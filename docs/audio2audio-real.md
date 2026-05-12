@@ -44,6 +44,10 @@ audio2audio-real: inference_supported=false next=bind-official-tensors
 
 Each file audit also prints a compact inventory with tensor count, dtype distribution, name-prefix counts, and first tensor shape samples. For the official bundle this highlights the next binding groups, for example `encoder.*`, `emb_code.*`, `linear1.*`, `estimator.*`, `conv_post.*`, and `prompt_cache.*`.
 
+Audit diagnostics include candidate next actions for unknown dtype, unclassified tensor prefixes, and key alias shape mismatches. The current shape sanity checks cover representative official MiniCPM-o 4.5 audio, TTS, projector, token2wav, HiFiGAN2, and prompt-cache tensors. A shape mismatch is treated as unsupported until the alias table or expected shape is updated.
+
+The Qwen3 text path now accepts the MiniCPM-o 4.5 text dimensions used by `MiniCPM-o-4_5-Q4_K_M.gguf`: `hidden=4096`, `layers=36`, `ffn=12288`, `ctx>=4096`, and `vocab=151748`. Large forward workspaces and logits buffers are heap-backed rather than fixed stack arrays.
+
 ## Required GGUF Files
 
 The official bundle must include:

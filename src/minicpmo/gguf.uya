@@ -574,6 +574,12 @@ struct AuditStats {
     first_unknown_shape: [u64: 8],
     first_unknown_n_dims: u32,
     first_unknown_ggml_type: u32,
+    shape_mismatch_count: u64,
+    first_shape_mismatch_tensor: [byte: 257],
+    first_shape_mismatch_actual: [u64: 8],
+    first_shape_mismatch_expected: [u64: 8],
+    first_shape_mismatch_actual_dims: u32,
+    first_shape_mismatch_expected_dims: u32,
     has_tokenizer_metadata: bool,
     has_tokenizer_tokens: bool,
     has_special_token_metadata: bool,
@@ -644,6 +650,12 @@ fn audit_stats_init() AuditStats {
         first_unknown_shape: [],
         first_unknown_n_dims: 0,
         first_unknown_ggml_type: 0,
+        shape_mismatch_count: 0,
+        first_shape_mismatch_tensor: [],
+        first_shape_mismatch_actual: [],
+        first_shape_mismatch_expected: [],
+        first_shape_mismatch_actual_dims: 0,
+        first_shape_mismatch_expected_dims: 0,
         has_tokenizer_metadata: false,
         has_tokenizer_tokens: false,
         has_special_token_metadata: false,
@@ -924,6 +936,54 @@ fn audit_is_root_tensor(name: &const byte) bool {
     return false;
 }
 
+fn audit_shape_exact(dims: &u64, n_dims: u32, e0: u64, e1: u64, e2: u64, e3: u64, expected_dims: u32) bool {
+    if n_dims != expected_dims { return false; }
+    if expected_dims > 0 && dims[0] != e0 { return false; }
+    if expected_dims > 1 && dims[1] != e1 { return false; }
+    if expected_dims > 2 && dims[2] != e2 { return false; }
+    if expected_dims > 3 && dims[3] != e3 { return false; }
+    return true;
+}
+
+fn audit_record_shape_mismatch(stats: &AuditStats, name: &const byte, dims: &u64, n_dims: u32, e0: u64, e1: u64, e2: u64, e3: u64, expected_dims: u32) void {
+    stats.shape_mismatch_count = stats.shape_mismatch_count + 1;
+    if stats.shape_mismatch_count != 1 { return; }
+    copy_cstr(&stats.first_shape_mismatch_tensor[0], @len(stats.first_shape_mismatch_tensor), name);
+    audit_copy_shape(&stats.first_shape_mismatch_actual[0], dims, n_dims);
+    stats.first_shape_mismatch_actual_dims = n_dims;
+    stats.first_shape_mismatch_expected_dims = expected_dims;
+    if expected_dims > 0 { stats.first_shape_mismatch_expected[0] = e0; }
+    if expected_dims > 1 { stats.first_shape_mismatch_expected[1] = e1; }
+    if expected_dims > 2 { stats.first_shape_mismatch_expected[2] = e2; }
+    if expected_dims > 3 { stats.first_shape_mismatch_expected[3] = e3; }
+}
+
+fn audit_expect_shape(stats: &AuditStats, name: &const byte, dims: &u64, n_dims: u32, expected_name: &const byte, e0: u64, e1: u64, e2: u64, e3: u64, expected_dims: u32) void {
+    if strcmp(name as *const byte, expected_name as *const byte) != 0 { return; }
+    if !audit_shape_exact(dims, n_dims, e0, e1, e2, e3, expected_dims) {
+        audit_record_shape_mismatch(stats, name, dims, n_dims, e0, e1, e2, e3, expected_dims);
+    }
+}
+
+fn audit_check_known_alias_shape(stats: &AuditStats, name: &const byte, dims: &u64, n_dims: u32) void {
+    audit_expect_shape(stats, name, dims, n_dims, "encoder.conv1.bias\0" as &const byte, 1, 1024, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "encoder.conv1.weight\0" as &const byte, 3, 80, 1024, 0, 3);
+    audit_expect_shape(stats, name, dims, n_dims, "encoder.conv2.weight\0" as &const byte, 3, 1024, 1024, 0, 3);
+    audit_expect_shape(stats, name, dims, n_dims, "encoder.positional_embedding\0" as &const byte, 1024, 1500, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "audio_projector.linear1.weight\0" as &const byte, 1024, 4096, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "audio_projector.linear2.weight\0" as &const byte, 4096, 4096, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "emb_code.0.weight\0" as &const byte, 768, 6562, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "emb_text.weight\0" as &const byte, 768, 152064, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "head_code.0.weight\0" as &const byte, 6562, 768, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "linear1.weight\0" as &const byte, 4096, 768, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "linear2.weight\0" as &const byte, 768, 768, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "after_norm.bias\0" as &const byte, 512, 0, 0, 0, 1);
+    audit_expect_shape(stats, name, dims, n_dims, "input_embedding.weight\0" as &const byte, 512, 6561, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "estimator.in_proj.weight\0" as &const byte, 320, 512, 0, 0, 2);
+    audit_expect_shape(stats, name, dims, n_dims, "conv_post.bias\0" as &const byte, 18, 0, 0, 0, 1);
+    audit_expect_shape(stats, name, dims, n_dims, "prompt_cache.spk_cb\0" as &const byte, 192, 0, 0, 0, 1);
+}
+
 fn audit_mark_tensor_prefixes(stats: &AuditStats, name: &const byte) void {
     if cstr_starts_with_ci(name, "blk.\0" as &const byte) { stats.prefix_blk_count = stats.prefix_blk_count + 1; }
     if cstr_starts_with_ci(name, "encoder.\0" as &const byte) { stats.prefix_audio_encoder_count = stats.prefix_audio_encoder_count + 1; }
@@ -1058,6 +1118,7 @@ fn audit_tensor_info(reader: &BinaryReader, stats: &AuditStats, data_start: u64)
         stats.unknown_dtype_count = stats.unknown_dtype_count + 1;
     }
     audit_mark_tensor_branch(stats, &name[0] as &const byte, &dims[0], n_dims, ggml_type);
+    audit_check_known_alias_shape(stats, &name[0] as &const byte, &dims[0], n_dims);
 
     var byte_count: u64 = 0;
     var absolute_offset: u64 = 0;
