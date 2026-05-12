@@ -33,6 +33,18 @@ build/minicpm-o-uya audio2audio-real --audit-only \
   --tts models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf \
   --projector models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-projector-F16.gguf \
   --token2wav-dir models/MiniCPM-o-4_5-gguf/token2wav-gguf
+
+# Optional input-protocol audit. This validates that ref/user audio are true
+# 16 kHz mono WAV PCM16/WAV F32/UYAP PCM, without auto-transcoding.
+build/minicpm-o-uya audio2audio-real --audit-only \
+  --llm models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+  --audio models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf \
+  --tts models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf \
+  --projector models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-projector-F16.gguf \
+  --token2wav-dir models/MiniCPM-o-4_5-gguf/token2wav-gguf \
+  --ref-audio outputs/complex_case2/complex2_0000.wav \
+  --input-audio outputs/complex_case2/complex2_0001.wav \
+  --out outputs/uya_audio2audio_answer.wav
 ```
 
 Expected success marker:
@@ -40,6 +52,15 @@ Expected success marker:
 ```text
 audio2audio-real: audit-only PASS files=9
 audio2audio-real: inference_supported=false next=bind-official-tensors
+```
+
+When audio inputs are supplied, the audit additionally prints `audio2audio-real input protocol`, per-file `audio input[ref]` / `audio input[user]` summaries, sample checksum, duration, peak, and RMS. Non-16 kHz mono files fail fast with an explicit transcode/downmix diagnostic. The same check can be run with:
+
+```sh
+MINICPM_O_REAL_BUNDLE=models/MiniCPM-o-4_5-gguf \
+MINICPM_O_REAL_REF_AUDIO=outputs/complex_case2/complex2_0000.wav \
+MINICPM_O_REAL_USER_AUDIO=outputs/complex_case2/complex2_0001.wav \
+make audio2audio-real-input-audit
 ```
 
 Each file audit also prints a compact inventory with tensor count, dtype distribution, name-prefix counts, and first tensor shape samples. For the official bundle this highlights the next binding groups, for example `encoder.*`, `emb_code.*`, `linear1.*`, `estimator.*`, `conv_post.*`, and `prompt_cache.*`.
@@ -108,7 +129,7 @@ After alias classification, these token2wav files should have zero unknown tenso
 
 ## Current Uya Status
 
-`audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package gate for the full implementation. The next implementation layer is to bind the official tensor families discovered by audit:
+`audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, or `--input-prefix prefix` which resolves to `prefix_0000.wav` for reference voice and `prefix_0001.wav` for user speech. The next implementation layer is to bind the official tensor families discovered by audit:
 
 - Audio encoder: `encoder.*`
 - TTS model: `emb_code.*` and model-specific decoder tensors

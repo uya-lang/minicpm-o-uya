@@ -6,9 +6,11 @@ use minicpmo.binary.BinaryReader;
 use minicpmo.binary.binary_close;
 use minicpmo.binary.binary_open;
 use minicpmo.binary.binary_read_exact;
+use minicpmo.binary.binary_read_u16_le;
 use minicpmo.binary.binary_read_u32_le;
 use minicpmo.binary.binary_read_u64_le;
 use minicpmo.binary.binary_reader_init;
+use minicpmo.binary.binary_seek;
 use minicpmo.binary.binary_skip;
 use minicpmo.kernels.silu;
 use minicpmo.kernels.softmax;
@@ -84,6 +86,15 @@ const AUDIO_EPS: f32 = 0.000001;
 const AUDIO_PI: f32 = 3.14159265358979323846;
 const AUDIO_MAX_PCM_SAMPLES: usize = 4096;
 const AUDIO_MAX_STFT_BINS: usize = 65;
+const AUDIO_WAV_RIFF: u32 = 0x46464952;
+const AUDIO_WAV_WAVE: u32 = 0x45564157;
+const AUDIO_WAV_FMT: u32 = 0x20746d66;
+const AUDIO_WAV_DATA: u32 = 0x61746164;
+const AUDIO_WAV_FORMAT_PCM: u16 = 1;
+const AUDIO_WAV_FORMAT_FLOAT: u16 = 3;
+const AUDIO_REAL_SAMPLE_RATE: u32 = 16000;
+const AUDIO_REAL_CHANNELS: u16 = 1;
+
 
 export struct AudioConfig {
     frame_count: u32,
@@ -332,6 +343,184 @@ fn audio_raw_load(path: &const byte, raw: &AudioRawMel) bool {
     return true;
 }
 
+
+fn audio_probe_update(checksum: &u32, peak: &f32, sum_sq: &f32, value: f32) void {
+    var abs_value: f32 = value;
+    if abs_value < 0.0 { abs_value = 0.0 - abs_value; }
+    if abs_value > peak[0] { peak[0] = abs_value; }
+    sum_sq[0] = sum_sq[0] + value * value;
+    const bits: &const u32 = &value as &const u32;
+    checksum[0] = (checksum[0] ^ bits[0]) * 16777619;
+}
+
+fn audio_probe_print(role: &const byte, path: &const byte, container: &const byte, dtype: &const byte, sample_rate: u32, channels: u32, sample_count: u64, checksum: u32, peak: f32, rms: f32) void {
+    const duration_ms: u64 = sample_count * (1000 as u64) / (sample_rate as u64);
+    _ = printf("audio input[%s]: path=%s container=%s dtype=%s sample_rate=%u channels=%u samples=%llu duration_ms=%llu checksum=0x%x peak=%.6f rms=%.6f\n", role, path, container, dtype, sample_rate, channels, sample_count, duration_ms, checksum, peak as f64, rms as f64);
+}
+
+fn audio_probe_require_real(role: &const byte, sample_rate: u32, channels: u32) bool {
+    if sample_rate != AUDIO_REAL_SAMPLE_RATE {
+        _ = printf("error: audio input[%s] unsupported sample_rate=%u expected=16000; transcode explicitly before running Uya\n", role, sample_rate);
+        return false;
+    }
+    if channels != AUDIO_REAL_CHANNELS as u32 {
+        _ = printf("error: audio input[%s] unsupported channels=%u expected=mono; downmix explicitly before running Uya\n", role, channels);
+        return false;
+    }
+    return true;
+}
+
+fn audio_probe_uyap(path: &const byte, role: &const byte, reader: &BinaryReader) bool {
+    var version: u32 = 0;
+    var sample_rate: u32 = 0;
+    var channels: u32 = 0;
+    var sample_count32: u32 = 0;
+    var dtype: u32 = 0;
+    if !binary_read_u32_le(reader, &version, "audio probe UYAP version\0" as &const byte) { return false; }
+    if version != AUDIO_RAW_VERSION { _ = printf("error: audio input[%s] UYAP unsupported version=%u\n", role, version); return false; }
+    if !binary_read_u32_le(reader, &sample_rate, "audio probe UYAP sample rate\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &channels, "audio probe UYAP channels\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &sample_count32, "audio probe UYAP sample count\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &dtype, "audio probe UYAP dtype\0" as &const byte) { return false; }
+    if !audio_probe_require_real(role, sample_rate, channels) { return false; }
+    const total: u64 = (sample_count32 as u64) * (channels as u64);
+    var checksum: u32 = 2166136261;
+    var peak: f32 = 0.0;
+    var sum_sq: f32 = 0.0;
+    var index: u64 = 0;
+    if dtype == AUDIO_PCM_DTYPE_F32 {
+        while index < total {
+            var value: f32 = 0.0;
+            if !audio_read_f32(reader, &value) { return false; }
+            audio_probe_update(&checksum, &peak, &sum_sq, value);
+            index = index + 1;
+        }
+        if reader.pos != reader.size { _ = printf("error: audio input[%s] UYAP has trailing bytes=%llu\n", role, reader.size - reader.pos); return false; }
+        var rms: f32 = 0.0; if total > 0 { rms = sqrtf(sum_sq / (total as f32)); }
+        audio_probe_print(role, path, "uyap\0" as &const byte, "f32\0" as &const byte, sample_rate, channels, sample_count32 as u64, checksum, peak, rms);
+        return true;
+    }
+    if dtype == AUDIO_PCM_DTYPE_S16 {
+        while index < total {
+            var bits: u32 = 0;
+            if !binary_read_u32_le(reader, &bits, "audio probe UYAP s16-as-i32\0" as &const byte) { return false; }
+            var signed: i32 = bits as i32;
+            const value: f32 = (signed as f32) / 32768.0;
+            audio_probe_update(&checksum, &peak, &sum_sq, value);
+            index = index + 1;
+        }
+        if reader.pos != reader.size { _ = printf("error: audio input[%s] UYAP has trailing bytes=%llu\n", role, reader.size - reader.pos); return false; }
+        var rms: f32 = 0.0; if total > 0 { rms = sqrtf(sum_sq / (total as f32)); }
+        audio_probe_print(role, path, "uyap\0" as &const byte, "s16-i32-container\0" as &const byte, sample_rate, channels, sample_count32 as u64, checksum, peak, rms);
+        return true;
+    }
+    _ = printf("error: audio input[%s] UYAP dtype=%u unsupported\n", role, dtype);
+    return false;
+}
+
+fn audio_probe_wav_samples(path: &const byte, role: &const byte, reader: &BinaryReader, data_pos: u64, data_size: u32, format_tag: u16, sample_rate: u32, channels: u16, bits_per_sample: u16) bool {
+    if !audio_probe_require_real(role, sample_rate, channels as u32) { return false; }
+    var bytes_per_sample: u32 = 0;
+    var dtype: &const byte = "unknown\0" as &const byte;
+    if format_tag == AUDIO_WAV_FORMAT_PCM && bits_per_sample == 16 { bytes_per_sample = 2; dtype = "s16\0" as &const byte; }
+    else { if format_tag == AUDIO_WAV_FORMAT_FLOAT && bits_per_sample == 32 { bytes_per_sample = 4; dtype = "f32\0" as &const byte; }
+    else { _ = printf("error: audio input[%s] WAV unsupported format_tag=%u bits_per_sample=%u; expected PCM16 or IEEE_FLOAT32\n", role, format_tag as u32, bits_per_sample as u32); return false; } }
+    const frame_bytes: u32 = (channels as u32) * bytes_per_sample;
+    if frame_bytes == 0 || data_size % frame_bytes != 0 { _ = printf("error: audio input[%s] WAV data bytes=%u not aligned to frame_bytes=%u\n", role, data_size, frame_bytes); return false; }
+    const sample_count: u64 = (data_size / frame_bytes) as u64;
+    if sample_count == 0 { _ = printf("error: audio input[%s] WAV has no samples\n", role); return false; }
+    if !binary_seek(reader, data_pos, "audio WAV data seek\0" as &const byte) { return false; }
+    var checksum: u32 = 2166136261;
+    var peak: f32 = 0.0;
+    var sum_sq: f32 = 0.0;
+    var index: u64 = 0;
+    const total: u64 = sample_count * (channels as u64);
+    while index < total {
+        var value: f32 = 0.0;
+        if format_tag == AUDIO_WAV_FORMAT_PCM {
+            var raw: u16 = 0;
+            if !binary_read_u16_le(reader, &raw, "audio WAV s16 sample\0" as &const byte) { return false; }
+            var signed: i32 = raw as i32;
+            if raw >= (32768 as u16) { signed = signed - 65536; }
+            value = (signed as f32) / 32768.0;
+        } else {
+            if !audio_read_f32(reader, &value) { return false; }
+        }
+        audio_probe_update(&checksum, &peak, &sum_sq, value);
+        index = index + 1;
+    }
+    var rms: f32 = 0.0; if total > 0 { rms = sqrtf(sum_sq / (total as f32)); }
+    audio_probe_print(role, path, "wav\0" as &const byte, dtype, sample_rate, channels as u32, sample_count, checksum, peak, rms);
+    return true;
+}
+
+fn audio_probe_wav(path: &const byte, role: &const byte, reader: &BinaryReader) bool {
+    var riff_size: u32 = 0;
+    var wave: u32 = 0;
+    if !binary_read_u32_le(reader, &riff_size, "audio WAV RIFF size\0" as &const byte) { return false; }
+    if !binary_read_u32_le(reader, &wave, "audio WAV WAVE magic\0" as &const byte) { return false; }
+    if wave != AUDIO_WAV_WAVE { _ = printf("error: audio input[%s] bad WAV magic\n", role); return false; }
+    var format_tag: u16 = 0;
+    var channels: u16 = 0;
+    var sample_rate: u32 = 0;
+    var bits_per_sample: u16 = 0;
+    var data_pos: u64 = 0;
+    var data_size: u32 = 0;
+    var have_fmt: bool = false;
+    var have_data: bool = false;
+    while reader.pos + (8 as u64) <= reader.size {
+        var chunk_id: u32 = 0;
+        var chunk_size: u32 = 0;
+        if !binary_read_u32_le(reader, &chunk_id, "audio WAV chunk id\0" as &const byte) { return false; }
+        if !binary_read_u32_le(reader, &chunk_size, "audio WAV chunk size\0" as &const byte) { return false; }
+        const payload_pos: u64 = reader.pos;
+        var padded: u64 = chunk_size as u64;
+        if padded % (2 as u64) != 0 { padded = padded + 1; }
+        if payload_pos + padded > reader.size { _ = printf("error: audio input[%s] WAV chunk extends past EOF\n", role); return false; }
+        if chunk_id == AUDIO_WAV_FMT {
+            if chunk_size < 16 { _ = printf("error: audio input[%s] WAV fmt chunk too small=%u\n", role, chunk_size); return false; }
+            var byte_rate: u32 = 0; var block_align: u16 = 0;
+            if !binary_read_u16_le(reader, &format_tag, "audio WAV format tag\0" as &const byte) { return false; }
+            if !binary_read_u16_le(reader, &channels, "audio WAV channels\0" as &const byte) { return false; }
+            if !binary_read_u32_le(reader, &sample_rate, "audio WAV sample rate\0" as &const byte) { return false; }
+            if !binary_read_u32_le(reader, &byte_rate, "audio WAV byte rate\0" as &const byte) { return false; }
+            if !binary_read_u16_le(reader, &block_align, "audio WAV block align\0" as &const byte) { return false; }
+            if !binary_read_u16_le(reader, &bits_per_sample, "audio WAV bits per sample\0" as &const byte) { return false; }
+            have_fmt = true;
+        } else {
+            if chunk_id == AUDIO_WAV_DATA {
+                data_pos = payload_pos;
+                data_size = chunk_size;
+                have_data = true;
+            }
+        }
+        if !binary_seek(reader, payload_pos + padded, "audio WAV next chunk\0" as &const byte) { return false; }
+        if have_fmt && have_data { break; }
+    }
+    _ = riff_size;
+    if !have_fmt { _ = printf("error: audio input[%s] WAV missing fmt chunk\n", role); return false; }
+    if !have_data { _ = printf("error: audio input[%s] WAV missing data chunk\n", role); return false; }
+    return audio_probe_wav_samples(path, role, reader, data_pos, data_size, format_tag, sample_rate, channels, bits_per_sample);
+}
+
+export fn audio_input_probe_file(path: &const byte, role: &const byte) bool {
+    var reader: BinaryReader = binary_reader_init();
+    if !binary_open(path, &reader) { return false; }
+    var magic: u32 = 0;
+    if !binary_read_u32_le(&reader, &magic, "audio input magic\0" as &const byte) { binary_close(&reader); return false; }
+    var ok: bool = false;
+    if magic == AUDIO_WAV_RIFF { ok = audio_probe_wav(path, role, &reader); }
+    else { if magic == AUDIO_PCM_MAGIC { ok = audio_probe_uyap(path, role, &reader); }
+    else { _ = printf("error: audio input[%s] unsupported container magic=0x%x; expected RIFF/WAVE or UYAP\n", role, magic); ok = false; } }
+    binary_close(&reader);
+    return ok;
+}
+
+export fn audio_input_probe_cli(audio_path: &const byte) i32 {
+    if !audio_input_probe_file(audio_path, "probe\0" as &const byte) { return 1; }
+    _ = printf("audio-input-probe: PASS\n");
+    return 0;
+}
 
 fn audio_pcm_load(path: &const byte, pcm: &AudioRawPcm) bool {
     pcm[0] = audio_pcm_init();

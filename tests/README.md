@@ -36,7 +36,7 @@ Generated files:
 - `tests/fixtures/tiny_image.uyim` — `UYIM` image manifest with embedded `UYRG` payload.
 - `tests/fixtures/tiny_video.uyvm` — `UYVM` video-frame manifest with embedded `UYRG` frames; no MP4 decoding is involved.
 - `tests/fixtures/tiny_audio.raw` — `UYAM` log-mel F32 audio fixture.
-- `tests/fixtures/tiny_audio.pcm` — `UYAP` PCM fixture for preprocessing smoke.
+- `tests/fixtures/tiny_audio.pcm` — `UYAP` PCM fixture for preprocessing smoke. `audio-input-fixture` additionally generates temporary 16 kHz mono WAV/UYAP files under `/tmp` to validate real input probing.
 - `tests/fixtures/tiny_omni.json` — mixed text/image/audio/speech prompt manifest for omni smoke and benchmark.
 - `tests/fixtures/tiny_stream.json` — streaming event manifest for queue/ring/interrupt smoke.
 
@@ -75,7 +75,7 @@ Generation smoke coverage uses the deterministic tiny Qwen3-like fixture to vali
 
 Vision smoke coverage uses tiny raw image fixtures to validate patch embedding, one-block vision transformer behavior, resampler/projector binding, image embedding span injection, stable checksum `0xb5a01b45`, placeholder/span alignment, RGB resize/crop-pad/normalize checksum `0xea7fa412`, image manifest parity, video manifest frame/tile counts, and 2D position embedding interpolation.
 
-Audio smoke coverage binds the tiny conv/front-end, one transformer block, output norm, projector, and `<audio>` embedding injection path. Current checks include raw checksum `0xbca0dcc`, embedding checksum `0x625ac595`, non-zero logits diff, PCM preprocessing, and clear missing-branch errors.
+Audio smoke coverage binds the tiny conv/front-end, one transformer block, output norm, projector, and `<audio>` embedding injection path. Current checks include raw checksum `0xbca0dcc`, embedding checksum `0x625ac595`, non-zero logits diff, PCM preprocessing, real 16 kHz mono WAV/UYAP input probing with explicit rejection of unsupported sample rates/channels, and clear missing-branch errors.
 
 Audio-to-audio smoke coverage runs `audio2audio-smoke` from `UYAP` PCM input through mel preprocessing, audio encoder, Qwen prompt prefill, speech token generation, vocoder decode, and WAV writing. It validates the audio-conditioned logits differ from text-only logits, writes a RIFF/WAVE file, checks sample rate/data bytes, and exercises both single-GGUF and split `--audio-model`/`--speech-model`/`--vocoder-model` argument forms.
 

@@ -1,6 +1,7 @@
 use libc.printf;
 use libc.strcmp;
 use libc.snprintf;
+use minicpmo.audio.audio_input_probe_file;
 use minicpmo.binary.BinaryReader;
 use minicpmo.binary.binary_close;
 use minicpmo.binary.binary_open;
@@ -1384,7 +1385,8 @@ fn audit_join_path(dir: &const byte, leaf: &const byte, out: &byte, cap: usize) 
 }
 
 fn audit_bundle_usage() void {
-    _ = printf("usage: minicpm-o-uya audio2audio-real --audit-only --llm <llm.gguf> --audio <audio.gguf> --tts <tts.gguf> --projector <projector.gguf> --token2wav-dir <dir>\n");
+    _ = printf("usage: minicpm-o-uya audio2audio-real [--audit-only] --llm <llm.gguf> --audio <audio.gguf> --tts <tts.gguf> --projector <projector.gguf> --token2wav-dir <dir>\n");
+    _ = printf("       [--ref-audio ref.wav] [--user-audio user.wav|--input-audio user.wav] [--input-prefix prefix] [--out out.wav]\n");
 }
 
 export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
@@ -1393,6 +1395,12 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
     var tts_path: &const byte = null;
     var projector_path: &const byte = null;
     var token2wav_dir: &const byte = null;
+    var ref_audio_path: &const byte = null;
+    var user_audio_path: &const byte = null;
+    var input_prefix: &const byte = null;
+    var out_path: &const byte = null;
+    var prefix_ref_path: [byte: 512] = [];
+    var prefix_user_path: [byte: 512] = [];
     var audit_only: bool = false;
     var i: i32 = 2;
     while i < argc {
@@ -1431,15 +1439,55 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
             i = i + 2;
             continue;
         }
+        if strcmp(argv[i] as *const byte, "--ref-audio\0" as *const byte) == 0 {
+            if i + 1 >= argc { audit_bundle_usage(); return 1; }
+            ref_audio_path = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--user-audio\0" as *const byte) == 0 || strcmp(argv[i] as *const byte, "--input-audio\0" as *const byte) == 0 {
+            if i + 1 >= argc { audit_bundle_usage(); return 1; }
+            user_audio_path = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--input-prefix\0" as *const byte) == 0 {
+            if i + 1 >= argc { audit_bundle_usage(); return 1; }
+            input_prefix = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--out\0" as *const byte) == 0 {
+            if i + 1 >= argc { audit_bundle_usage(); return 1; }
+            out_path = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
+        }
         audit_bundle_usage();
         return 1;
     }
-    if !audit_only || llm_path == null || audio_path == null || tts_path == null || projector_path == null || token2wav_dir == null {
+    if llm_path == null || audio_path == null || tts_path == null || projector_path == null || token2wav_dir == null {
         audit_bundle_usage();
+        return 1;
+    }
+    if input_prefix != null {
+        if ref_audio_path == null {
+            const written_ref: i32 = snprintf(&prefix_ref_path[0] as *byte, @len(prefix_ref_path), "%s_0000.wav\0" as *const byte, input_prefix);
+            if written_ref < 0 || (written_ref as usize) >= @len(prefix_ref_path) { _ = printf("error: input-prefix ref path too long: %s\n", input_prefix); return 1; }
+            ref_audio_path = &prefix_ref_path[0] as &const byte;
+        }
+        if user_audio_path == null {
+            const written_user: i32 = snprintf(&prefix_user_path[0] as *byte, @len(prefix_user_path), "%s_0001.wav\0" as *const byte, input_prefix);
+            if written_user < 0 || (written_user as usize) >= @len(prefix_user_path) { _ = printf("error: input-prefix user path too long: %s\n", input_prefix); return 1; }
+            user_audio_path = &prefix_user_path[0] as &const byte;
+        }
+    }
+    if (ref_audio_path == null && user_audio_path != null) || (ref_audio_path != null && user_audio_path == null) {
+        _ = printf("error: audio2audio-real requires both ref and user audio; use --ref-audio with --user-audio or --input-prefix\n");
         return 1;
     }
 
-    _ = printf("audio2audio-real: audit-only bundle validation\n");
+    _ = printf("audio2audio-real: bundle validation\n");
     var ok: bool = true;
     if !audit_bundle_one("llm\0" as &const byte, llm_path) { ok = false; }
     if !audit_bundle_one("audio\0" as &const byte, audio_path) { ok = false; }
@@ -1464,7 +1512,19 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
     } else { ok = false; }
 
     if !ok { return 1; }
-    _ = printf("audio2audio-real: audit-only PASS files=9\n");
-    _ = printf("audio2audio-real: inference_supported=false next=bind-official-tensors\n");
-    return 0;
+    if ref_audio_path != null && user_audio_path != null {
+        _ = printf("audio2audio-real input protocol: ref_audio=%s user_audio=%s\n", ref_audio_path, user_audio_path);
+        if out_path != null { _ = printf("audio2audio-real output target: %s\n", out_path); }
+        if !audio_input_probe_file(ref_audio_path, "ref\0" as &const byte) { return 1; }
+        if !audio_input_probe_file(user_audio_path, "user\0" as &const byte) { return 1; }
+        _ = printf("audio2audio-real input-audit PASS ref_user=2\n");
+    }
+    if audit_only {
+        _ = printf("audio2audio-real: audit-only PASS files=9\n");
+        _ = printf("audio2audio-real: inference_supported=false next=bind-official-tensors\n");
+        return 0;
+    }
+    _ = printf("error: audio2audio-real inference is not implemented yet; use --audit-only to validate bundle and input protocol\n");
+    _ = printf("audio2audio-real: inference_supported=false next=bind-audio-encoder-forward\n");
+    return 1;
 }

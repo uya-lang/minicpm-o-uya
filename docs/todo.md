@@ -410,7 +410,7 @@
 - [x] 记录正确离线测试协议：`prefix_0000.wav` 是 reference/system voice，`prefix_0001.wav` 起才是用户输入。
 - [x] 生成 `outputs/nihao_case` 和 `outputs/complex_case2` 作为行为基线。
 - [x] 记录错误用法风险：只传 `prefix_0000.wav` 会被当作参考音色，容易看起来像复述输入。
-- [ ] 增加不入库的外部 baseline manifest，记录模型路径、输入 wav、输出 wav、回答文本、运行日志路径。
+- [x] 增加不入库的外部 baseline manifest，记录模型路径、输入 wav、输出 wav、回答文本、运行日志路径。
 - [x] 增加 `docs/audio2audio-real.md`，明确 baseline 命令、输入文件命名、输出目录和验收口径。
 
 验收标准：
@@ -460,13 +460,17 @@
 
 ### 21.4 Audio encoder 与用户语音注入
 
-- [ ] 支持真实 PCM/WAV 读取：16 kHz mono s16/f32，并明确拒绝不支持格式或自动转码路径。
+- [x] 支持真实 PCM/WAV 读取：16 kHz mono s16/f32，并明确拒绝不支持格式或自动转码路径。
+  - [x] `audio-input-probe` 支持 RIFF/WAVE PCM16、RIFF/WAVE F32 和现有 UYAP PCM；非 16 kHz mono 明确报错，不自动转码。
 - [ ] 对齐官方 audio preprocessing：window、STFT、mel、chunking、padding、streaming cache。
 - [ ] 移除 tiny audio cap，支持真实用户语音长度和多 chunk 输入。
+  - [x] 输入 probe 流式扫描真实 WAV/UYAP，不受 tiny mel cap 限制；真实 mel/audio encoder forward 仍待接入。
 - [ ] 绑定官方 audio encoder tensors，并实现对应 conv/transformer/projector forward。
 - [ ] 实现正确 prompt 协议：reference audio 进入 system prompt，user audio 进入 `<|im_start|>user` turn。
-- [ ] 支持 `prefix_0000.wav`/`prefix_0001.wav` 测试格式，也支持显式 `--ref-audio`/`--user-audio` 参数。
+  - [x] `audio2audio-real --audit-only` 已区分 `ref_audio` 和 `user_audio`，并在协议日志中输出两者路径。
+- [x] 支持 `prefix_0000.wav`/`prefix_0001.wav` 测试格式，也支持显式 `--ref-audio`/`--user-audio` 参数。
 - [ ] 保存 audio embedding checksum、span count、n_pos、prefill timing 便于与 llama.cpp-omni 对照。
+  - [x] 输入阶段已保存 sample checksum、duration、peak、rms；embedding checksum 待 audio encoder forward 后输出。
 
 验收标准：
 
@@ -511,8 +515,9 @@
 
 - [x] 新增真实 CLI，不复用 smoke 名称：`audio2audio-real`。
 - [x] 支持显式分文件参数：`--llm`、`--audio`、`--tts`、`--projector`、`--token2wav-dir`。
-- [ ] 支持输入参数：`--ref-audio`、`--user-audio`、`--out`。
+- [x] 支持输入参数：`--ref-audio`、`--user-audio`/`--input-audio`、`--out`。
 - [ ] 支持 llama.cpp-omni 测试格式：`--test-prefix PREFIX --count N`，其中 `0000` 是 ref，`0001..` 是 user turn。
+  - [x] 支持单轮 `--input-prefix PREFIX`，自动解析 `PREFIX_0000.wav` 为 ref、`PREFIX_0001.wav` 为 user。
 - [ ] 输出回答文本、answer wav、turn wav、audio token chunks、timing log。
 - [ ] 增加 `--text-only`、`--no-tts`、`--dump-hidden`、`--dump-embeddings` 诊断模式。
 - [ ] 所有真实模型命令默认要求显式路径，不从仓库内隐式下载模型。

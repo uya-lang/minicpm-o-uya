@@ -4,7 +4,7 @@ OUT := build/minicpm-o-uya
 RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio2audio-real-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio2audio-real-audit audio2audio-real-input-audit clean FORCE
 
 build: build-release
 
@@ -20,7 +20,7 @@ build-release:
 
 test:
 	$(UYA) test src/*.uya src/minicpmo/*.uya
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -168,6 +168,22 @@ speech-fixture: FORCE build fixtures
 	grep -q "speech wav: path=/tmp/minicpm-o-uya-speech.wav bytes=172" /tmp/minicpm-o-uya-speech.out
 	python3 -c 'from pathlib import Path; b=Path("/tmp/minicpm-o-uya-speech.wav").read_bytes(); assert len(b)==172 and b[:4]==b"RIFF" and b[8:12]==b"WAVE" and int.from_bytes(b[24:28],"little")==24000 and int.from_bytes(b[40:44],"little")==128'
 
+audio-input-fixture: FORCE build
+	python3 -c 'from pathlib import Path; import wave, struct, math; p=Path("/tmp/minicpm-o-uya-audio-probe.wav"); w=wave.open(str(p),"wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(b"".join(struct.pack("<h", int(12000*math.sin(2*math.pi*440*i/16000))) for i in range(32))); w.close()'
+	$(OUT) audio-input-probe /tmp/minicpm-o-uya-audio-probe.wav >/tmp/minicpm-o-uya-audio-probe.out
+	grep -q "audio input\[probe\]: path=/tmp/minicpm-o-uya-audio-probe.wav container=wav dtype=s16 sample_rate=16000 channels=1 samples=32" /tmp/minicpm-o-uya-audio-probe.out
+	grep -q "audio-input-probe: PASS" /tmp/minicpm-o-uya-audio-probe.out
+	python3 -c 'from pathlib import Path; import struct; p=Path("/tmp/minicpm-o-uya-audio-probe.uyap.pcm"); samples=[0, 1024, -2048, 4096]; p.write_bytes(struct.pack("<IIIIII", 0x50415955, 1, 16000, 1, len(samples), 0) + b"".join(struct.pack("<i", x) for x in samples))'
+	$(OUT) audio-input-probe /tmp/minicpm-o-uya-audio-probe.uyap.pcm >/tmp/minicpm-o-uya-audio-probe-uyap.out
+	grep -q "container=uyap dtype=s16-i32-container sample_rate=16000 channels=1 samples=4" /tmp/minicpm-o-uya-audio-probe-uyap.out
+	python3 -c 'from pathlib import Path; import wave, struct; p=Path("/tmp/minicpm-o-uya-audio-probe-bad.wav"); w=wave.open(str(p),"wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(8000); w.writeframes(struct.pack("<hhhh", 1, 2, 3, 4)); w.close()'
+	@if $(OUT) audio-input-probe /tmp/minicpm-o-uya-audio-probe-bad.wav >/tmp/minicpm-o-uya-audio-probe-bad.out 2>&1; then \
+		echo "expected non-16k-mono wav probe to fail"; \
+		exit 1; \
+	else \
+		grep -q "unsupported sample_rate=8000 expected=16000" /tmp/minicpm-o-uya-audio-probe-bad.out; \
+	fi
+
 audio2audio-fixture: FORCE build fixtures
 	$(OUT) audio2audio-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_audio.pcm /tmp/minicpm-o-uya-audio2audio.wav >/tmp/minicpm-o-uya-audio2audio.out
 	$(OUT) audio2audio-smoke tests/fixtures/tiny.gguf --audio-model tests/fixtures/tiny.gguf --speech-model tests/fixtures/tiny.gguf --vocoder-model tests/fixtures/tiny.gguf tests/fixtures/tiny_audio.pcm /tmp/minicpm-o-uya-audio2audio-multi.wav >/tmp/minicpm-o-uya-audio2audio-multi.out
@@ -200,6 +216,21 @@ audio2audio-real-audit: build
 		--tts "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf" \
 		--projector "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-projector-F16.gguf" \
 		--token2wav-dir "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf"
+
+audio2audio-real-input-audit: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_REAL_REF_AUDIO)" ] || [ -z "$(MINICPM_O_REAL_USER_AUDIO)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_REF_AUDIO=ref.wav MINICPM_O_REAL_USER_AUDIO=user.wav [MINICPM_O_REAL_OUT=out.wav] make audio2audio-real-input-audit"; \
+		exit 2; \
+	fi
+	$(OUT) audio2audio-real --audit-only \
+		--llm "$(MINICPM_O_REAL_BUNDLE)/MiniCPM-o-4_5-Q4_K_M.gguf" \
+		--audio "$(MINICPM_O_REAL_BUNDLE)/audio/MiniCPM-o-4_5-audio-F16.gguf" \
+		--tts "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf" \
+		--projector "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-projector-F16.gguf" \
+		--token2wav-dir "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf" \
+		--ref-audio "$(MINICPM_O_REAL_REF_AUDIO)" \
+		--input-audio "$(MINICPM_O_REAL_USER_AUDIO)" \
+		--out "$${MINICPM_O_REAL_OUT:-/tmp/minicpm-o-uya-real-answer.wav}"
 
 clean:
 	rm -rf build
