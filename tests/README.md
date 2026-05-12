@@ -77,7 +77,7 @@ Vision smoke coverage uses tiny raw image fixtures to validate patch embedding, 
 
 Audio smoke coverage binds the tiny conv/front-end, one transformer block, output norm, projector, and `<audio>` embedding injection path. Current checks include raw checksum `0xbca0dcc`, embedding checksum `0x625ac595`, non-zero logits diff, PCM preprocessing, and clear missing-branch errors.
 
-Audio-to-audio smoke coverage runs `audio2audio-smoke` from `UYAP` PCM input through mel preprocessing, audio encoder, Qwen prompt prefill, speech token generation, vocoder decode, and WAV writing. It validates the audio-conditioned logits differ from text-only logits, writes a RIFF/WAVE file, and checks sample rate/data bytes.
+Audio-to-audio smoke coverage runs `audio2audio-smoke` from `UYAP` PCM input through mel preprocessing, audio encoder, Qwen prompt prefill, speech token generation, vocoder decode, and WAV writing. It validates the audio-conditioned logits differ from text-only logits, writes a RIFF/WAVE file, checks sample rate/data bytes, and exercises both single-GGUF and split `--audio-model`/`--speech-model`/`--vocoder-model` argument forms.
 
 Speech smoke coverage validates prompt-to-token setup, deterministic decoder features, vocoder sample generation, optional WAV writing, and unsupported/missing speech tensor diagnostics without claiming natural audio quality.
 
@@ -113,6 +113,9 @@ Default tests never require external weights. For real/community models, set pat
 ```sh
 export MINICPM_O_GGUF=/path/to/minicpm-o.gguf
 export MINICPM_O_TEXT_GGUF=/path/to/qwen3-text.gguf
+export MINICPM_O_AUDIO_GGUF=/path/to/MiniCPM-o-4_5-audio-F16.gguf
+export MINICPM_O_SPEECH_GGUF=/path/to/MiniCPM-o-4_5-tts-F16.gguf
+export MINICPM_O_VOCODER_GGUF=/path/to/token2wav-or-vocoder.gguf
 export MINICPM_O_IMAGE_RAW=/path/to/image.raw
 export MINICPM_O_AUDIO_RAW=/path/to/audio.raw
 export MINICPM_O_MANIFEST=/path/to/omni-manifest.json
@@ -124,7 +127,7 @@ build/minicpm-o-uya tensors "$MINICPM_O_GGUF" --mmap
 build/minicpm-o-uya qwen3-bind "$MINICPM_O_TEXT_GGUF"
 build/minicpm-o-uya vision-smoke "$MINICPM_O_GGUF" "$MINICPM_O_IMAGE_RAW"
 build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
-build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
+build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_TEXT_GGUF" --audio-model "$MINICPM_O_AUDIO_GGUF" --speech-model "$MINICPM_O_SPEECH_GGUF" --vocoder-model "$MINICPM_O_VOCODER_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_TEXT_GGUF" --n-prompt 512 --n-gen 128 --repetitions 5 --threads 28

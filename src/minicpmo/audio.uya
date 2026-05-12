@@ -32,6 +32,7 @@ use minicpmo.speech.VocoderWeights;
 use minicpmo.speech.speech_bind_weights;
 use minicpmo.speech.speech_checksum_u32;
 use minicpmo.speech.speech_checksum_waveform;
+use minicpmo.speech.speech_default_wav_path;
 use minicpmo.speech.speech_config_init;
 use minicpmo.speech.speech_generate_tokens;
 use minicpmo.speech.speech_waveform_analyze;
@@ -966,45 +967,73 @@ fn audio_fit_raw_to_config(config: &AudioConfig, raw: &AudioRawMel) bool {
     return true;
 }
 
-export fn audio2audio_smoke_cli(model_path: &const byte, audio_path: &const byte, wav_path: &const byte) i32 {
+fn audio2audio_detach_tables(text_table: &TensorWeightTable, audio_table: &TensorWeightTable, speech_table: &TensorWeightTable, vocoder_table: &TensorWeightTable) void {
+    tensor_weight_table_detach_mmap(text_table);
+    tensor_weight_table_detach_mmap(audio_table);
+    tensor_weight_table_detach_mmap(speech_table);
+    tensor_weight_table_detach_mmap(vocoder_table);
+}
+
+fn audio2audio_smoke_usage() void {
+    _ = printf("usage: minicpm-o-uya audio2audio-smoke <model.gguf> [--audio-model audio.gguf] [--speech-model speech.gguf] [--vocoder-model vocoder.gguf] <audio.pcm|audio.raw> [out.wav]\n");
+}
+
+export fn audio2audio_smoke_multi_cli(text_model_path: &const byte, audio_model_path: &const byte, speech_model_path: &const byte, vocoder_model_path: &const byte, audio_path: &const byte, wav_path: &const byte) i32 {
     var audio_config: AudioConfig = audio_config_init();
-    if !audio_config_load_metadata(model_path, &audio_config) { return 1; }
+    if !audio_config_load_metadata(audio_model_path, &audio_config) { return 1; }
+    if !audio_config.has_audio_token_id {
+        var text_audio_config: AudioConfig = audio_config_init();
+        if !audio_config_load_metadata(text_model_path, &text_audio_config) { return 1; }
+        if text_audio_config.has_audio_token_id {
+            audio_config.audio_token_id = text_audio_config.audio_token_id;
+            audio_config.has_audio_token_id = true;
+        }
+    }
     var raw: AudioRawMel = audio_raw_init();
     var source_kind: u32 = 0;
     if !audio_load_smoke_input(audio_path, &raw, &source_kind) { return 1; }
     const input_frames: u32 = raw.frame_count;
     if !audio_fit_raw_to_config(&audio_config, &raw) { return 1; }
     var qwen_config: Qwen3Config = qwen3_config_init();
-    if !qwen3_config_load_metadata(model_path, &qwen_config) { return 1; }
-    var table: TensorWeightTable = tensor_table_init();
-    if !tensor_weight_table_load(model_path, &table) { return 1; }
-    if !audio_complete_config(&audio_config, &table, &raw) { return 1; }
-    if !qwen3_complete_config_from_tensors(&qwen_config, &table) { return 1; }
+    if !qwen3_config_load_metadata(text_model_path, &qwen_config) { return 1; }
+    var text_table: TensorWeightTable = tensor_table_init();
+    var audio_table: TensorWeightTable = tensor_table_init();
+    var speech_table: TensorWeightTable = tensor_table_init();
+    var vocoder_table: TensorWeightTable = tensor_table_init();
+    if !tensor_weight_table_load(text_model_path, &text_table) { return 1; }
+    if !tensor_weight_table_load(audio_model_path, &audio_table) { return 1; }
+    if !tensor_weight_table_load(speech_model_path, &speech_table) { return 1; }
+    if !tensor_weight_table_load(vocoder_model_path, &vocoder_table) { return 1; }
+    if !audio_complete_config(&audio_config, &audio_table, &raw) { return 1; }
+    if !qwen3_complete_config_from_tensors(&qwen_config, &text_table) { return 1; }
     if qwen_config.hidden_size != audio_config.llm_hidden_size { _ = printf("error: audio2audio projector output=%u does not match qwen hidden=%u\n", audio_config.llm_hidden_size, qwen_config.hidden_size); return 1; }
     if !qwen3_check_forward_caps(&qwen_config) { return 1; }
-    if !tensor_weight_table_attach_mmap(model_path, &table) { return 1; }
+    if !tensor_weight_table_attach_mmap(text_model_path, &text_table) { return 1; }
+    if !tensor_weight_table_attach_mmap(audio_model_path, &audio_table) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
+    if !tensor_weight_table_attach_mmap(speech_model_path, &speech_table) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
+    if !tensor_weight_table_attach_mmap(vocoder_model_path, &vocoder_table) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
     var audio_weights: AudioWeights = audio_weights_init();
-    if !audio_bind_weights(&table, &audio_config, &audio_weights) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !audio_bind_weights(&audio_table, &audio_config, &audio_weights) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
     var qwen_weights: Qwen3Weights = qwen3_weights_init();
-    if !qwen3_bind_weights(&table, &qwen_config, &qwen_weights) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !qwen3_bind_weights(&text_table, &qwen_config, &qwen_weights) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
     var tok: Tokenizer = tokenizer_init();
-    if !tokenizer_load(model_path, &tok) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !tokenizer_load(text_model_path, &tok) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
 
     var embeddings: [f32: 1024] = [];
     var span_count: usize = 0;
-    if !audio_encode(&audio_config, &audio_weights, &raw, &embeddings[0], &span_count) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !audio_encode(&audio_config, &audio_weights, &raw, &embeddings[0], &span_count) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
     var prompt_ids: [u32: 64] = [];
     var prompt_count: usize = 0;
-    if !tokenizer_encode_to_ids(&tok, "<audio> hello\0" as &const byte, &prompt_ids[0], AUDIO_MAX_PROMPT, &prompt_count) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !tokenizer_encode_to_ids(&tok, "<audio> hello\0" as &const byte, &prompt_ids[0], AUDIO_MAX_PROMPT, &prompt_count) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
     const placeholder_count: usize = audio_count_placeholders(&prompt_ids[0], prompt_count, audio_config.audio_token_id);
-    if placeholder_count != span_count { _ = printf("error: audio2audio placeholder count=%zu does not match embedding span=%zu\n", placeholder_count, span_count); tensor_weight_table_detach_mmap(&table); return 1; }
+    if placeholder_count != span_count { _ = printf("error: audio2audio placeholder count=%zu does not match embedding span=%zu\n", placeholder_count, span_count); audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
 
     var logits_audio: [f32: 256] = [];
     var logits_text: [f32: 256] = [];
-    if !audio_prefill_prompt(&qwen_config, &qwen_weights, &prompt_ids[0], prompt_count, audio_config.audio_token_id, &embeddings[0], span_count, true, &logits_audio[0]) { tensor_weight_table_detach_mmap(&table); return 1; }
-    if !audio_prefill_prompt(&qwen_config, &qwen_weights, &prompt_ids[0], prompt_count, audio_config.audio_token_id, &embeddings[0], span_count, false, &logits_text[0]) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !audio_prefill_prompt(&qwen_config, &qwen_weights, &prompt_ids[0], prompt_count, audio_config.audio_token_id, &embeddings[0], span_count, true, &logits_audio[0]) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
+    if !audio_prefill_prompt(&qwen_config, &qwen_weights, &prompt_ids[0], prompt_count, audio_config.audio_token_id, &embeddings[0], span_count, false, &logits_text[0]) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
     const diff_l1: f32 = audio_logits_l1(&logits_audio[0], &logits_text[0], qwen_config.vocab_size as usize);
-    if diff_l1 <= 0.000001 { _ = printf("error: audio2audio audio logits are not observably different diff_l1=%.9f\n", diff_l1 as f64); tensor_weight_table_detach_mmap(&table); return 1; }
+    if diff_l1 <= 0.000001 { _ = printf("error: audio2audio audio logits are not observably different diff_l1=%.9f\n", diff_l1 as f64); audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
 
     var speech_ids: [u32: 64] = [];
     var speech_count: usize = 0;
@@ -1021,22 +1050,22 @@ export fn audio2audio_smoke_cli(model_path: &const byte, audio_path: &const byte
         if logits_audio[vocab_index] > best_logit { best_logit = logits_audio[vocab_index]; vocab_pick = vocab_index as u32; }
         vocab_index = vocab_index + 1;
     }
-    if speech_count >= @len(speech_ids) { _ = printf("error: audio2audio speech prompt exceeds cap=%zu\n", @len(speech_ids)); tensor_weight_table_detach_mmap(&table); return 1; }
+    if speech_count >= @len(speech_ids) { _ = printf("error: audio2audio speech prompt exceeds cap=%zu\n", @len(speech_ids)); audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
     speech_ids[speech_count] = vocab_pick;
     speech_count = speech_count + 1;
 
     var speech_config: SpeechConfig = speech_config_init();
     var speech_weights: SpeechWeights = speech_weights_init();
-    if !speech_bind_weights(&table, &speech_config, &speech_weights) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !speech_bind_weights(&speech_table, &speech_config, &speech_weights) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
     var seq: SpeechTokenSequence = SpeechTokenSequence{ count: 0, tokens: [], hidden: [] };
-    if !speech_generate_tokens(&speech_config, &speech_weights, &speech_ids[0] as &const u32, speech_count, &seq) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !speech_generate_tokens(&speech_config, &speech_weights, &speech_ids[0] as &const u32, speech_count, &seq) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
     var vocoder_config: VocoderConfig = vocoder_config_init();
     var vocoder_weights: VocoderWeights = vocoder_weights_init();
-    if !vocoder_bind_weights(&table, &speech_config, &vocoder_config, &vocoder_weights) { tensor_weight_table_detach_mmap(&table); return 1; }
+    if !vocoder_bind_weights(&vocoder_table, &speech_config, &vocoder_config, &vocoder_weights) { audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
     var waveform: SpeechWaveform = speech_waveform_init();
-    if !vocoder_decode_tokens(&vocoder_config, &vocoder_weights, &seq, &waveform) { _ = printf("error: audio2audio vocoder decode failed\n"); tensor_weight_table_detach_mmap(&table); return 1; }
-    if !speech_waveform_analyze(&waveform) { _ = printf("error: audio2audio waveform validation failed\n"); tensor_weight_table_detach_mmap(&table); return 1; }
-    if !speech_wav_write(wav_path, &waveform) { _ = printf("error: audio2audio wav write failed\n"); tensor_weight_table_detach_mmap(&table); return 1; }
+    if !vocoder_decode_tokens(&vocoder_config, &vocoder_weights, &seq, &waveform) { _ = printf("error: audio2audio vocoder decode failed\n"); audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
+    if !speech_waveform_analyze(&waveform) { _ = printf("error: audio2audio waveform validation failed\n"); audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
+    if !speech_wav_write(wav_path, &waveform) { _ = printf("error: audio2audio wav write failed\n"); audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table); return 1; }
 
     const raw_checksum: u32 = audio_checksum(&raw.values[0], raw.element_count);
     const embed_checksum: u32 = audio_checksum(&embeddings[0], span_count * (audio_config.llm_hidden_size as usize));
@@ -1044,14 +1073,66 @@ export fn audio2audio_smoke_cli(model_path: &const byte, audio_path: &const byte
     const text_logits_checksum: u32 = audio_checksum(&logits_text[0], qwen_config.vocab_size as usize);
     const token_checksum: u32 = speech_checksum_u32(&seq.tokens[0] as &const u32, seq.count);
     const waveform_checksum: u32 = speech_checksum_waveform(&waveform);
+    _ = printf("audio2audio models: text=%s audio=%s speech=%s vocoder=%s\n", text_model_path, audio_model_path, speech_model_path, vocoder_model_path);
     _ = printf("audio2audio input: source=%s input_frames=%u frames=%u mel_bins=%u elements=%zu checksum=0x%x\n", audio_source_label(source_kind), input_frames, raw.frame_count, raw.mel_bin_count, raw.element_count, raw_checksum);
     _ = printf("audio2audio audio: placeholders=%zu span=%zu embedding_checksum=0x%x logits_audio=0x%x logits_text=0x%x diff_l1=%.9f picked_token=%u\n", placeholder_count, span_count, embed_checksum, audio_logits_checksum, text_logits_checksum, diff_l1 as f64, vocab_pick);
     _ = printf("audio2audio speech: prompt_tokens=%zu generated=%zu checksum=0x%x\n", speech_count, seq.count, token_checksum);
     _ = printf("audio2audio waveform: samples=%zu sample_rate=%u rms=%.6f peak=%.6f checksum=0x%x\n", waveform.sample_count, waveform.sample_rate, waveform.rms as f64, waveform.peak as f64, waveform_checksum);
     _ = printf("audio2audio wav: path=%s bytes=%u\n", wav_path, 44 + ((waveform.sample_count as u32) * 2));
     _ = printf("audio2audio-smoke: PASS\n");
-    tensor_weight_table_detach_mmap(&table);
+    audio2audio_detach_tables(&text_table, &audio_table, &speech_table, &vocoder_table);
     return 0;
+}
+
+export fn audio2audio_smoke_cli(model_path: &const byte, audio_path: &const byte, wav_path: &const byte) i32 {
+    return audio2audio_smoke_multi_cli(model_path, model_path, model_path, model_path, audio_path, wav_path);
+}
+
+export fn audio2audio_smoke_args_cli(argc: i32, argv: & &byte) i32 {
+    if argc < 4 { audio2audio_smoke_usage(); return 1; }
+    const text_model_path: &const byte = argv[2] as &const byte;
+    var audio_model_path: &const byte = text_model_path;
+    var speech_model_path: &const byte = text_model_path;
+    var vocoder_model_path: &const byte = text_model_path;
+    var audio_path: &const byte = null;
+    var wav_path: &const byte = speech_default_wav_path();
+    var has_wav_path: bool = false;
+    var arg_index: i32 = 3;
+    while arg_index < argc {
+        if strcmp(argv[arg_index] as *const byte, "--audio-model\0" as *const byte) == 0 {
+            if arg_index + 1 >= argc { audio2audio_smoke_usage(); return 1; }
+            audio_model_path = argv[arg_index + 1] as &const byte;
+            arg_index = arg_index + 2;
+            continue;
+        }
+        if strcmp(argv[arg_index] as *const byte, "--speech-model\0" as *const byte) == 0 {
+            if arg_index + 1 >= argc { audio2audio_smoke_usage(); return 1; }
+            speech_model_path = argv[arg_index + 1] as &const byte;
+            arg_index = arg_index + 2;
+            continue;
+        }
+        if strcmp(argv[arg_index] as *const byte, "--vocoder-model\0" as *const byte) == 0 {
+            if arg_index + 1 >= argc { audio2audio_smoke_usage(); return 1; }
+            vocoder_model_path = argv[arg_index + 1] as &const byte;
+            arg_index = arg_index + 2;
+            continue;
+        }
+        if audio_path == null {
+            audio_path = argv[arg_index] as &const byte;
+            arg_index = arg_index + 1;
+            continue;
+        }
+        if !has_wav_path {
+            wav_path = argv[arg_index] as &const byte;
+            has_wav_path = true;
+            arg_index = arg_index + 1;
+            continue;
+        }
+        audio2audio_smoke_usage();
+        return 1;
+    }
+    if audio_path == null { audio2audio_smoke_usage(); return 1; }
+    return audio2audio_smoke_multi_cli(text_model_path, audio_model_path, speech_model_path, vocoder_model_path, audio_path, wav_path);
 }
 
 export fn audio_smoke_cli(model_path: &const byte, audio_path: &const byte) i32 {

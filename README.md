@@ -48,7 +48,7 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `vision-preprocess-smoke <model.gguf> <image.rgb\|manifest>` | RGB/manifest preprocessing smoke | `UYRG`, `UYIM`, `UYVM`; no PNG/JPEG/MP4 decoding |
 | `audio-smoke <model.gguf> <audio.raw>` | Audio encoder smoke | `UYAM` log-mel F32 input |
 | `audio-preprocess-smoke <audio.pcm>` | PCM to tiny log-mel preprocessing smoke | `UYAP` PCM fixture input |
-| `audio2audio-smoke <model.gguf> <audio.pcm\|audio.raw> [out.wav]` | Audio input to WAV smoke | PCM/mel -> audio encoder -> speech/vocoder WAV |
+| `audio2audio-smoke <model.gguf> [--audio-model audio.gguf] [--speech-model speech.gguf] [--vocoder-model vocoder.gguf] <audio.pcm\|audio.raw> [out.wav]` | Audio input to WAV smoke | PCM/mel -> audio encoder -> speech/vocoder WAV; optional split GGUF tables |
 | `speech-smoke <model.gguf> <prompt> [out.wav]` | Speech/vocoder smoke | Deterministic tiny WAV output only |
 | `omni-smoke <model.gguf> <manifest.json>` | Compile mixed text/image/audio/speech manifest | Fixed test JSON schema |
 | `omni-chat <model.gguf>` | Blocking omni REPL | Text and manifest turns; speech output is queued/diagnosed, not full duplex |
@@ -103,6 +103,7 @@ Sampler arguments accepted by `generate` are validated by the tiny sampler path;
 - `omni-chat` is blocking and preserves text output; speech output is reported as unsupported/queued there.
 - `stream-chat` is a deterministic queue/ring/interruption prototype, not a production full-duplex assistant.
 - `speech-smoke` and `audio2audio-smoke` write tiny deterministic WAVs and do not claim natural vocoder quality.
+- `audio2audio-smoke` can load split GGUF tensor tables with `--audio-model`, `--speech-model`, and `--vocoder-model`, but official MiniCPM-o 4.5 tensor naming/layout may still require binding aliases before it runs end-to-end.
 - Unknown tensor names, missing branches, unknown dtypes, or unsupported chat templates are compatibility work items, not silent fallbacks.
 
 ## External Model Smoke
@@ -112,6 +113,9 @@ Keep external files outside the repo:
 ```sh
 export MINICPM_O_GGUF=/path/to/minicpm-o.gguf
 export MINICPM_O_TEXT_GGUF=/path/to/qwen3-text.gguf
+export MINICPM_O_AUDIO_GGUF=/path/to/MiniCPM-o-4_5-audio-F16.gguf
+export MINICPM_O_SPEECH_GGUF=/path/to/MiniCPM-o-4_5-tts-F16.gguf
+export MINICPM_O_VOCODER_GGUF=/path/to/token2wav-or-vocoder.gguf
 export MINICPM_O_IMAGE_RAW=/path/to/image.raw
 export MINICPM_O_AUDIO_RAW=/path/to/audio.raw
 export MINICPM_O_MANIFEST=/path/to/omni-manifest.json
@@ -127,7 +131,7 @@ build/minicpm-o-uya tensors "$MINICPM_O_GGUF" --mmap
 build/minicpm-o-uya qwen3-bind "$MINICPM_O_TEXT_GGUF"
 build/minicpm-o-uya vision-smoke "$MINICPM_O_GGUF" "$MINICPM_O_IMAGE_RAW"
 build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
-build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
+build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_TEXT_GGUF" --audio-model "$MINICPM_O_AUDIO_GGUF" --speech-model "$MINICPM_O_SPEECH_GGUF" --vocoder-model "$MINICPM_O_VOCODER_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_TEXT_GGUF" --n-prompt 512 --n-gen 128 --repetitions 5 --threads 28

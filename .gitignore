@@ -43,3 +43,6 @@ build/
 # local external-model manifests
 local/
 fixtures/external/
+.venv-edge-tts/
+.gitignore
+outputs/

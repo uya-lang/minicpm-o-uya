@@ -398,16 +398,168 @@
 - 每个失败场景都有建议下一步。
 - 文档不夸大当前能力。
 
+
+## Phase 21: 真实 MiniCPM-o 4.5 audio-to-audio 对齐
+
+目标：在纯 Uya runtime 中实现与本地 `llama.cpp-omni` 离线 audio-to-audio demo 等价的功能，而不是只跑 tiny smoke。完整链路必须支持：参考音色音频 + 用户语音问题 -> audio encoder -> Qwen3/MiniCPM-o LLM 生成文本/hidden states -> TTS audio tokens -> token2wav/HiFiGAN -> 24 kHz mono WAV 回答。
+
+### 21.1 基线与输入协议
+
+- [x] 下载并本地跑通官方 `openbmb/MiniCPM-o-4_5-gguf` 分文件 GGUF。
+- [x] 编译并跑通 `llama.cpp-omni` 的 `llama-omni-cli` CPU 路径。
+- [x] 记录正确离线测试协议：`prefix_0000.wav` 是 reference/system voice，`prefix_0001.wav` 起才是用户输入。
+- [x] 生成 `outputs/nihao_case` 和 `outputs/complex_case2` 作为行为基线。
+- [x] 记录错误用法风险：只传 `prefix_0000.wav` 会被当作参考音色，容易看起来像复述输入。
+- [ ] 增加不入库的外部 baseline manifest，记录模型路径、输入 wav、输出 wav、回答文本、运行日志路径。
+- [ ] 增加 `docs/audio2audio-real.md`，明确 baseline 命令、输入文件命名、输出目录和验收口径。
+
+验收标准：
+
+- `llama.cpp-omni` baseline 至少有两个固定用例：短问候和复杂性能对比问题。
+- 每个 baseline 都保存用户输入文本、用户 wav、模型回答文本、回答 wav、拼接 wav、运行日志。
+- 文档明确区分 reference audio、user audio、answer audio，不再把 reference 音频误当用户问题。
+
+### 21.2 官方 GGUF audit 与 tensor alias
+
+- [x] Uya `audio2audio-smoke` 支持 split GGUF 参数：`--audio-model`、`--speech-model`、`--vocoder-model`。
+- [ ] 为官方 `MiniCPM-o-4_5-Q4_K_M.gguf`、`audio/MiniCPM-o-4_5-audio-F16.gguf`、`tts/MiniCPM-o-4_5-tts-F16.gguf`、`tts/MiniCPM-o-4_5-projector-F16.gguf`、`token2wav-gguf/*.gguf` 生成 tensor/metadata inventory。
+- [ ] 增加 `audit-bundle` 或等价脚本，批量输出每个 GGUF 的 tensor count、dtype distribution、name prefix、shape summary。
+- [ ] 为 audio encoder 建立官方 tensor alias 表。
+- [ ] 为 TTS GGUF 建立 `emb_code`、`emb_text`、`projector_semantic`、`projector_spk`、`head_code` 绑定表。
+- [ ] 为 token2wav 建立 encoder、flow_matching、flow_extra、hifigan2、prompt_cache 绑定表。
+- [ ] 对缺失 tensor、未知 dtype、shape mismatch 输出具体分支名和候选 alias。
+
+验收标准：
+
+- Uya 能在不执行推理的情况下完整 audit 官方 MiniCPM-o 4.5 GGUF bundle。
+- 每个官方 tensor 要么被分类到明确模块，要么被列为 unsupported with reason。
+- audit 输出能回答“还差哪些 kernel/binding 才能跑真实 audio-to-audio”。
+
+### 21.3 Qwen3 8B 真实 LLM forward
+
+- [ ] 将 Qwen3 forward 上限从 tiny/smoke cap 提升到 MiniCPM-o 4.5 需要的实际尺寸：`hidden=4096`、`layers=36`、`ffn=12288`、`vocab≈151748`、`ctx>=4096`。
+- [ ] 把大数组从栈上固定数组迁移到 heap/scratch arena，避免 8B 模型运行时栈爆。
+- [ ] 实现/验证 Q4_K、Q5_K、Q6_K、Q8_K、IQ 系列在真实 matvec 中可用，而不只是 parser/byte-size 可识别。
+- [ ] 支持 Qwen3/MiniCPM-o 4.5 的 rope、q/k norm、GQA、KV cache layout 和 chat template。
+- [ ] 支持 prompt prefill 分块、decode step、sampler、stop token、hidden state capture。
+- [ ] 增加 text-only 对齐用例：同一 prompt 下与 llama.cpp top-k logits 或 token 序列对照。
+
+验收标准：
+
+- Uya 能加载官方 `MiniCPM-o-4_5-Q4_K_M.gguf` 并完成 text-only prefill/decode。
+- 同一 text prompt 下，Uya 与 llama.cpp 的前若干 token 或 top-k logits 在可解释误差内。
+- 运行时内存分配、KV cache bytes、load time、prefill/decode tokens/s 可观测。
+
+### 21.4 Audio encoder 与用户语音注入
+
+- [ ] 支持真实 PCM/WAV 读取：16 kHz mono s16/f32，并明确拒绝不支持格式或自动转码路径。
+- [ ] 对齐官方 audio preprocessing：window、STFT、mel、chunking、padding、streaming cache。
+- [ ] 移除 tiny audio cap，支持真实用户语音长度和多 chunk 输入。
+- [ ] 绑定官方 audio encoder tensors，并实现对应 conv/transformer/projector forward。
+- [ ] 实现正确 prompt 协议：reference audio 进入 system prompt，user audio 进入 `<|im_start|>user` turn。
+- [ ] 支持 `prefix_0000.wav`/`prefix_0001.wav` 测试格式，也支持显式 `--ref-audio`/`--user-audio` 参数。
+- [ ] 保存 audio embedding checksum、span count、n_pos、prefill timing 便于与 llama.cpp-omni 对照。
+
+验收标准：
+
+- 同一 user wav 下，Uya audio embedding 的 shape/n_pos 与 llama.cpp-omni 记录一致或差异可解释。
+- `0000=ref, 0001=user` 的复杂用例不再复述输入，而能进入回答路径。
+- 缺 audio 分支或音频太短/太长时有清晰诊断。
+
+### 21.5 LLM -> TTS audio token 生成
+
+- [ ] 实现 TTS GGUF 权重加载：`emb_code.0.weight`、`emb_text.weight`、`projector_semantic.*`、`projector_spk.*`、`head_code.0.weight`。
+- [ ] 实现 LLM hidden states 到 TTS conditioning embedding 的 projector path。
+- [ ] 实现 TTS prefill/decode cache，与 audio_bos、audio_eos、audio token vocabulary 对齐。
+- [ ] 实现 chunked text/hidden-state queue：LLM 每个文本 chunk 同步送入 TTS。
+- [ ] 生成 audio token ids 并保存 `audio_tokens_chunk_*.txt/bin`，格式对齐 llama.cpp-omni。
+- [ ] 增加 TTS token 级对照：相同 hidden/text chunk 下，audio token 前 N 个与 baseline 对比。
+
+验收标准：
+
+- Uya 能从 LLM 回答文本/hidden states 生成非空 audio token 序列。
+- audio token 分片数量、EOS 行为、首 token/audio_bos 行为与 llama.cpp-omni 可对照。
+- TTS 阶段输出耗时、token count、cache length 可观测。
+
+### 21.6 Token2Wav/HiFiGAN 真实声码器
+
+- [ ] 解析并绑定 `token2wav-gguf/encoder.gguf`。
+- [ ] 解析并绑定 `token2wav-gguf/flow_matching.gguf`。
+- [ ] 解析并绑定 `token2wav-gguf/flow_extra.gguf`。
+- [ ] 解析并绑定 `token2wav-gguf/hifigan2.gguf`。
+- [ ] 解析并应用 `token2wav-gguf/prompt_cache.gguf`，避免每次实时重算参考音色 cache。
+- [ ] 实现 token2mel/flow matching 推理图需要的 attention、conv、norm、sampling/noise schedule。
+- [ ] 实现 hifigan2 vocoder forward，输出 24 kHz mono PCM。
+- [ ] 实现流式 WAV chunk 写入，并支持最终 concat 成完整回答 wav。
+- [ ] 支持 CPU reference 后端；GPU/多线程优化另设后续任务。
+
+验收标准：
+
+- Uya 可把 TTS audio tokens 转成可播放 WAV。
+- WAV header、采样率、通道数、duration、RMS/peak 合法。
+- 与 llama.cpp-omni 同用例的回答音频时长、chunk 数、首响时间指标可对照。
+
+### 21.7 `audio2audio-real` CLI
+
+- [ ] 新增真实 CLI，不复用 smoke 名称：`audio2audio-real`。
+- [ ] 支持显式分文件参数：`--llm`、`--audio`、`--tts`、`--projector`、`--token2wav-dir`。
+- [ ] 支持输入参数：`--ref-audio`、`--user-audio`、`--out`。
+- [ ] 支持 llama.cpp-omni 测试格式：`--test-prefix PREFIX --count N`，其中 `0000` 是 ref，`0001..` 是 user turn。
+- [ ] 输出回答文本、answer wav、turn wav、audio token chunks、timing log。
+- [ ] 增加 `--text-only`、`--no-tts`、`--dump-hidden`、`--dump-embeddings` 诊断模式。
+- [ ] 所有真实模型命令默认要求显式路径，不从仓库内隐式下载模型。
+
+验收标准：
+
+- 以下命令能生成回答 WAV：
+
+```sh
+build/minicpm-o-uya audio2audio-real \
+  --llm models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+  --audio models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf \
+  --tts models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf \
+  --projector models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-projector-F16.gguf \
+  --token2wav-dir models/MiniCPM-o-4_5-gguf/token2wav-gguf \
+  --ref-audio outputs/complex_case2/complex2_0000.wav \
+  --user-audio outputs/complex_case2/complex2_0001.wav \
+  --out outputs/uya_complex_answer.wav
+```
+
+- 输出目录包含 `answer.txt`、`answer.wav`、`turn.wav`、`timing.log`、必要 debug dumps。
+- 错误用法如只传 `0000.wav` 时给出“这是 reference audio，不是 user audio”的诊断。
+
+### 21.8 性能对齐与回归
+
+- [ ] 为真实 audio-to-audio 增加 benchmark 指标：load time、audio prefill、LLM prefill、first audio response、total wall time、peak RSS、answer duration、RTF。
+- [ ] 与 `llama.cpp-omni` 同用例对照，记录 CPU-only 基线。
+- [ ] 增加长音频、短音频、静音、中文、英文、中英混合、复杂多项要求用例。
+- [ ] 增加 deterministic smoke 保持无模型 CI 可跑，真实模型测试只在显式环境变量启用。
+- [ ] 文档记录当前速度预期：第一版先正确，再优化，不承诺立即达到 llama.cpp-omni 性能。
+
+验收标准：
+
+- `make test` 仍只跑 tiny fixture。
+- `MINICPM_O_REAL_BUNDLE=/path make audio2audio-real-smoke` 可手动跑真实模型。
+- 每个性能回归都有日志和指标，便于比较 Uya 与 llama.cpp-omni。
+
+
 ## 本机/外部模型约定
 
 不要把模型权重放进仓库。使用环境变量指向外部路径：
 
 ```text
 MINICPM_O_GGUF=/path/to/minicpm-o.gguf
-MINICPM_O_TEXT_GGUF=/path/to/qwen3-text.gguf
+MINICPM_O_TEXT_GGUF=/path/to/MiniCPM-o-4_5-Q4_K_M.gguf
+MINICPM_O_AUDIO_GGUF=/path/to/audio/MiniCPM-o-4_5-audio-F16.gguf
+MINICPM_O_TTS_GGUF=/path/to/tts/MiniCPM-o-4_5-tts-F16.gguf
+MINICPM_O_PROJECTOR_GGUF=/path/to/tts/MiniCPM-o-4_5-projector-F16.gguf
+MINICPM_O_TOKEN2WAV_DIR=/path/to/token2wav-gguf
+MINICPM_O_REF_AUDIO=/path/to/ref_0000.wav
+MINICPM_O_USER_AUDIO=/path/to/user_0001.wav
 MINICPM_O_IMAGE_RAW=/path/to/image.raw
 MINICPM_O_AUDIO_RAW=/path/to/audio.raw
 MINICPM_O_MANIFEST=/path/to/omni-manifest.json
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf
 ```
 
-默认 `make test` 只跑 tiny fixture。真实模型 smoke 使用单独 target，且必须 documented。
+默认 `make test` 只跑 tiny fixture。真实模型 smoke 使用单独 target，且必须 documented。模型权重、`outputs/` 生成音频、`llama.cpp*` 工作树和下载缓存都不应提交。

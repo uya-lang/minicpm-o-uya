@@ -1,6 +1,6 @@
 use libc.printf;
 use libc.strcmp;
-use minicpmo.audio.audio2audio_smoke_cli;
+use minicpmo.audio.audio2audio_smoke_args_cli;
 use minicpmo.audio.audio_preprocess_smoke_cli;
 use minicpmo.audio.audio_smoke_cli;
 use minicpmo.bench.bench_cli;
@@ -42,7 +42,7 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya vision-preprocess-smoke <model.gguf> <image.rgb|manifest>\n");
     _ = printf("  minicpm-o-uya audio-smoke <model.gguf> <audio.raw>\n");
     _ = printf("  minicpm-o-uya audio-preprocess-smoke <audio.pcm>\n");
-    _ = printf("  minicpm-o-uya audio2audio-smoke <model.gguf> <audio.pcm|audio.raw> [out.wav]\n");
+    _ = printf("  minicpm-o-uya audio2audio-smoke <model.gguf> [--audio-model audio.gguf] [--speech-model speech.gguf] [--vocoder-model vocoder.gguf] <audio.pcm|audio.raw> [out.wav]\n");
     _ = printf("  minicpm-o-uya speech-smoke <model.gguf> <prompt> [out.wav]\n");
     _ = printf("  minicpm-o-uya omni-smoke <model.gguf> <manifest.json>\n");
     _ = printf("  minicpm-o-uya omni-chat <model.gguf>\n");
@@ -163,13 +163,7 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
         return audio_preprocess_smoke_cli(argv[2] as &const byte);
     }
     if strcmp(argv[1] as *const byte, "audio2audio-smoke\0" as *const byte) == 0 {
-        if argc != 4 && argc != 5 {
-            _ = printf("usage: minicpm-o-uya audio2audio-smoke <model.gguf> <audio.pcm|audio.raw> [out.wav]\n");
-            return 1;
-        }
-        var wav_path_a2a: &const byte = speech_default_wav_path();
-        if argc == 5 { wav_path_a2a = argv[4] as &const byte; }
-        return audio2audio_smoke_cli(argv[2] as &const byte, argv[3] as &const byte, wav_path_a2a);
+        return audio2audio_smoke_args_cli(argc, argv as & &byte);
     }
     if strcmp(argv[1] as *const byte, "speech-smoke\0" as *const byte) == 0 {
         if argc != 4 && argc != 5 {

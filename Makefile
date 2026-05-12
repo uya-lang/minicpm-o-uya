@@ -170,7 +170,10 @@ speech-fixture: FORCE build fixtures
 
 audio2audio-fixture: FORCE build fixtures
 	$(OUT) audio2audio-smoke tests/fixtures/tiny.gguf tests/fixtures/tiny_audio.pcm /tmp/minicpm-o-uya-audio2audio.wav >/tmp/minicpm-o-uya-audio2audio.out
+	$(OUT) audio2audio-smoke tests/fixtures/tiny.gguf --audio-model tests/fixtures/tiny.gguf --speech-model tests/fixtures/tiny.gguf --vocoder-model tests/fixtures/tiny.gguf tests/fixtures/tiny_audio.pcm /tmp/minicpm-o-uya-audio2audio-multi.wav >/tmp/minicpm-o-uya-audio2audio-multi.out
 	grep -q "audio2audio-smoke: PASS" /tmp/minicpm-o-uya-audio2audio.out
+	grep -q "audio2audio-smoke: PASS" /tmp/minicpm-o-uya-audio2audio-multi.out
+	grep -q "audio2audio models: text=tests/fixtures/tiny.gguf audio=tests/fixtures/tiny.gguf speech=tests/fixtures/tiny.gguf vocoder=tests/fixtures/tiny.gguf" /tmp/minicpm-o-uya-audio2audio-multi.out
 	grep -q "audio2audio input: source=uyap-pcm input_frames=7 frames=1 mel_bins=4" /tmp/minicpm-o-uya-audio2audio.out
 	grep -q "audio2audio audio: placeholders=1 span=1 embedding_checksum=" /tmp/minicpm-o-uya-audio2audio.out
 	grep -q "diff_l1=" /tmp/minicpm-o-uya-audio2audio.out
