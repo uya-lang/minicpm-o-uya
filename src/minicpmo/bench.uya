@@ -1,5 +1,6 @@
 use libc.printf;
 use minicpmo.omni.omni_smoke_cli;
+use minicpmo.qwen3.qwen3_bench_args_cli;
 use minicpmo.tensor.RuntimeCacheSkeletons;
 use minicpmo.tensor.runtime_cache_skeletons_default;
 
@@ -23,7 +24,7 @@ fn bench_print_rate(label: &const byte, units: u32, millis: u32, unit_name: &con
     _ = printf("bench %s: %u.%03u %s/s units=%u ms=%u\n", label, scaled / 1000, scaled % 1000, unit_name, units, millis);
 }
 
-export fn bench_cli(model_path: &const byte, manifest_path: &const byte) i32 {
+fn bench_smoke_cli(model_path: &const byte, manifest_path: &const byte) i32 {
     const caches: RuntimeCacheSkeletons = runtime_cache_skeletons_default();
     const peak_memory_bytes: u64 = caches.llm.total_bytes + caches.vision.total_bytes + caches.audio.total_bytes + caches.speech.total_bytes + (65536 as u64);
     _ = printf("bench: model=%s manifest=%s\n", model_path, manifest_path);
@@ -39,4 +40,16 @@ export fn bench_cli(model_path: &const byte, manifest_path: &const byte) i32 {
     if omni_smoke_cli(model_path, manifest_path) != 0 { return 1; }
     _ = printf("bench: PASS\n");
     return 0;
+}
+
+export fn bench_cli(argc: i32, argv: & &byte) i32 {
+    if argc < 3 {
+        _ = printf("usage: minicpm-o-uya bench <model.gguf> <manifest.json>\n");
+        _ = printf("   or: minicpm-o-uya bench <model.gguf> [--prompt TEXT] [--n-prompt N] [--n-gen N] [--repetitions N] [--threads N] [--no-warmup]\n");
+        return 1;
+    }
+    if argc == 4 && argv[3][0] != 45 {
+        return bench_smoke_cli(argv[2] as &const byte, argv[3] as &const byte);
+    }
+    return qwen3_bench_args_cli(argc, argv);
 }

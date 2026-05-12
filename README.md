@@ -53,10 +53,13 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `omni-chat <model.gguf>` | Blocking omni REPL | Text and manifest turns; speech output is queued/diagnosed, not full duplex |
 | `stream-chat <model.gguf> <manifest.json>` | Streaming event prototype | Queue/ring/interrupt smoke over fixture events |
 | `bench <model.gguf> <manifest.json>` | Tiny benchmark smoke | Deterministic reference timings and memory estimates |
+| `bench <model.gguf> [--prompt TEXT] [--n-prompt N] [--n-gen N] [--repetitions N] [--threads N] [--no-warmup]` | Real text benchmark | Measures load/prefill/decode for Qwen3 path with live timings |
 | `kernels-smoke` | Scalar kernel golden smoke | F32/F16/BF16/reference ops |
 | `quant-smoke` | Quant kernel golden smoke | Selected GGML quant types |
 
 Sampler arguments accepted by `generate` are validated by the tiny sampler path; unsupported or malformed values fail early instead of silently changing behavior.
+
+`bench` now has two modes: the original `<model.gguf> <manifest.json>` smoke path stays deterministic for regression tests, while `bench <model.gguf> [bench args...]` runs a real text benchmark intended for apples-to-apples comparison with `llama-bench`.
 
 ## Supported Models And Formats
 
@@ -125,6 +128,7 @@ build/minicpm-o-uya vision-smoke "$MINICPM_O_GGUF" "$MINICPM_O_IMAGE_RAW"
 build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
+build/minicpm-o-uya bench "$MINICPM_O_TEXT_GGUF" --n-prompt 512 --n-gen 128 --repetitions 5 --threads 28
 ```
 
 If any step reports unsupported layout or missing tensors, keep the failing command output and extend the corresponding binding path before attempting generation.
@@ -158,6 +162,22 @@ Run the same command on your machine after changes:
 
 ```sh
 build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
+```
+
+For live hardware comparison, use the real text benchmark mode instead. The numbers below vary by CPU, compiler flags, and model:
+
+```sh
+build/minicpm-o-uya bench /path/to/qwen3.gguf --n-prompt 512 --n-gen 128 --repetitions 5 --threads 28
+```
+
+It reports:
+
+```text
+bench config: mode=text-real ...
+bench load: ms=...
+bench text_prompt: ... tokens/s ...
+bench text_decode: ... tokens/s ...
+bench memory: peak_estimate_bytes=...
 ```
 
 ## Troubleshooting

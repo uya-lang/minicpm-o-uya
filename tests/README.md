@@ -57,7 +57,7 @@ Generated files:
 - `omni-fixture` for mixed manifest parsing, placeholder spans, media embedding counts, and prompt compilation.
 - `omni-chat-fixture` for blocking text and manifest turns, context preservation, and explicit unsupported speech output diagnostics.
 - `stream-chat-fixture` for stream queue, audio ring buffer, partial callbacks, backpressure, interrupt, and pending speech cleanup diagnostics.
-- `bench-fixture` for deterministic performance/memory/reference-error output.
+- `bench-fixture` for deterministic smoke benchmark output plus a tiny real text benchmark invocation.
 - `chat-fixture` for text REPL behavior and context overflow diagnostics.
 
 ## Golden Coverage
@@ -93,6 +93,16 @@ bench memory: peak_estimate_bytes=78336 llm=512 vision=4096 audio=4096 speech=40
 bench reference_error: text=0.000000 vision=0.000000 audio=0.000000 vocoder=0.000000
 ```
 
+It also checks the real text benchmark mode on the tiny fixture with a small workload:
+
+```text
+bench config: mode=text-real prompt_tokens=4 gen_tokens=4 repetitions=1 warmup=0 threads=1
+bench load: ms=...
+bench text_prompt: ... tokens/s ...
+bench text_decode: ... tokens/s ...
+bench reference_error: n/a mode=real-timing
+```
+
 ## External Smoke
 
 Default tests never require external weights. For real/community models, set paths outside the repository and run commands manually:
@@ -113,6 +123,7 @@ build/minicpm-o-uya vision-smoke "$MINICPM_O_GGUF" "$MINICPM_O_IMAGE_RAW"
 build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
+build/minicpm-o-uya bench "$MINICPM_O_TEXT_GGUF" --n-prompt 512 --n-gen 128 --repetitions 5 --threads 28
 ```
 
 If external smoke fails, the expected next step is to preserve the exact diagnostic, run `audit`, and add the missing dtype/layout/modality binding. Do not treat tiny fixture pass results as production MiniCPM-o compatibility.

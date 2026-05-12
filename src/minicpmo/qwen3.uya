@@ -1,4 +1,6 @@
 use libc.calloc;
+use libc.clock;
+use libc.CLOCKS_PER_SEC;
 use libc.cosf;
 use libc.fgets;
 use libc.fflush;
@@ -27,8 +29,10 @@ use minicpmo.kernels.f16_load_f32;
 use minicpmo.kernels.silu;
 use minicpmo.kernels.softmax;
 use minicpmo.tensor.TensorDType;
+use minicpmo.tensor.LlmKvCacheLayout;
 use minicpmo.tensor.TensorView;
 use minicpmo.tensor.TensorWeightTable;
+use minicpmo.tensor.llm_kv_cache_layout;
 use minicpmo.tensor.tensor_build_layer_name;
 use minicpmo.tensor.tensor_dtype_name;
 use minicpmo.tensor.tensor_lookup;
@@ -82,6 +86,10 @@ const QWEN3_CHAT_DEFAULT_MAX_NEW_TOKENS: u32 = 512;
 const QWEN3_GENERATED_TEXT_CAP: usize = 4096;
 const QWEN3_TOKENIZER_UNKNOWN_ID: u32 = 4294967295;
 const QWEN3_MAX_THREADS: usize = 64;
+const QWEN3_BENCH_SEED_CAP: usize = 64;
+const QWEN3_BENCH_DEFAULT_PROMPT_TOKENS: u32 = 8;
+const QWEN3_BENCH_DEFAULT_GEN_TOKENS: u32 = 8;
+const QWEN3_BENCH_DEFAULT_REPETITIONS: u32 = 3;
 
 var qwen3_thread_count: usize = 1;
 
@@ -97,6 +105,15 @@ export struct Qwen3SamplerConfig {
     stop_on_eos: bool,
     verbose: bool,
     threads: u32,
+}
+
+struct Qwen3BenchConfig {
+    prompt_tokens: u32,
+    gen_tokens: u32,
+    repetitions: u32,
+    threads: u32,
+    warmup: bool,
+    prompt_seed: &const byte,
 }
 
 struct Qwen3MatvecTask {
@@ -167,6 +184,21 @@ struct Qwen3StringRead {
 
 export fn qwen3_config_init() Qwen3Config {
     return Qwen3Config{ vocab_size: 0, context_length: 0, hidden_size: 0, intermediate_size: 0, layer_count: 0, head_count: 0, kv_head_count: 0, head_dim: 0, norm_eps_bits: 0, rope_freq_base_bits: 0, has_norm_eps: false, has_rope_freq_base: false };
+}
+
+fn qwen3_config_copy(dst: &Qwen3Config, src: &Qwen3Config) void {
+    dst.vocab_size = src.vocab_size;
+    dst.context_length = src.context_length;
+    dst.hidden_size = src.hidden_size;
+    dst.intermediate_size = src.intermediate_size;
+    dst.layer_count = src.layer_count;
+    dst.head_count = src.head_count;
+    dst.kv_head_count = src.kv_head_count;
+    dst.head_dim = src.head_dim;
+    dst.norm_eps_bits = src.norm_eps_bits;
+    dst.rope_freq_base_bits = src.rope_freq_base_bits;
+    dst.has_norm_eps = src.has_norm_eps;
+    dst.has_rope_freq_base = src.has_rope_freq_base;
 }
 
 export fn qwen3_weights_init() Qwen3Weights {
@@ -878,6 +910,17 @@ fn qwen3_sampler_init() Qwen3SamplerConfig {
     return Qwen3SamplerConfig{ max_new_tokens: 0, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true, verbose: false, threads: 1 };
 }
 
+fn qwen3_bench_config_init() Qwen3BenchConfig {
+    return Qwen3BenchConfig{
+        prompt_tokens: QWEN3_BENCH_DEFAULT_PROMPT_TOKENS,
+        gen_tokens: QWEN3_BENCH_DEFAULT_GEN_TOKENS,
+        repetitions: QWEN3_BENCH_DEFAULT_REPETITIONS,
+        threads: 1,
+        warmup: true,
+        prompt_seed: "hello\0" as &const byte,
+    };
+}
+
 fn qwen3_sampler_f32(bits: u32) f32 {
     const ptr: &const f32 = &bits as &const f32;
     return ptr[0];
@@ -1053,6 +1096,39 @@ fn qwen3_parse_sampler_args(argc: i32, argv: & &byte, start_index: i32, sampler:
     return true;
 }
 
+fn qwen3_parse_bench_args(argc: i32, argv: & &byte, start_index: i32, bench: &Qwen3BenchConfig) bool {
+    var i: i32 = start_index;
+    while i < argc {
+        if strcmp(argv[i] as *const byte, "-p\0" as *const byte) == 0 || strcmp(argv[i] as *const byte, "--n-prompt\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &bench.prompt_tokens) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "-n\0" as *const byte) == 0 || strcmp(argv[i] as *const byte, "--n-gen\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &bench.gen_tokens) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "-r\0" as *const byte) == 0 || strcmp(argv[i] as *const byte, "--repetitions\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &bench.repetitions) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "-t\0" as *const byte) == 0 || strcmp(argv[i] as *const byte, "--threads\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &bench.threads) { return false; }
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "--prompt\0" as *const byte) == 0 {
+            if i + 1 >= argc { return false; }
+            bench.prompt_seed = argv[i + 1] as &const byte;
+            i = i + 2; continue;
+        }
+        if strcmp(argv[i] as *const byte, "--no-warmup\0" as *const byte) == 0 {
+            bench.warmup = false;
+            i = i + 1; continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 fn qwen3_runtime_init() Qwen3Runtime {
     return Qwen3Runtime{ k_cache: null, v_cache: null, rope_cos: null, rope_sin: null, prompt_ids: null, context_capacity: 0, rope_half_dim: 0, prompt_count: 0, total_tokens: 0, seed: QWEN3_SAMPLER_DEFAULT_SEED };
 }
@@ -1096,6 +1172,108 @@ fn qwen3_runtime_free(runtime: &Qwen3Runtime) void {
     if runtime.prompt_ids != null { free(runtime.prompt_ids as &void); }
     qwen3_q8_0_thread_pool_shutdown_c();
     runtime[0] = qwen3_runtime_init();
+}
+
+fn qwen3_close_runtime(table: &TensorWeightTable, tok: &Tokenizer, runtime: &Qwen3Runtime) void {
+    qwen3_runtime_free(runtime);
+    tokenizer_free(tok);
+    tensor_weight_table_detach_mmap(table);
+}
+
+fn qwen3_bench_clock_micros() u64 {
+    return (clock() as u64) * (1000000 as u64) / (CLOCKS_PER_SEC as u64);
+}
+
+fn qwen3_bench_elapsed_micros(start: u64, end: u64) u64 {
+    if end < start { return 0; }
+    return end - start;
+}
+
+fn qwen3_bench_rate_x1000(units: u64, micros: u64) u64 {
+    if micros == 0 { return 0; }
+    return (units * (1000000000 as u64)) / micros;
+}
+
+fn qwen3_bench_print_rate(label: &const byte, units: u64, micros: u64, unit_name: &const byte, repetitions: u32) void {
+    const scaled: u64 = qwen3_bench_rate_x1000(units, micros);
+    const whole_ms: u64 = micros / (1000 as u64);
+    const frac_ms: u64 = micros % (1000 as u64);
+    _ = printf("bench %s: %llu.%03llu %s/s units=%llu ms=%llu.%03llu repetitions=%u\n", label, scaled / (1000 as u64), scaled % (1000 as u64), unit_name, units, whole_ms, frac_ms, repetitions);
+}
+
+fn qwen3_bench_print_duration(label: &const byte, micros: u64, repetitions: u32) void {
+    var avg: u64 = 0;
+    if repetitions != 0 {
+        avg = micros / (repetitions as u64);
+    }
+    _ = printf("bench %s: ms=%llu.%03llu avg_ms=%llu.%03llu repetitions=%u\n", label, micros / (1000 as u64), micros % (1000 as u64), avg / (1000 as u64), avg % (1000 as u64), repetitions);
+}
+
+fn qwen3_bench_make_prompt_ids(seed_ids: &const u32, seed_count: usize, prompt_ids: &u32, prompt_count: usize) bool {
+    if seed_count == 0 || prompt_count == 0 { return false; }
+    var i: usize = 0;
+    while i < prompt_count {
+        prompt_ids[i] = seed_ids[i % seed_count];
+        i = i + 1;
+    }
+    return true;
+}
+
+fn qwen3_bench_decode_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, logits: &f32, seed_ids: &const u32, seed_count: usize, gen_count: usize) bool {
+    if gen_count == 0 { return true; }
+    if seed_count == 0 { return false; }
+    if runtime.total_tokens + gen_count > config.context_length as usize || runtime.total_tokens + gen_count > runtime.context_capacity {
+        _ = printf("error: bench decode exceeds context total_tokens=%zu add_tokens=%zu runtime_context=%zu model_context=%u\n", runtime.total_tokens, gen_count, runtime.context_capacity, config.context_length);
+        return false;
+    }
+    var i: usize = 0;
+    while i < gen_count {
+        const next_id: u32 = seed_ids[i % seed_count];
+        runtime.prompt_ids[runtime.total_tokens] = next_id;
+        runtime.total_tokens = runtime.total_tokens + 1;
+        if !qwen3_forward_token_with_rope(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, true, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn qwen3_bench_warmup(model_path: &const byte, bench: &Qwen3BenchConfig) bool {
+    var config: Qwen3Config = qwen3_config_init();
+    var table: TensorWeightTable = tensor_table_init();
+    var weights: Qwen3Weights = qwen3_weights_init();
+    var tok: Tokenizer = tokenizer_init();
+    var runtime: Qwen3Runtime = qwen3_runtime_init();
+    var logits: [f32: QWEN3_FORWARD_MAX_VOCAB] = [];
+    var seed_ids: [u32: QWEN3_BENCH_SEED_CAP] = [];
+    var seed_count: usize = 0;
+    if !qwen3_open_runtime(model_path, &config, &table, &weights, &tok, &runtime) { return false; }
+    if !tokenizer_encode_to_ids(&tok, bench.prompt_seed, &seed_ids[0], @len(seed_ids), &seed_count) || seed_count == 0 {
+        _ = printf("error: bench warmup failed to encode prompt seed: %s\n", bench.prompt_seed);
+        qwen3_close_runtime(&table, &tok, &runtime);
+        return false;
+    }
+    var prompt_ids: &u32 = calloc(bench.prompt_tokens as usize, 4) as &u32;
+    if prompt_ids == null {
+        _ = printf("error: bench warmup prompt allocation failed tokens=%u\n", bench.prompt_tokens);
+        qwen3_close_runtime(&table, &tok, &runtime);
+        return false;
+    }
+    const total_tokens: usize = (bench.prompt_tokens + bench.gen_tokens) as usize;
+    if total_tokens > runtime.context_capacity || total_tokens > config.context_length as usize {
+        _ = printf("error: bench warmup exceeds context prompt=%u gen=%u runtime_context=%zu model_context=%u\n", bench.prompt_tokens, bench.gen_tokens, runtime.context_capacity, config.context_length);
+        free(prompt_ids as &void);
+        qwen3_close_runtime(&table, &tok, &runtime);
+        return false;
+    }
+    if !qwen3_bench_make_prompt_ids(&seed_ids[0], seed_count, prompt_ids, bench.prompt_tokens as usize) {
+        free(prompt_ids as &void);
+        qwen3_close_runtime(&table, &tok, &runtime);
+        return false;
+    }
+    const ok: bool = qwen3_append_prompt_ids(&config, &weights, &runtime, prompt_ids as &const u32, bench.prompt_tokens as usize, &logits[0]) && qwen3_bench_decode_tokens(&config, &weights, &runtime, &logits[0], &seed_ids[0], seed_count, bench.gen_tokens as usize);
+    free(prompt_ids as &void);
+    qwen3_close_runtime(&table, &tok, &runtime);
+    return ok;
 }
 
 fn qwen3_append_prompt_ids(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, ids: &const u32, id_count: usize, logits: &f32) bool {
@@ -1194,11 +1372,140 @@ fn qwen3_open_runtime(path: &const byte, config: &Qwen3Config, table: &TensorWei
 fn qwen3_prepare_runtime(path: &const byte, prompt: &const byte, config: &Qwen3Config, table: &TensorWeightTable, weights: &Qwen3Weights, tok: &Tokenizer, runtime: &Qwen3Runtime, logits: &f32) bool {
     if !qwen3_open_runtime(path, config, table, weights, tok, runtime) { return false; }
     if !qwen3_append_prompt_text(config, weights, tok, runtime, prompt, logits) {
-        qwen3_runtime_free(runtime);
-        tensor_weight_table_detach_mmap(table);
+        qwen3_close_runtime(table, tok, runtime);
         return false;
     }
     return true;
+}
+
+export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
+    if argc < 3 {
+        _ = printf("usage: minicpm-o-uya bench <model.gguf> [--prompt TEXT] [--n-prompt N] [--n-gen N] [--repetitions N] [--threads N] [--no-warmup]\n");
+        return 1;
+    }
+    var bench: Qwen3BenchConfig = qwen3_bench_config_init();
+    if !qwen3_parse_bench_args(argc, argv, 3, &bench) {
+        _ = printf("usage: minicpm-o-uya bench <model.gguf> [--prompt TEXT] [--n-prompt N] [--n-gen N] [--repetitions N] [--threads N] [--no-warmup]\n");
+        return 1;
+    }
+    if bench.prompt_tokens == 0 {
+        _ = printf("error: bench requires --n-prompt >= 1\n");
+        return 1;
+    }
+    if bench.repetitions == 0 {
+        _ = printf("error: bench requires --repetitions >= 1\n");
+        return 1;
+    }
+    qwen3_set_thread_count(bench.threads);
+    if bench.warmup && !qwen3_bench_warmup(argv[2] as &const byte, &bench) {
+        return 1;
+    }
+
+    var load_micros: u64 = 0;
+    var prompt_micros: u64 = 0;
+    var decode_micros: u64 = 0;
+    var prompt_units: u64 = 0;
+    var decode_units: u64 = 0;
+    var summary_config: Qwen3Config = qwen3_config_init();
+    var summary_file_size: u64 = 0;
+    var seed_ids: [u32: QWEN3_BENCH_SEED_CAP] = [];
+    var seed_count: usize = 0;
+
+    var rep: u32 = 0;
+    while rep < bench.repetitions {
+        var config: Qwen3Config = qwen3_config_init();
+        var table: TensorWeightTable = tensor_table_init();
+        var weights: Qwen3Weights = qwen3_weights_init();
+        var tok: Tokenizer = tokenizer_init();
+        var runtime: Qwen3Runtime = qwen3_runtime_init();
+        const start: u64 = qwen3_bench_clock_micros();
+        if !qwen3_open_runtime(argv[2] as &const byte, &config, &table, &weights, &tok, &runtime) { return 1; }
+        load_micros = load_micros + qwen3_bench_elapsed_micros(start, qwen3_bench_clock_micros());
+        if rep == 0 {
+            qwen3_config_copy(&summary_config, &config);
+            summary_file_size = table.file_size;
+            if !tokenizer_encode_to_ids(&tok, bench.prompt_seed, &seed_ids[0], @len(seed_ids), &seed_count) || seed_count == 0 {
+                _ = printf("error: bench failed to encode prompt seed: %s\n", bench.prompt_seed);
+                qwen3_close_runtime(&table, &tok, &runtime);
+                return 1;
+            }
+            const total_tokens: usize = (bench.prompt_tokens + bench.gen_tokens) as usize;
+            if total_tokens > runtime.context_capacity || total_tokens > config.context_length as usize {
+                _ = printf("error: bench prompt+decode exceeds context prompt=%u gen=%u runtime_context=%zu model_context=%u\n", bench.prompt_tokens, bench.gen_tokens, runtime.context_capacity, config.context_length);
+                qwen3_close_runtime(&table, &tok, &runtime);
+                return 1;
+            }
+        }
+        qwen3_close_runtime(&table, &tok, &runtime);
+        rep = rep + 1;
+    }
+
+    var prompt_ids: &u32 = calloc(bench.prompt_tokens as usize, 4) as &u32;
+    if prompt_ids == null {
+        _ = printf("error: bench prompt allocation failed tokens=%u\n", bench.prompt_tokens);
+        return 1;
+    }
+    if !qwen3_bench_make_prompt_ids(&seed_ids[0], seed_count, prompt_ids, bench.prompt_tokens as usize) {
+        free(prompt_ids as &void);
+        _ = printf("error: bench failed to build prompt ids\n");
+        return 1;
+    }
+
+    rep = 0;
+    while rep < bench.repetitions {
+        var config: Qwen3Config = qwen3_config_init();
+        var table: TensorWeightTable = tensor_table_init();
+        var weights: Qwen3Weights = qwen3_weights_init();
+        var tok: Tokenizer = tokenizer_init();
+        var runtime: Qwen3Runtime = qwen3_runtime_init();
+        var logits: [f32: QWEN3_FORWARD_MAX_VOCAB] = [];
+        if !qwen3_open_runtime(argv[2] as &const byte, &config, &table, &weights, &tok, &runtime) {
+            free(prompt_ids as &void);
+            return 1;
+        }
+        const prompt_start: u64 = qwen3_bench_clock_micros();
+        if !qwen3_append_prompt_ids(&config, &weights, &runtime, prompt_ids as &const u32, bench.prompt_tokens as usize, &logits[0]) {
+            free(prompt_ids as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            return 1;
+        }
+        prompt_micros = prompt_micros + qwen3_bench_elapsed_micros(prompt_start, qwen3_bench_clock_micros());
+        prompt_units = prompt_units + (bench.prompt_tokens as u64);
+
+        const decode_start: u64 = qwen3_bench_clock_micros();
+        if !qwen3_bench_decode_tokens(&config, &weights, &runtime, &logits[0], &seed_ids[0], seed_count, bench.gen_tokens as usize) {
+            free(prompt_ids as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            return 1;
+        }
+        decode_micros = decode_micros + qwen3_bench_elapsed_micros(decode_start, qwen3_bench_clock_micros());
+        decode_units = decode_units + (bench.gen_tokens as u64);
+        qwen3_close_runtime(&table, &tok, &runtime);
+        rep = rep + 1;
+    }
+    free(prompt_ids as &void);
+
+    const runtime_context: usize = qwen3_runtime_context_capacity(&summary_config);
+    const kv_layout: LlmKvCacheLayout = llm_kv_cache_layout(summary_config.layer_count, runtime_context as u32, summary_config.kv_head_count, summary_config.head_dim, TensorDType.F32);
+    const rope_half_dim: u64 = (summary_config.head_dim as u64) / 2;
+    const rope_bytes: u64 = (runtime_context as u64) * rope_half_dim * 8;
+    const prompt_bytes: u64 = (runtime_context as u64) * 4;
+    const logits_bytes: u64 = (summary_config.vocab_size as u64) * 4;
+    const runtime_bytes: u64 = kv_layout.total_bytes + rope_bytes + prompt_bytes + logits_bytes;
+    const peak_bytes: u64 = runtime_bytes + summary_file_size;
+    var warmup_value: u32 = 0;
+    if bench.warmup { warmup_value = 1; }
+
+    _ = printf("bench config: mode=text-real prompt_tokens=%u gen_tokens=%u repetitions=%u warmup=%u threads=%zu\n", bench.prompt_tokens, bench.gen_tokens, bench.repetitions, warmup_value, qwen3_thread_count);
+    _ = printf("bench model: path=%s seed_prompt=%s seed_tokens=%zu vocab=%u context=%u hidden=%u layers=%u kv_heads=%u head_dim=%u\n", argv[2] as &const byte, bench.prompt_seed, seed_count, summary_config.vocab_size, summary_config.context_length, summary_config.hidden_size, summary_config.layer_count, summary_config.kv_head_count, summary_config.head_dim);
+    qwen3_bench_print_duration("load\0" as &const byte, load_micros, bench.repetitions);
+    qwen3_bench_print_rate("text_prompt\0" as &const byte, prompt_units, prompt_micros, "tokens\0" as &const byte, bench.repetitions);
+    qwen3_bench_print_rate("text_decode\0" as &const byte, decode_units, decode_micros, "tokens\0" as &const byte, bench.repetitions);
+    _ = printf("bench memory: peak_estimate_bytes=%llu weights_mmap=%llu runtime=%llu kv=%llu rope=%llu prompt_ids=%llu logits=%llu\n", peak_bytes, summary_file_size, runtime_bytes, kv_layout.total_bytes, rope_bytes, prompt_bytes, logits_bytes);
+    _ = printf("bench optimize: hot_matvec=q8_0_parallel_c kv_cache=contiguous rope=precomputed sampler=fixed-seed\n");
+    _ = printf("bench reference_error: n/a mode=real-timing\n");
+    _ = printf("bench: PASS\n");
+    return 0;
 }
 
 fn qwen3_trim_line(line: &byte) void {
