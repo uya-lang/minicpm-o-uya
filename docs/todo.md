@@ -423,10 +423,10 @@
 
 - [x] Uya `audio2audio-smoke` 支持 split GGUF 参数：`--audio-model`、`--speech-model`、`--vocoder-model`。
 - [x] 为官方 `MiniCPM-o-4_5-Q4_K_M.gguf`、`audio/MiniCPM-o-4_5-audio-F16.gguf`、`tts/MiniCPM-o-4_5-tts-F16.gguf`、`tts/MiniCPM-o-4_5-projector-F16.gguf`、`token2wav-gguf/*.gguf` 生成 tensor/metadata inventory。
-- [ ] 增加 `audit-bundle` 或等价脚本，批量输出每个 GGUF 的 tensor count、dtype distribution、name prefix、shape summary。
-- [ ] 为 audio encoder 建立官方 tensor alias 表。
-- [ ] 为 TTS GGUF 建立 `emb_code`、`emb_text`、`projector_semantic`、`projector_spk`、`head_code` 绑定表。
-- [ ] 为 token2wav 建立 encoder、flow_matching、flow_extra、hifigan2、prompt_cache 绑定表。
+- [x] 增加 `audit-bundle` 或等价脚本，批量输出每个 GGUF 的 tensor count、dtype distribution、name prefix、shape summary。
+- [x] 为 audio encoder 建立官方 tensor alias 表。
+- [x] 为 TTS GGUF 建立 `emb_code`、`emb_text`、`projector_semantic`、`projector_spk`、`head_code` 绑定表。
+- [x] 为 token2wav 建立 encoder、flow_matching、flow_extra、hifigan2、prompt_cache 绑定表。
 - [ ] 对缺失 tensor、未知 dtype、shape mismatch 输出具体分支名和候选 alias。
 
 验收标准：

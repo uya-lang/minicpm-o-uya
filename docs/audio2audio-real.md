@@ -42,6 +42,8 @@ audio2audio-real: audit-only PASS files=9
 audio2audio-real: inference_supported=false next=bind-official-tensors
 ```
 
+Each file audit also prints a compact inventory with tensor count, dtype distribution, name-prefix counts, and first tensor shape samples. For the official bundle this highlights the next binding groups, for example `encoder.*`, `emb_code.*`, `linear1.*`, `estimator.*`, `conv_post.*`, and `prompt_cache.*`.
+
 ## Required GGUF Files
 
 The official bundle must include:
@@ -55,6 +57,49 @@ The official bundle must include:
 - `token2wav-gguf/flow_extra.gguf`
 - `token2wav-gguf/hifigan2.gguf`
 - `token2wav-gguf/prompt_cache.gguf`
+
+
+## Audio Encoder Alias Inventory
+
+The official `audio/MiniCPM-o-4_5-audio-F16.gguf` currently audits as:
+
+- `encoder.conv1.{weight,bias}`: mel front-end conv, first tensor shape sample `[1,1024]` for bias and `[3,80,1024]` for weight.
+- `encoder.conv2.{weight,bias}`: second conv, weight shape `[3,1024,1024]`.
+- `encoder.positional_embedding`: positional table, shape `[1024,1500]`.
+- `encoder.blocks.N.*`: 24 transformer blocks, 15 tensors per block, including `attn.{query,key,value,out}`, `attn_ln`, `mlp`, and `mlp_ln`.
+- `encoder.ln_post.{weight,bias}`: final audio encoder norm.
+- `audio_projector.linear1.{weight,bias}` and `audio_projector.linear2.{weight,bias}`: projection into LLM hidden space.
+
+The audit summary should report `audio_encoder.encoder=367` and `audio_projector=4` for this file.
+
+
+## TTS Alias Inventory
+
+The official `tts/MiniCPM-o-4_5-tts-F16.gguf` currently audits as:
+
+- `emb_code.0.weight`: codec/audio token embedding, shape `[768,6562]`.
+- `emb_text.weight`: text token embedding for the TTS decoder, shape `[768,152064]`.
+- `token_embd.weight`: combined decoder token embedding, shape `[768,158626]`.
+- `blk.N.*`: 20 Qwen-style decoder blocks, 9 tensors per block.
+- `output_norm.weight`: final decoder norm.
+- `projector_semantic.linear{1,2}.{weight,bias}`: semantic conditioning projector.
+- `projector_spk.linear{1,2}.{weight,bias}`: speaker conditioning projector.
+- `head_code.0.weight`: audio-code output head, shape `[6562,768]`.
+
+The audit summary should report `tts_core=11` with `emb_code=1`, `emb_text=1`, `projector_semantic=4`, `projector_spk=4`, and `head_code=1` for this file.
+
+
+## Token2Wav Alias Inventory
+
+The official `token2wav-gguf` directory currently audits as:
+
+- `encoder.gguf`: `embed.*`, `encoders.*`, `up_embed.*`, `up_encoders.*`, `pre_lookahead_layer.*`, `up_layer.*`, and `after_norm.*`.
+- `flow_matching.gguf`: `estimator.*`, including input projection, DiT blocks, timestep MLP, and final layer.
+- `flow_extra.gguf`: `input_embedding.*`, `encoder_proj.*`, and `spk_embed_affine_layer.*`.
+- `hifigan2.gguf`: `conv_pre.*`, `ups.*`, `resblocks.*`, `source_resblocks.*`, `source_downs.*`, `m_source.*`, `f0_predictor.*`, and `conv_post.*`.
+- `prompt_cache.gguf`: `prompt_cache.spk_cb`, `prompt_cache.estimator_*`, and `prompt_cache.conformer_*`.
+
+After alias classification, these token2wav files should have zero unknown tensors in audit output. Kernel support is still pending; this table only establishes names and shapes for binding.
 
 ## Current Uya Status
 

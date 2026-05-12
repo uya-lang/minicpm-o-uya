@@ -541,6 +541,39 @@ struct AuditStats {
     unknown_tensor_count: u64,
     first_unknown_tensor: [byte: 257],
     tensor_data_warning_count: u64,
+    prefix_blk_count: u64,
+    prefix_audio_encoder_count: u64,
+    prefix_audio_projector_count: u64,
+    prefix_tts_count: u64,
+    prefix_tts_emb_code_count: u64,
+    prefix_tts_emb_text_count: u64,
+    prefix_tts_projector_semantic_count: u64,
+    prefix_tts_projector_spk_count: u64,
+    prefix_tts_head_code_count: u64,
+    prefix_projector_count: u64,
+    prefix_token2wav_encoder_count: u64,
+    prefix_flow_count: u64,
+    prefix_hifigan_count: u64,
+    prefix_prompt_cache_count: u64,
+    first_root_tensor: [byte: 257],
+    first_text_tensor: [byte: 257],
+    first_audio_tensor: [byte: 257],
+    first_speech_tensor: [byte: 257],
+    first_root_shape: [u64: 8],
+    first_text_shape: [u64: 8],
+    first_audio_shape: [u64: 8],
+    first_speech_shape: [u64: 8],
+    first_root_n_dims: u32,
+    first_text_n_dims: u32,
+    first_audio_n_dims: u32,
+    first_speech_n_dims: u32,
+    first_root_ggml_type: u32,
+    first_text_ggml_type: u32,
+    first_audio_ggml_type: u32,
+    first_speech_ggml_type: u32,
+    first_unknown_shape: [u64: 8],
+    first_unknown_n_dims: u32,
+    first_unknown_ggml_type: u32,
     has_tokenizer_metadata: bool,
     has_tokenizer_tokens: bool,
     has_special_token_metadata: bool,
@@ -578,6 +611,39 @@ fn audit_stats_init() AuditStats {
         unknown_tensor_count: 0,
         first_unknown_tensor: [],
         tensor_data_warning_count: 0,
+        prefix_blk_count: 0,
+        prefix_audio_encoder_count: 0,
+        prefix_audio_projector_count: 0,
+        prefix_tts_count: 0,
+        prefix_tts_emb_code_count: 0,
+        prefix_tts_emb_text_count: 0,
+        prefix_tts_projector_semantic_count: 0,
+        prefix_tts_projector_spk_count: 0,
+        prefix_tts_head_code_count: 0,
+        prefix_projector_count: 0,
+        prefix_token2wav_encoder_count: 0,
+        prefix_flow_count: 0,
+        prefix_hifigan_count: 0,
+        prefix_prompt_cache_count: 0,
+        first_root_tensor: [],
+        first_text_tensor: [],
+        first_audio_tensor: [],
+        first_speech_tensor: [],
+        first_root_shape: [],
+        first_text_shape: [],
+        first_audio_shape: [],
+        first_speech_shape: [],
+        first_root_n_dims: 0,
+        first_text_n_dims: 0,
+        first_audio_n_dims: 0,
+        first_speech_n_dims: 0,
+        first_root_ggml_type: 0,
+        first_text_ggml_type: 0,
+        first_audio_ggml_type: 0,
+        first_speech_ggml_type: 0,
+        first_unknown_shape: [],
+        first_unknown_n_dims: 0,
+        first_unknown_ggml_type: 0,
         has_tokenizer_metadata: false,
         has_tokenizer_tokens: false,
         has_special_token_metadata: false,
@@ -858,7 +924,41 @@ fn audit_is_root_tensor(name: &const byte) bool {
     return false;
 }
 
-fn audit_mark_tensor_branch(stats: &AuditStats, name: &const byte) void {
+fn audit_mark_tensor_prefixes(stats: &AuditStats, name: &const byte) void {
+    if cstr_starts_with_ci(name, "blk.\0" as &const byte) { stats.prefix_blk_count = stats.prefix_blk_count + 1; }
+    if cstr_starts_with_ci(name, "encoder.\0" as &const byte) { stats.prefix_audio_encoder_count = stats.prefix_audio_encoder_count + 1; }
+    if cstr_starts_with_ci(name, "audio_projector.\0" as &const byte) { stats.prefix_audio_projector_count = stats.prefix_audio_projector_count + 1; }
+    if cstr_starts_with_ci(name, "emb_code\0" as &const byte) { stats.prefix_tts_emb_code_count = stats.prefix_tts_emb_code_count + 1; }
+    if cstr_starts_with_ci(name, "emb_text\0" as &const byte) { stats.prefix_tts_emb_text_count = stats.prefix_tts_emb_text_count + 1; }
+    if cstr_starts_with_ci(name, "projector_semantic\0" as &const byte) { stats.prefix_tts_projector_semantic_count = stats.prefix_tts_projector_semantic_count + 1; }
+    if cstr_starts_with_ci(name, "projector_spk\0" as &const byte) { stats.prefix_tts_projector_spk_count = stats.prefix_tts_projector_spk_count + 1; }
+    if cstr_starts_with_ci(name, "head_code\0" as &const byte) { stats.prefix_tts_head_code_count = stats.prefix_tts_head_code_count + 1; }
+    if cstr_starts_with_ci(name, "emb_code\0" as &const byte) || cstr_starts_with_ci(name, "emb_text\0" as &const byte) || cstr_starts_with_ci(name, "projector_semantic\0" as &const byte) || cstr_starts_with_ci(name, "projector_spk\0" as &const byte) || cstr_starts_with_ci(name, "head_code\0" as &const byte) { stats.prefix_tts_count = stats.prefix_tts_count + 1; }
+    if cstr_starts_with_ci(name, "linear1.\0" as &const byte) || cstr_starts_with_ci(name, "linear2.\0" as &const byte) { stats.prefix_projector_count = stats.prefix_projector_count + 1; }
+    if cstr_starts_with_ci(name, "after_norm.\0" as &const byte) || cstr_starts_with_ci(name, "embed.\0" as &const byte) || cstr_starts_with_ci(name, "up_embed.\0" as &const byte) || cstr_starts_with_ci(name, "encoders.\0" as &const byte) || cstr_starts_with_ci(name, "up_encoders.\0" as &const byte) || cstr_starts_with_ci(name, "pre_lookahead_layer.\0" as &const byte) || cstr_starts_with_ci(name, "up_layer.\0" as &const byte) { stats.prefix_token2wav_encoder_count = stats.prefix_token2wav_encoder_count + 1; }
+    if cstr_starts_with_ci(name, "estimator.\0" as &const byte) || cstr_starts_with_ci(name, "input_embedding.\0" as &const byte) || cstr_starts_with_ci(name, "encoder_proj.\0" as &const byte) || cstr_starts_with_ci(name, "spk_embed_affine_layer.\0" as &const byte) { stats.prefix_flow_count = stats.prefix_flow_count + 1; }
+    if cstr_starts_with_ci(name, "conv_pre.\0" as &const byte) || cstr_starts_with_ci(name, "conv_post.\0" as &const byte) || cstr_starts_with_ci(name, "ups.\0" as &const byte) || cstr_starts_with_ci(name, "resblocks.\0" as &const byte) || cstr_starts_with_ci(name, "source_resblocks.\0" as &const byte) || cstr_starts_with_ci(name, "source_downs.\0" as &const byte) || cstr_starts_with_ci(name, "m_source.\0" as &const byte) || cstr_starts_with_ci(name, "f0_predictor.\0" as &const byte) { stats.prefix_hifigan_count = stats.prefix_hifigan_count + 1; }
+    if cstr_starts_with_ci(name, "prompt_cache.\0" as &const byte) { stats.prefix_prompt_cache_count = stats.prefix_prompt_cache_count + 1; }
+}
+
+fn audit_copy_shape(dest: &u64, dims: &u64, n_dims: u32) void {
+    var i: u32 = 0;
+    while i < n_dims {
+        dest[i as usize] = dims[i as usize];
+        i = i + 1;
+    }
+}
+
+fn audit_mark_first_unknown_shape(stats: &AuditStats, name: &const byte, dims: &u64, n_dims: u32, ggml_type: u32) void {
+    copy_cstr(&stats.first_unknown_tensor[0], @len(stats.first_unknown_tensor), name);
+    audit_copy_shape(&stats.first_unknown_shape[0], dims, n_dims);
+    stats.first_unknown_n_dims = n_dims;
+    stats.first_unknown_ggml_type = ggml_type;
+}
+
+fn audit_mark_tensor_branch(stats: &AuditStats, name: &const byte, dims: &u64, n_dims: u32, ggml_type: u32) void {
+    audit_mark_tensor_prefixes(stats, name);
+
     if cstr_contains_ci(name, "token_embd\0" as &const byte) || cstr_contains_ci(name, "tok_embeddings\0" as &const byte) || cstr_contains_ci(name, "embed_tokens\0" as &const byte) {
         stats.has_token_embd_tensor = true;
     }
@@ -868,15 +968,33 @@ fn audit_mark_tensor_branch(stats: &AuditStats, name: &const byte) void {
 
     if audit_is_root_tensor(name) {
         stats.root_tensor_count = stats.root_tensor_count + 1;
+        if stats.root_tensor_count == 1 {
+            copy_cstr(&stats.first_root_tensor[0], @len(stats.first_root_tensor), name);
+            audit_copy_shape(&stats.first_root_shape[0], dims, n_dims);
+            stats.first_root_n_dims = n_dims;
+            stats.first_root_ggml_type = ggml_type;
+        }
         return;
     }
     if cstr_starts_with_ci(name, "blk.\0" as &const byte) || cstr_contains_ci(name, "model.layers\0" as &const byte) || cstr_contains_ci(name, "language_model\0" as &const byte) || cstr_contains_ci(name, "llm\0" as &const byte) || cstr_contains_ci(name, "qwen\0" as &const byte) || cstr_contains_ci(name, "text\0" as &const byte) {
         stats.text_tensor_count = stats.text_tensor_count + 1;
+        if stats.text_tensor_count == 1 {
+            copy_cstr(&stats.first_text_tensor[0], @len(stats.first_text_tensor), name);
+            audit_copy_shape(&stats.first_text_shape[0], dims, n_dims);
+            stats.first_text_n_dims = n_dims;
+            stats.first_text_ggml_type = ggml_type;
+        }
         stats.has_text_tensor = true;
         return;
     }
-    if cstr_contains_ci(name, "audio\0" as &const byte) || cstr_contains_ci(name, "whisper\0" as &const byte) || cstr_contains_ci(name, "mel\0" as &const byte) {
+    if cstr_contains_ci(name, "audio\0" as &const byte) || cstr_contains_ci(name, "whisper\0" as &const byte) || cstr_contains_ci(name, "mel\0" as &const byte) || cstr_starts_with_ci(name, "encoder.\0" as &const byte) || cstr_starts_with_ci(name, "audio_projector.\0" as &const byte) {
         stats.audio_tensor_count = stats.audio_tensor_count + 1;
+        if stats.audio_tensor_count == 1 {
+            copy_cstr(&stats.first_audio_tensor[0], @len(stats.first_audio_tensor), name);
+            audit_copy_shape(&stats.first_audio_shape[0], dims, n_dims);
+            stats.first_audio_n_dims = n_dims;
+            stats.first_audio_ggml_type = ggml_type;
+        }
         stats.has_audio_tensor = true;
         return;
     }
@@ -885,14 +1003,18 @@ fn audit_mark_tensor_branch(stats: &AuditStats, name: &const byte) void {
         stats.has_vision_tensor = true;
         return;
     }
-    if cstr_contains_ci(name, "speech\0" as &const byte) || cstr_contains_ci(name, "vocoder\0" as &const byte) || cstr_contains_ci(name, "cosy\0" as &const byte) || cstr_contains_ci(name, "codec\0" as &const byte) || cstr_contains_ci(name, "tts\0" as &const byte) {
+    if cstr_contains_ci(name, "speech\0" as &const byte) || cstr_contains_ci(name, "vocoder\0" as &const byte) || cstr_contains_ci(name, "cosy\0" as &const byte) || cstr_contains_ci(name, "codec\0" as &const byte) || cstr_contains_ci(name, "tts\0" as &const byte) || cstr_starts_with_ci(name, "emb_code\0" as &const byte) || cstr_starts_with_ci(name, "emb_text\0" as &const byte) || cstr_starts_with_ci(name, "projector_semantic\0" as &const byte) || cstr_starts_with_ci(name, "projector_spk\0" as &const byte) || cstr_starts_with_ci(name, "head_code\0" as &const byte) || cstr_starts_with_ci(name, "linear1.\0" as &const byte) || cstr_starts_with_ci(name, "linear2.\0" as &const byte) || cstr_starts_with_ci(name, "after_norm.\0" as &const byte) || cstr_starts_with_ci(name, "embed.\0" as &const byte) || cstr_starts_with_ci(name, "up_embed.\0" as &const byte) || cstr_starts_with_ci(name, "encoders.\0" as &const byte) || cstr_starts_with_ci(name, "up_encoders.\0" as &const byte) || cstr_starts_with_ci(name, "pre_lookahead_layer.\0" as &const byte) || cstr_starts_with_ci(name, "up_layer.\0" as &const byte) || cstr_starts_with_ci(name, "estimator.\0" as &const byte) || cstr_starts_with_ci(name, "input_embedding.\0" as &const byte) || cstr_starts_with_ci(name, "encoder_proj.\0" as &const byte) || cstr_starts_with_ci(name, "spk_embed_affine_layer.\0" as &const byte) || cstr_starts_with_ci(name, "conv_pre.\0" as &const byte) || cstr_starts_with_ci(name, "conv_post.\0" as &const byte) || cstr_starts_with_ci(name, "ups.\0" as &const byte) || cstr_starts_with_ci(name, "resblocks.\0" as &const byte) || cstr_starts_with_ci(name, "source_resblocks.\0" as &const byte) || cstr_starts_with_ci(name, "source_downs.\0" as &const byte) || cstr_starts_with_ci(name, "m_source.\0" as &const byte) || cstr_starts_with_ci(name, "f0_predictor.\0" as &const byte) || cstr_starts_with_ci(name, "prompt_cache.\0" as &const byte) {
         stats.speech_tensor_count = stats.speech_tensor_count + 1;
+        if stats.speech_tensor_count == 1 {
+            copy_cstr(&stats.first_speech_tensor[0], @len(stats.first_speech_tensor), name);
+            audit_copy_shape(&stats.first_speech_shape[0], dims, n_dims);
+            stats.first_speech_n_dims = n_dims;
+            stats.first_speech_ggml_type = ggml_type;
+        }
         stats.has_speech_tensor = true;
         return;
     }
-    if stats.unknown_tensor_count == 0 {
-        copy_cstr(&stats.first_unknown_tensor[0], @len(stats.first_unknown_tensor), name);
-    }
+    if stats.unknown_tensor_count == 0 { audit_mark_first_unknown_shape(stats, name, dims, n_dims, ggml_type); }
     stats.unknown_tensor_count = stats.unknown_tensor_count + 1;
 }
 
@@ -935,7 +1057,7 @@ fn audit_tensor_info(reader: &BinaryReader, stats: &AuditStats, data_start: u64)
         }
         stats.unknown_dtype_count = stats.unknown_dtype_count + 1;
     }
-    audit_mark_tensor_branch(stats, &name[0] as &const byte);
+    audit_mark_tensor_branch(stats, &name[0] as &const byte, &dims[0], n_dims, ggml_type);
 
     var byte_count: u64 = 0;
     var absolute_offset: u64 = 0;
@@ -1016,6 +1138,30 @@ fn audit_print_dtype_distribution(stats: &AuditStats) void {
     }
     if !printed {
         _ = printf("  none\n");
+    }
+}
+
+fn audit_print_prefix_summary(stats: &AuditStats) void {
+    _ = printf("tensor prefix summary:\n");
+    _ = printf("  qwen_blk: %llu\n", stats.prefix_blk_count);
+    _ = printf("  audio_encoder.encoder: %llu\n", stats.prefix_audio_encoder_count);
+    _ = printf("  audio_projector: %llu\n", stats.prefix_audio_projector_count);
+    _ = printf("  tts_core: %llu\n", stats.prefix_tts_count);
+    _ = printf("    emb_code: %llu emb_text: %llu projector_semantic: %llu projector_spk: %llu head_code: %llu\n", stats.prefix_tts_emb_code_count, stats.prefix_tts_emb_text_count, stats.prefix_tts_projector_semantic_count, stats.prefix_tts_projector_spk_count, stats.prefix_tts_head_code_count);
+    _ = printf("  tts_projector.linear: %llu\n", stats.prefix_projector_count);
+    _ = printf("  token2wav_encoder.after_norm: %llu\n", stats.prefix_token2wav_encoder_count);
+    _ = printf("  token2wav_flow: %llu\n", stats.prefix_flow_count);
+    _ = printf("  hifigan2: %llu\n", stats.prefix_hifigan_count);
+    _ = printf("  prompt_cache: %llu\n", stats.prefix_prompt_cache_count);
+    _ = printf("tensor shape samples:\n");
+    if stats.root_tensor_count > 0 { _ = printf("  root first=%s shape=", &stats.first_root_tensor[0]); print_shape(&stats.first_root_shape[0], stats.first_root_n_dims); _ = printf(" ggml_type=%u\n", stats.first_root_ggml_type); }
+    if stats.text_tensor_count > 0 { _ = printf("  text first=%s shape=", &stats.first_text_tensor[0]); print_shape(&stats.first_text_shape[0], stats.first_text_n_dims); _ = printf(" ggml_type=%u\n", stats.first_text_ggml_type); }
+    if stats.audio_tensor_count > 0 { _ = printf("  audio first=%s shape=", &stats.first_audio_tensor[0]); print_shape(&stats.first_audio_shape[0], stats.first_audio_n_dims); _ = printf(" ggml_type=%u\n", stats.first_audio_ggml_type); }
+    if stats.speech_tensor_count > 0 { _ = printf("  speech/token2wav first=%s shape=", &stats.first_speech_tensor[0]); print_shape(&stats.first_speech_shape[0], stats.first_speech_n_dims); _ = printf(" ggml_type=%u\n", stats.first_speech_ggml_type); }
+    if stats.unknown_tensor_count > 0 {
+        _ = printf("  unknown first=%s shape=", &stats.first_unknown_tensor[0]);
+        print_shape(&stats.first_unknown_shape[0], stats.first_unknown_n_dims);
+        _ = printf(" ggml_type=%u\n", stats.first_unknown_ggml_type);
     }
 }
 
@@ -1143,6 +1289,7 @@ export fn audit_gguf(path: &const byte) i32 {
     _ = printf("layout: alignment=%llu tensor_dir_start=%llu tensor_dir_end=%llu data_start=%llu\n", alignment, tensor_dir_start, tensor_dir_end, data_start);
     audit_print_metadata_distribution(&stats);
     audit_print_dtype_distribution(&stats);
+    audit_print_prefix_summary(&stats);
     _ = printf("tensor branch counts:\n");
     _ = printf("  root: %llu\n", stats.root_tensor_count);
     _ = printf("  text: %llu\n", stats.text_tensor_count);
