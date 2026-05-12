@@ -48,6 +48,10 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `vision-preprocess-smoke <model.gguf> <image.rgb\|manifest>` | RGB/manifest preprocessing smoke | `UYRG`, `UYIM`, `UYVM`; no PNG/JPEG/MP4 decoding |
 | `audio-smoke <model.gguf> <audio.raw>` | Audio encoder smoke | `UYAM` log-mel F32 input |
 | `audio-preprocess-smoke <audio.pcm>` | PCM to tiny log-mel preprocessing smoke | `UYAP` PCM fixture input |
+| `audio-input-probe <audio.wav\|audio.uyap.pcm>` | Real audio input validation | 16 kHz mono WAV/UYAP protocol gate |
+| `audio-real-preprocess-probe <audio.wav\|audio.uyap.pcm>` | Real MiniCPM-o preprocessing plan | 100 ms align, center pad, conv/pool token planning |
+| `audio-real-mel-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real numeric mel probe | Supports `--dump-f32 out.uyml` for full-array alignment |
+| `audio-real-encode-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real audio encoder forward probe | Correctness-first `conv + transformer + projector + pool` path |
 | `audio2audio-smoke <model.gguf> [--audio-model audio.gguf] [--speech-model speech.gguf] [--vocoder-model vocoder.gguf] <audio.pcm\|audio.raw> [out.wav]` | Audio input to WAV smoke | PCM/mel -> audio encoder -> speech/vocoder WAV; optional split GGUF tables |
 | `speech-smoke <model.gguf> <prompt> [out.wav]` | Speech/vocoder smoke | Deterministic tiny WAV output only |
 | `omni-smoke <model.gguf> <manifest.json>` | Compile mixed text/image/audio/speech manifest | Fixed test JSON schema |
@@ -131,6 +135,9 @@ build/minicpm-o-uya tensors "$MINICPM_O_GGUF" --mmap
 build/minicpm-o-uya qwen3-bind "$MINICPM_O_TEXT_GGUF"
 build/minicpm-o-uya vision-smoke "$MINICPM_O_GGUF" "$MINICPM_O_IMAGE_RAW"
 build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
+build/minicpm-o-uya audio-real-preprocess-probe /path/to/user.wav
+build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
+build/minicpm-o-uya audio-real-encode-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_TEXT_GGUF" --audio-model "$MINICPM_O_AUDIO_GGUF" --speech-model "$MINICPM_O_SPEECH_GGUF" --vocoder-model "$MINICPM_O_VOCODER_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"

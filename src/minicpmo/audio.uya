@@ -2,6 +2,7 @@ use libc.O_CREAT;
 use libc.O_TRUNC;
 use libc.O_WRONLY;
 use libc.calloc;
+use libc.clock;
 use libc.cosf;
 use libc.free;
 use libc.log10f;
@@ -22,6 +23,7 @@ use minicpmo.binary.binary_read_u64_le;
 use minicpmo.binary.binary_reader_init;
 use minicpmo.binary.binary_seek;
 use minicpmo.binary.binary_skip;
+use minicpmo.kernels.gelu;
 use minicpmo.kernels.silu;
 use minicpmo.kernels.softmax;
 use minicpmo.qwen3.Qwen3Config;
@@ -117,6 +119,7 @@ const AUDIO_REAL_POOL_STRIDE: u32 = 5;
 const AUDIO_REAL_MEL_PROBE_MAX_SAMPLES: u64 = 480000;
 const AUDIO_REAL_MEL_DUMP_MAGIC: u32 = 0x4c4d5955;
 const AUDIO_REAL_MEL_DUMP_VERSION: u32 = 1;
+const AUDIO_REAL_LAYER_NORM_EPS: f32 = 0.00001;
 const AUDIO_INFO_CONTAINER_WAV: u32 = 1;
 const AUDIO_INFO_CONTAINER_UYAP: u32 = 2;
 const AUDIO_INFO_DTYPE_S16: u32 = 1;
@@ -1574,6 +1577,425 @@ export fn audio_real_bind_file(path: &const byte) bool {
 
 export fn audio_real_bind_cli(path: &const byte) i32 {
     if !audio_real_bind_file(path) { return 1; }
+    return 0;
+}
+
+fn audio_real_clock_us() u64 {
+    return clock() as u64;
+}
+
+fn audio_real_conv_output_tokens(input_tokens: usize, kernel: usize, stride: usize) usize {
+    if input_tokens == 0 || kernel == 0 || stride == 0 { return 0; }
+    const pad: usize = kernel / 2;
+    if input_tokens + (pad * 2) < kernel { return 0; }
+    return ((input_tokens + (pad * 2) - kernel) / stride) + 1;
+}
+
+fn audio_real_pool_output_tokens(input_tokens: usize) usize {
+    if input_tokens < AUDIO_REAL_POOL_KERNEL as usize { return 0; }
+    return ((input_tokens - (AUDIO_REAL_POOL_KERNEL as usize)) / (AUDIO_REAL_POOL_STRIDE as usize)) + 1;
+}
+
+fn audio_real_alloc_f32(count: usize, label: &const byte) &f32 {
+    const ptr: &f32 = calloc(count, 4) as &f32;
+    if ptr == null { _ = printf("error: audio-real-encode allocation failed label=%s count=%zu\n", label, count); }
+    return ptr;
+}
+
+fn audio_real_layer_norm_tensor(dst: &f32, src: &const f32, weight: &TensorView, bias: &TensorView, len: usize) void {
+    var mean: f32 = 0.0;
+    var i: usize = 0;
+    while i < len { mean = mean + src[i]; i = i + 1; }
+    mean = mean / (len as f32);
+    var var_sum: f32 = 0.0;
+    i = 0;
+    while i < len {
+        const delta: f32 = src[i] - mean;
+        var_sum = var_sum + delta * delta;
+        i = i + 1;
+    }
+    const scale: f32 = 1.0 / sqrtf(var_sum / (len as f32) + AUDIO_REAL_LAYER_NORM_EPS);
+    i = 0;
+    while i < len {
+        dst[i] = (src[i] - mean) * scale * qwen3_tensor_get(weight, i) + qwen3_tensor_get(bias, i);
+        i = i + 1;
+    }
+}
+
+fn audio_real_matvec_bias(dst: &f32, matrix: &TensorView, bias: &TensorView, src: &const f32, in_dim: usize, out_dim: usize, use_gelu: bool, use_relu: bool) void {
+    var out_index: usize = 0;
+    while out_index < out_dim {
+        var sum: f32 = 0.0;
+        if bias != null { sum = qwen3_tensor_get(bias, out_index); }
+        var in_index: usize = 0;
+        while in_index < in_dim {
+            sum = sum + src[in_index] * qwen3_tensor_get(matrix, in_index * out_dim + out_index);
+            in_index = in_index + 1;
+        }
+        if use_gelu { sum = gelu(sum); }
+        if use_relu && sum < 0.0 { sum = 0.0; }
+        dst[out_index] = sum;
+        out_index = out_index + 1;
+    }
+}
+
+fn audio_real_position_value(view: &TensorView, hidden_size: usize, token_index: usize, hidden_index: usize) f32 {
+    if view.n_dims != 2 { return 0.0 as f32; }
+    if view.shape[0] == hidden_size as u64 {
+        return qwen3_tensor_get(view, hidden_index * (view.shape[1] as usize) + token_index);
+    }
+    return qwen3_tensor_get(view, token_index * hidden_size + hidden_index);
+}
+
+fn audio_real_mel_to_frame_major(mel_values: &const f32, mel_frames: usize, mel_bins: usize, frame_major: &f32) void {
+    var frame: usize = 0;
+    while frame < mel_frames {
+        var mel: usize = 0;
+        while mel < mel_bins {
+            frame_major[frame * mel_bins + mel] = mel_values[mel * mel_frames + frame];
+            mel = mel + 1;
+        }
+        frame = frame + 1;
+    }
+}
+
+fn audio_real_conv1d_same_from_mel(dst: &f32, mel_frames: usize, mel_bins: usize, mel_frame_major: &const f32, weight: &TensorView, bias: &TensorView, stride: usize, out_hidden: usize, out_tokens: &usize) bool {
+    const kernel: usize = weight.shape[0] as usize;
+    const pad: i32 = (kernel / 2) as i32;
+    out_tokens[0] = audio_real_conv_output_tokens(mel_frames, kernel, stride);
+    if out_tokens[0] == 0 { return false; }
+    var out_token: usize = 0;
+    while out_token < out_tokens[0] {
+        var out_hidden_index: usize = 0;
+        while out_hidden_index < out_hidden {
+            var sum: f32 = qwen3_tensor_get(bias, out_hidden_index);
+            var k: usize = 0;
+            while k < kernel {
+                const src_token_signed: i32 = (out_token * stride + k) as i32 - pad;
+                if src_token_signed >= 0 && src_token_signed < mel_frames as i32 {
+                    const src_token: usize = src_token_signed as usize;
+                    var mel: usize = 0;
+                    while mel < mel_bins {
+                        const src_value: f32 = mel_frame_major[src_token * mel_bins + mel];
+                        sum = sum + src_value * qwen3_tensor_get(weight, ((k * mel_bins + mel) * out_hidden) + out_hidden_index);
+                        mel = mel + 1;
+                    }
+                }
+                k = k + 1;
+            }
+            dst[out_token * out_hidden + out_hidden_index] = gelu(sum);
+            out_hidden_index = out_hidden_index + 1;
+        }
+        out_token = out_token + 1;
+    }
+    return true;
+}
+
+fn audio_real_conv1d_same_hidden(dst: &f32, src_tokens: usize, src: &const f32, weight: &TensorView, bias: &TensorView, stride: usize, hidden: usize, out_tokens: &usize) bool {
+    const kernel: usize = weight.shape[0] as usize;
+    const pad: i32 = (kernel / 2) as i32;
+    out_tokens[0] = audio_real_conv_output_tokens(src_tokens, kernel, stride);
+    if out_tokens[0] == 0 { return false; }
+    var out_token: usize = 0;
+    while out_token < out_tokens[0] {
+        var out_hidden_index: usize = 0;
+        while out_hidden_index < hidden {
+            var sum: f32 = qwen3_tensor_get(bias, out_hidden_index);
+            var k: usize = 0;
+            while k < kernel {
+                const src_token_signed: i32 = (out_token * stride + k) as i32 - pad;
+                if src_token_signed >= 0 && src_token_signed < src_tokens as i32 {
+                    const src_token: usize = src_token_signed as usize;
+                    var in_hidden_index: usize = 0;
+                    while in_hidden_index < hidden {
+                        sum = sum + src[src_token * hidden + in_hidden_index] * qwen3_tensor_get(weight, ((k * hidden + in_hidden_index) * hidden) + out_hidden_index);
+                        in_hidden_index = in_hidden_index + 1;
+                    }
+                }
+                k = k + 1;
+            }
+            dst[out_token * hidden + out_hidden_index] = gelu(sum);
+            out_hidden_index = out_hidden_index + 1;
+        }
+        out_token = out_token + 1;
+    }
+    return true;
+}
+
+fn audio_real_attention_token(dst: &f32, q_values: &const f32, k_values: &const f32, v_values: &const f32, token_count: usize, head_count: usize, head_dim: usize, token_index: usize, scores: &f32, probs: &f32) void {
+    var hidden_index: usize = 0;
+    while hidden_index < head_count * head_dim { dst[hidden_index] = 0.0; hidden_index = hidden_index + 1; }
+    const scale: f32 = 1.0 / sqrtf(head_dim as f32);
+    var head_index: usize = 0;
+    while head_index < head_count {
+        var key_token: usize = 0;
+        while key_token < token_count {
+            var dot: f32 = 0.0;
+            var dim_index: usize = 0;
+            while dim_index < head_dim {
+                const offset: usize = head_index * head_dim + dim_index;
+                dot = dot + q_values[token_index * head_count * head_dim + offset] * k_values[key_token * head_count * head_dim + offset];
+                dim_index = dim_index + 1;
+            }
+            scores[key_token] = dot * scale;
+            key_token = key_token + 1;
+        }
+        softmax(probs, scores as &const f32, token_count);
+        var out_dim: usize = 0;
+        while out_dim < head_dim {
+            var sum: f32 = 0.0;
+            var value_token: usize = 0;
+            while value_token < token_count {
+                const offset2: usize = head_index * head_dim + out_dim;
+                sum = sum + probs[value_token] * v_values[value_token * head_count * head_dim + offset2];
+                value_token = value_token + 1;
+            }
+            dst[head_index * head_dim + out_dim] = sum;
+            out_dim = out_dim + 1;
+        }
+        head_index = head_index + 1;
+    }
+}
+
+fn audio_real_forward(table: &TensorWeightTable, config: &AudioConfig, mel_values: &const f32, mel_frames: usize, embeddings: &f32, span_count: &usize) bool {
+    const hidden: usize = config.hidden_size as usize;
+    const head_count: usize = config.head_count as usize;
+    const head_dim: usize = config.head_dim as usize;
+    const ffn: usize = config.intermediate_size as usize;
+    const llm_hidden: usize = config.llm_hidden_size as usize;
+    const conv_tokens: usize = audio_real_conv_output_tokens(mel_frames, 3, 2);
+    const pooled_tokens: usize = audio_real_pool_output_tokens(conv_tokens);
+    if conv_tokens == 0 || pooled_tokens == 0 { _ = printf("error: audio-real-encode invalid token plan mel_frames=%zu conv_tokens=%zu pooled_tokens=%zu\n", mel_frames, conv_tokens, pooled_tokens); return false; }
+    if conv_tokens > config.frame_count as usize { _ = printf("error: audio-real-encode conv_tokens=%zu exceed position context=%u\n", conv_tokens, config.frame_count); return false; }
+
+    const mel_frame_major_count: usize = mel_frames * (config.mel_bin_count as usize);
+    var mel_frame_major: &f32 = audio_real_alloc_f32(mel_frame_major_count, "mel-frame-major\0" as &const byte);
+    var conv1_states: &f32 = audio_real_alloc_f32(mel_frames * hidden, "conv1-states\0" as &const byte);
+    var states: &f32 = audio_real_alloc_f32(conv_tokens * hidden, "states\0" as &const byte);
+    var normed: &f32 = audio_real_alloc_f32(conv_tokens * hidden, "normed\0" as &const byte);
+    var q_values: &f32 = audio_real_alloc_f32(conv_tokens * hidden, "q-values\0" as &const byte);
+    var k_values: &f32 = audio_real_alloc_f32(conv_tokens * hidden, "k-values\0" as &const byte);
+    var v_values: &f32 = audio_real_alloc_f32(conv_tokens * hidden, "v-values\0" as &const byte);
+    var attn_ctx: &f32 = audio_real_alloc_f32(conv_tokens * hidden, "attn-ctx\0" as &const byte);
+    var tmp_out: &f32 = audio_real_alloc_f32(conv_tokens * hidden, "tmp-out\0" as &const byte);
+    var ffn_hidden: &f32 = audio_real_alloc_f32(conv_tokens * ffn, "ffn-hidden\0" as &const byte);
+    var projector_1: &f32 = audio_real_alloc_f32(conv_tokens * llm_hidden, "projector-1\0" as &const byte);
+    var projector_2: &f32 = audio_real_alloc_f32(conv_tokens * llm_hidden, "projector-2\0" as &const byte);
+    var scores: &f32 = audio_real_alloc_f32(conv_tokens, "scores\0" as &const byte);
+    var probs: &f32 = audio_real_alloc_f32(conv_tokens, "probs\0" as &const byte);
+    if mel_frame_major == null || conv1_states == null || states == null || normed == null || q_values == null || k_values == null || v_values == null || attn_ctx == null || tmp_out == null || ffn_hidden == null || projector_1 == null || projector_2 == null || scores == null || probs == null {
+        if mel_frame_major != null { free(mel_frame_major as &void); }
+        if conv1_states != null { free(conv1_states as &void); }
+        if states != null { free(states as &void); }
+        if normed != null { free(normed as &void); }
+        if q_values != null { free(q_values as &void); }
+        if k_values != null { free(k_values as &void); }
+        if v_values != null { free(v_values as &void); }
+        if attn_ctx != null { free(attn_ctx as &void); }
+        if tmp_out != null { free(tmp_out as &void); }
+        if ffn_hidden != null { free(ffn_hidden as &void); }
+        if projector_1 != null { free(projector_1 as &void); }
+        if projector_2 != null { free(projector_2 as &void); }
+        if scores != null { free(scores as &void); }
+        if probs != null { free(probs as &void); }
+        return false;
+    }
+
+    audio_real_mel_to_frame_major(mel_values, mel_frames, config.mel_bin_count as usize, mel_frame_major);
+
+    const conv1_w: &TensorView = audio_require_tensor(table, "encoder.conv1.weight\0" as &const byte, "conv1 weight\0" as &const byte);
+    const conv1_b: &TensorView = audio_require_tensor(table, "encoder.conv1.bias\0" as &const byte, "conv1 bias\0" as &const byte);
+    const conv2_w: &TensorView = audio_require_tensor(table, "encoder.conv2.weight\0" as &const byte, "conv2 weight\0" as &const byte);
+    const conv2_b: &TensorView = audio_require_tensor(table, "encoder.conv2.bias\0" as &const byte, "conv2 bias\0" as &const byte);
+    const pos_view: &TensorView = audio_require_tensor(table, "encoder.positional_embedding\0" as &const byte, "position embedding\0" as &const byte);
+    const ln_post_w: &TensorView = audio_require_tensor(table, "encoder.ln_post.weight\0" as &const byte, "ln post weight\0" as &const byte);
+    const ln_post_b: &TensorView = audio_require_tensor(table, "encoder.ln_post.bias\0" as &const byte, "ln post bias\0" as &const byte);
+    const proj1_w: &TensorView = audio_require_tensor(table, "audio_projector.linear1.weight\0" as &const byte, "projector 1 weight\0" as &const byte);
+    const proj1_b: &TensorView = audio_require_tensor(table, "audio_projector.linear1.bias\0" as &const byte, "projector 1 bias\0" as &const byte);
+    const proj2_w: &TensorView = audio_require_tensor(table, "audio_projector.linear2.weight\0" as &const byte, "projector 2 weight\0" as &const byte);
+    const proj2_b: &TensorView = audio_require_tensor(table, "audio_projector.linear2.bias\0" as &const byte, "projector 2 bias\0" as &const byte);
+    if conv1_w == null || conv1_b == null || conv2_w == null || conv2_b == null || pos_view == null || ln_post_w == null || ln_post_b == null || proj1_w == null || proj1_b == null || proj2_w == null || proj2_b == null {
+        free(mel_frame_major as &void); free(conv1_states as &void); free(states as &void); free(normed as &void); free(q_values as &void); free(k_values as &void); free(v_values as &void); free(attn_ctx as &void); free(tmp_out as &void); free(ffn_hidden as &void); free(projector_1 as &void); free(projector_2 as &void); free(scores as &void); free(probs as &void);
+        return false;
+    }
+
+    var conv1_tokens: usize = 0;
+    var conv2_tokens: usize = 0;
+    if !audio_real_conv1d_same_from_mel(conv1_states, mel_frames, config.mel_bin_count as usize, mel_frame_major as &const f32, conv1_w, conv1_b, 1, hidden, &conv1_tokens) {
+        free(mel_frame_major as &void); free(conv1_states as &void); free(states as &void); free(normed as &void); free(q_values as &void); free(k_values as &void); free(v_values as &void); free(attn_ctx as &void); free(tmp_out as &void); free(ffn_hidden as &void); free(projector_1 as &void); free(projector_2 as &void); free(scores as &void); free(probs as &void);
+        _ = printf("error: audio-real-encode conv1 forward failed\n");
+        return false;
+    }
+    if !audio_real_conv1d_same_hidden(states, conv1_tokens, conv1_states as &const f32, conv2_w, conv2_b, 2, hidden, &conv2_tokens) {
+        free(mel_frame_major as &void); free(conv1_states as &void); free(states as &void); free(normed as &void); free(q_values as &void); free(k_values as &void); free(v_values as &void); free(attn_ctx as &void); free(tmp_out as &void); free(ffn_hidden as &void); free(projector_1 as &void); free(projector_2 as &void); free(scores as &void); free(probs as &void);
+        _ = printf("error: audio-real-encode conv2 forward failed\n");
+        return false;
+    }
+    if conv2_tokens != conv_tokens {
+        free(mel_frame_major as &void); free(conv1_states as &void); free(states as &void); free(normed as &void); free(q_values as &void); free(k_values as &void); free(v_values as &void); free(attn_ctx as &void); free(tmp_out as &void); free(ffn_hidden as &void); free(projector_1 as &void); free(projector_2 as &void); free(scores as &void); free(probs as &void);
+        _ = printf("error: audio-real-encode conv token mismatch expected=%zu got=%zu\n", conv_tokens, conv2_tokens);
+        return false;
+    }
+
+    var token_index: usize = 0;
+    while token_index < conv_tokens {
+        var hidden_index: usize = 0;
+        while hidden_index < hidden {
+            states[token_index * hidden + hidden_index] = states[token_index * hidden + hidden_index] + audio_real_position_value(pos_view, hidden, token_index, hidden_index);
+            hidden_index = hidden_index + 1;
+        }
+        token_index = token_index + 1;
+    }
+
+    var layer_index: u32 = 0;
+    while layer_index < config.layer_count {
+        const attn_ln_w: &TensorView = audio_require_real_layer(table, layer_index, "attn_ln.weight\0" as &const byte, "attn ln weight\0" as &const byte);
+        const attn_ln_b: &TensorView = audio_require_real_layer(table, layer_index, "attn_ln.bias\0" as &const byte, "attn ln bias\0" as &const byte);
+        const q_w: &TensorView = audio_require_real_layer(table, layer_index, "attn.query.weight\0" as &const byte, "attn query weight\0" as &const byte);
+        const q_b: &TensorView = audio_require_real_layer(table, layer_index, "attn.query.bias\0" as &const byte, "attn query bias\0" as &const byte);
+        const k_w: &TensorView = audio_require_real_layer(table, layer_index, "attn.key.weight\0" as &const byte, "attn key weight\0" as &const byte);
+        const v_w: &TensorView = audio_require_real_layer(table, layer_index, "attn.value.weight\0" as &const byte, "attn value weight\0" as &const byte);
+        const v_b: &TensorView = audio_require_real_layer(table, layer_index, "attn.value.bias\0" as &const byte, "attn value bias\0" as &const byte);
+        const out_w: &TensorView = audio_require_real_layer(table, layer_index, "attn.out.weight\0" as &const byte, "attn out weight\0" as &const byte);
+        const out_b: &TensorView = audio_require_real_layer(table, layer_index, "attn.out.bias\0" as &const byte, "attn out bias\0" as &const byte);
+        const mlp_ln_w: &TensorView = audio_require_real_layer(table, layer_index, "mlp_ln.weight\0" as &const byte, "mlp ln weight\0" as &const byte);
+        const mlp_ln_b: &TensorView = audio_require_real_layer(table, layer_index, "mlp_ln.bias\0" as &const byte, "mlp ln bias\0" as &const byte);
+        const mlp0_w: &TensorView = audio_require_real_layer(table, layer_index, "mlp.0.weight\0" as &const byte, "mlp 0 weight\0" as &const byte);
+        const mlp0_b: &TensorView = audio_require_real_layer(table, layer_index, "mlp.0.bias\0" as &const byte, "mlp 0 bias\0" as &const byte);
+        const mlp2_w: &TensorView = audio_require_real_layer(table, layer_index, "mlp.2.weight\0" as &const byte, "mlp 2 weight\0" as &const byte);
+        const mlp2_b: &TensorView = audio_require_real_layer(table, layer_index, "mlp.2.bias\0" as &const byte, "mlp 2 bias\0" as &const byte);
+        if attn_ln_w == null || attn_ln_b == null || q_w == null || q_b == null || k_w == null || v_w == null || v_b == null || out_w == null || out_b == null || mlp_ln_w == null || mlp_ln_b == null || mlp0_w == null || mlp0_b == null || mlp2_w == null || mlp2_b == null {
+            free(mel_frame_major as &void); free(conv1_states as &void); free(states as &void); free(normed as &void); free(q_values as &void); free(k_values as &void); free(v_values as &void); free(attn_ctx as &void); free(tmp_out as &void); free(ffn_hidden as &void); free(projector_1 as &void); free(projector_2 as &void); free(scores as &void); free(probs as &void);
+            return false;
+        }
+
+        token_index = 0;
+        while token_index < conv_tokens {
+            audio_real_layer_norm_tensor(&normed[token_index * hidden], &states[token_index * hidden] as &const f32, attn_ln_w, attn_ln_b, hidden);
+            audio_real_matvec_bias(&q_values[token_index * hidden], q_w, q_b, &normed[token_index * hidden] as &const f32, hidden, hidden, false, false);
+            audio_real_matvec_bias(&k_values[token_index * hidden], k_w, null, &normed[token_index * hidden] as &const f32, hidden, hidden, false, false);
+            audio_real_matvec_bias(&v_values[token_index * hidden], v_w, v_b, &normed[token_index * hidden] as &const f32, hidden, hidden, false, false);
+            token_index = token_index + 1;
+        }
+
+        token_index = 0;
+        while token_index < conv_tokens {
+            audio_real_attention_token(&attn_ctx[token_index * hidden], q_values as &const f32, k_values as &const f32, v_values as &const f32, conv_tokens, head_count, head_dim, token_index, scores, probs);
+            audio_real_matvec_bias(&tmp_out[token_index * hidden], out_w, out_b, &attn_ctx[token_index * hidden] as &const f32, hidden, hidden, false, false);
+            var hidden_index2: usize = 0;
+            while hidden_index2 < hidden {
+                states[token_index * hidden + hidden_index2] = states[token_index * hidden + hidden_index2] + tmp_out[token_index * hidden + hidden_index2];
+                hidden_index2 = hidden_index2 + 1;
+            }
+            token_index = token_index + 1;
+        }
+
+        token_index = 0;
+        while token_index < conv_tokens {
+            audio_real_layer_norm_tensor(&normed[token_index * hidden], &states[token_index * hidden] as &const f32, mlp_ln_w, mlp_ln_b, hidden);
+            audio_real_matvec_bias(&ffn_hidden[token_index * ffn], mlp0_w, mlp0_b, &normed[token_index * hidden] as &const f32, hidden, ffn, true, false);
+            audio_real_matvec_bias(&tmp_out[token_index * hidden], mlp2_w, mlp2_b, &ffn_hidden[token_index * ffn] as &const f32, ffn, hidden, false, false);
+            var hidden_index3: usize = 0;
+            while hidden_index3 < hidden {
+                states[token_index * hidden + hidden_index3] = states[token_index * hidden + hidden_index3] + tmp_out[token_index * hidden + hidden_index3];
+                hidden_index3 = hidden_index3 + 1;
+            }
+            token_index = token_index + 1;
+        }
+        layer_index = layer_index + 1;
+    }
+
+    token_index = 0;
+    while token_index < conv_tokens {
+        audio_real_layer_norm_tensor(&normed[token_index * hidden], &states[token_index * hidden] as &const f32, ln_post_w, ln_post_b, hidden);
+        audio_real_matvec_bias(&projector_1[token_index * llm_hidden], proj1_w, proj1_b, &normed[token_index * hidden] as &const f32, hidden, llm_hidden, false, true);
+        audio_real_matvec_bias(&projector_2[token_index * llm_hidden], proj2_w, proj2_b, &projector_1[token_index * llm_hidden] as &const f32, llm_hidden, llm_hidden, false, false);
+        token_index = token_index + 1;
+    }
+
+    var pooled_index: usize = 0;
+    while pooled_index < pooled_tokens {
+        var out_hidden_index: usize = 0;
+        while out_hidden_index < llm_hidden {
+            var sum: f32 = 0.0;
+            var pool_index: usize = 0;
+            while pool_index < AUDIO_REAL_POOL_KERNEL as usize {
+                const src_token: usize = pooled_index * (AUDIO_REAL_POOL_STRIDE as usize) + pool_index;
+                sum = sum + projector_2[src_token * llm_hidden + out_hidden_index];
+                pool_index = pool_index + 1;
+            }
+            embeddings[pooled_index * llm_hidden + out_hidden_index] = sum / (AUDIO_REAL_POOL_KERNEL as f32);
+            out_hidden_index = out_hidden_index + 1;
+        }
+        pooled_index = pooled_index + 1;
+    }
+
+    span_count[0] = pooled_tokens;
+    free(mel_frame_major as &void);
+    free(conv1_states as &void);
+    free(states as &void);
+    free(normed as &void);
+    free(q_values as &void);
+    free(k_values as &void);
+    free(v_values as &void);
+    free(attn_ctx as &void);
+    free(tmp_out as &void);
+    free(ffn_hidden as &void);
+    free(projector_1 as &void);
+    free(projector_2 as &void);
+    free(scores as &void);
+    free(probs as &void);
+    return true;
+}
+
+export fn audio_real_encode_probe_file(audio_model_path: &const byte, audio_path: &const byte, role: &const byte) bool {
+    var config: AudioConfig = audio_config_init();
+    if !audio_config_load_metadata(audio_model_path, &config) { return false; }
+    var table: TensorWeightTable = tensor_table_init();
+    if !tensor_weight_table_load(audio_model_path, &table) { return false; }
+    if !audio_real_complete_config(&config, &table) { return false; }
+    var checked: u32 = 0;
+    if !audio_real_bind_check(&table, &config, &checked) { return false; }
+    if !tensor_weight_table_attach_mmap(audio_model_path, &table) { return false; }
+
+    var filters: AudioRealFilterBank = audio_real_filter_bank_init();
+    if !audio_real_filterbank_load(audio_model_path, &filters) { tensor_weight_table_detach_mmap(&table); return false; }
+    var pcm: AudioRealPcmHeap = audio_real_pcm_heap_init();
+    if !audio_real_load_samples_file(audio_path, role, &pcm) { audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
+    const aligned_samples: u64 = audio_real_aligned_sample_count(pcm.sample_count);
+    const padded_samples: u64 = aligned_samples + (AUDIO_REAL_CENTER_PAD as u64) * (2 as u64);
+    const mel_frames_u64: u64 = (padded_samples - (AUDIO_REAL_FRAME_SIZE as u64)) / (AUDIO_REAL_HOP_LENGTH as u64);
+    const mel_count: u64 = mel_frames_u64 * (AUDIO_REAL_MEL_BINS as u64);
+    if mel_frames_u64 == 0 || mel_count == 0 { _ = printf("error: audio-real-encode[%s] empty mel frames\n", role); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
+    var mel_values: &f32 = audio_real_alloc_f32(mel_count as usize, "mel-values\0" as &const byte);
+    if mel_values == null { audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
+    if !audio_real_mel_compute(&pcm, &filters, mel_values, mel_frames_u64, aligned_samples) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
+
+    const conv_tokens: usize = audio_real_conv_output_tokens(mel_frames_u64 as usize, 3, 2);
+    const pooled_tokens: usize = audio_real_pool_output_tokens(conv_tokens);
+    if pooled_tokens == 0 { _ = printf("error: audio-real-encode[%s] pooled_tokens=0 conv_tokens=%zu\n", role, conv_tokens); free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
+    var embeddings: &f32 = audio_real_alloc_f32(pooled_tokens * (config.llm_hidden_size as usize), "embeddings\0" as &const byte);
+    if embeddings == null { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
+    const encode_start_us: u64 = audio_real_clock_us();
+    var span_count: usize = 0;
+    if !audio_real_forward(&table, &config, mel_values as &const f32, mel_frames_u64 as usize, embeddings, &span_count) {
+        free(embeddings as &void); free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false;
+    }
+    const encode_elapsed_us: u64 = audio_real_clock_us() - encode_start_us;
+    const checksum: u32 = audio_checksum(embeddings as &const f32, span_count * (config.llm_hidden_size as usize));
+    _ = printf("audio-real-encode[%s]: audio=%s samples=%llu mel_frames=%llu conv_tokens=%zu pooled_tokens=%zu n_pos=%zu n_embd=%u checksum=0x%x encode_ms=%.3f\n", role, audio_path, pcm.sample_count, mel_frames_u64, conv_tokens, pooled_tokens, span_count, config.llm_hidden_size, checksum, (encode_elapsed_us as f64) / 1000.0);
+    _ = printf("audio-real-encode[%s] values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", role, embeddings[0] as f64, embeddings[1] as f64, embeddings[2] as f64, embeddings[3] as f64, embeddings[4] as f64, embeddings[5] as f64);
+    free(embeddings as &void);
+    free(mel_values as &void);
+    audio_real_pcm_heap_free(&pcm);
+    audio_real_filter_bank_free(&filters);
+    tensor_weight_table_detach_mmap(&table);
+    return true;
+}
+
+export fn audio_real_encode_probe_cli(audio_model_path: &const byte, audio_path: &const byte) i32 {
+    if !audio_real_encode_probe_file(audio_model_path, audio_path, "probe\0" as &const byte) { return 1; }
+    _ = printf("audio-real-encode-probe: PASS\n");
     return 0;
 }
 

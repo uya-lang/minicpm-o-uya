@@ -470,15 +470,15 @@
   - [x] `audio-real-mel-probe --dump-f32` 与 `tests/compare_audio_mel_alignment.py`/`make audio-real-mel-align` 已接好，可对比 `llama.cpp-omni` 的 `log_mel_spectrogram.json` dump。
   - [x] 已与本地 `llama.cpp-omni` `log_mel_spectrogram` dump 做数值误差对齐：`outputs/complex_case2/complex2_0000.wav` 为 `mean_abs=1.2707e-5`、`max_abs=1.4266e-3`，`complex2_0001.wav` 为 `mean_abs=1.2695e-5`、`max_abs=1.4004e-3`；当前默认阈值取 `mean_abs <= 2e-5`、`max_abs <= 2e-3`。
 - [ ] 移除 tiny audio cap，支持真实用户语音长度和多 chunk 输入。
-  - [x] 输入 probe 流式扫描真实 WAV/UYAP，不受 tiny mel cap 限制；真实 mel/audio encoder forward 仍待接入。
+  - [x] 输入 probe 流式扫描真实 WAV/UYAP，不受 tiny mel cap 限制；`audio-real-encode-probe` 现已可跑真实 audio encoder forward，但当前仍保留 `480000 samples` 上限且没有多 chunk 调度。
 - [ ] 绑定官方 audio encoder tensors，并实现对应 conv/transformer/projector forward。
   - [x] `audio-bind`/`audio2audio-real --audit-only` 已绑定官方 `encoder.conv*`、24 层 `encoder.blocks.*`、`encoder.ln_post.*`、`audio_projector.linear{1,2}.*`，共 371 个 tensor。
-  - [ ] 实现官方 conv + transformer + projector forward，并输出 embedding shape/n_pos/checksum。
+  - [x] `audio-real-encode-probe` 已实现官方 `conv + transformer + projector + pool(5,5)` forward，并输出 `mel_frames/conv_tokens/n_pos/n_embd/checksum/encode_ms`。
 - [ ] 实现正确 prompt 协议：reference audio 进入 system prompt，user audio 进入 `<|im_start|>user` turn。
   - [x] `audio2audio-real --audit-only` 已区分 `ref_audio` 和 `user_audio`，并在协议日志中输出两者路径。
 - [x] 支持 `prefix_0000.wav`/`prefix_0001.wav` 测试格式，也支持显式 `--ref-audio`/`--user-audio` 参数。
 - [ ] 保存 audio embedding checksum、span count、n_pos、prefill timing 便于与 llama.cpp-omni 对照。
-  - [x] 输入阶段已保存 sample checksum、duration、peak、rms；embedding checksum 待 audio encoder forward 后输出。
+  - [x] 输入阶段已保存 sample checksum、duration、peak、rms；`audio-real-encode-probe` 与 `audio2audio-real --audit-only --encode-probe` 已可输出 embedding checksum、`n_pos`、`n_embd` 和 encode wall time。
 
 验收标准：
 

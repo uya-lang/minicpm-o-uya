@@ -2,6 +2,7 @@ use libc.printf;
 use libc.strcmp;
 use libc.snprintf;
 use minicpmo.audio.audio_input_probe_file;
+use minicpmo.audio.audio_real_encode_probe_file;
 use minicpmo.audio.audio_real_preprocess_probe_file;
 use minicpmo.audio.audio_real_bind_file;
 use minicpmo.speech.speech_tts_bind_file;
@@ -1401,7 +1402,7 @@ fn audit_parse_u32_value(text: &const byte, out: &u32) bool {
 }
 
 fn audit_bundle_usage() void {
-    _ = printf("usage: minicpm-o-uya audio2audio-real [--audit-only] --llm <llm.gguf> --audio <audio.gguf> --tts <tts.gguf> --projector <projector.gguf> --token2wav-dir <dir>\n");
+    _ = printf("usage: minicpm-o-uya audio2audio-real [--audit-only] [--encode-probe] --llm <llm.gguf> --audio <audio.gguf> --tts <tts.gguf> --projector <projector.gguf> --token2wav-dir <dir>\n");
     _ = printf("       [--ref-audio ref.wav] [--user-audio user.wav|--input-audio user.wav] [--input-prefix prefix] [--test-prefix prefix --count N] [--out out.wav]\n");
 }
 
@@ -1421,10 +1422,16 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
     var prefix_ref_path: [byte: 512] = [];
     var prefix_user_path: [byte: 512] = [];
     var audit_only: bool = false;
+    var encode_probe: bool = false;
     var i: i32 = 2;
     while i < argc {
         if strcmp(argv[i] as *const byte, "--audit-only\0" as *const byte) == 0 {
             audit_only = true;
+            i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--encode-probe\0" as *const byte) == 0 {
+            encode_probe = true;
             i = i + 1;
             continue;
         }
@@ -1563,6 +1570,7 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
         if out_path != null { _ = printf("audio2audio-real output target: %s\n", out_path); }
         if !audio_input_probe_file(ref_audio_path, "ref\0" as &const byte) { return 1; }
         if !audio_real_preprocess_probe_file(ref_audio_path, "ref\0" as &const byte) { return 1; }
+        if encode_probe { if !audio_real_encode_probe_file(audio_path, ref_audio_path, "ref\0" as &const byte) { return 1; } }
         var turn: u32 = 1;
         while turn < test_count {
             const written_turn: i32 = snprintf(&prefix_user_path[0] as *byte, @len(prefix_user_path), "%s_%04u.wav\0" as *const byte, test_prefix, turn);
@@ -1570,6 +1578,7 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
             _ = printf("audio2audio-real test turn: user_index=%u user_audio=%s\n", turn, &prefix_user_path[0]);
             if !audio_input_probe_file(&prefix_user_path[0] as &const byte, "user\0" as &const byte) { return 1; }
             if !audio_real_preprocess_probe_file(&prefix_user_path[0] as &const byte, "user\0" as &const byte) { return 1; }
+            if encode_probe { if !audio_real_encode_probe_file(audio_path, &prefix_user_path[0] as &const byte, "user\0" as &const byte) { return 1; } }
             turn = turn + 1;
         }
         _ = printf("audio2audio-real input-audit PASS ref_user=%u\n", test_count);
@@ -1578,8 +1587,10 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
         if out_path != null { _ = printf("audio2audio-real output target: %s\n", out_path); }
         if !audio_input_probe_file(ref_audio_path, "ref\0" as &const byte) { return 1; }
         if !audio_real_preprocess_probe_file(ref_audio_path, "ref\0" as &const byte) { return 1; }
+        if encode_probe { if !audio_real_encode_probe_file(audio_path, ref_audio_path, "ref\0" as &const byte) { return 1; } }
         if !audio_input_probe_file(user_audio_path, "user\0" as &const byte) { return 1; }
         if !audio_real_preprocess_probe_file(user_audio_path, "user\0" as &const byte) { return 1; }
+        if encode_probe { if !audio_real_encode_probe_file(audio_path, user_audio_path, "user\0" as &const byte) { return 1; } }
         _ = printf("audio2audio-real input-audit PASS ref_user=2\n");
     } }
     if audit_only {

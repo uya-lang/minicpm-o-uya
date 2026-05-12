@@ -75,6 +75,8 @@ MINICPM_O_REAL_USER_AUDIO=outputs/complex_case2/complex2_0001.wav \
 make audio2audio-real-input-audit
 ```
 
+If you also want correctness-first audio encoder embeddings during the same input audit, add `MINICPM_O_REAL_ENCODE_PROBE=1` to the make command, or pass `--encode-probe` directly to `audio2audio-real --audit-only`.
+
 Each file audit also prints a compact inventory with tensor count, dtype distribution, name-prefix counts, and first tensor shape samples. The audio file is additionally checked with `audio-bind`, which binds the official `encoder.conv*`, 24 `encoder.blocks.*` transformer layers, `encoder.ln_post.*`, and `audio_projector.linear{1,2}.*` tensors. The current official audio bind checks 371 tensors and validates the mel filter metadata (`n_mel=80`, `n_fft/filter_bins=201`, `filters=16080`). The TTS file is additionally checked with `tts-bind`, which binds `emb_code.*`, `emb_text.*`, the 20-layer decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, `head_code.*`, and checks 193 tensors. The remaining binding groups are token2wav families such as `estimator.*`, `conv_post.*`, and `prompt_cache.*`.
 
 Audit diagnostics include candidate next actions for unknown dtype, unclassified tensor prefixes, and key alias shape mismatches. The current shape sanity checks cover representative official MiniCPM-o 4.5 audio, TTS, projector, token2wav, HiFiGAN2, and prompt-cache tensors. A shape mismatch is treated as unsupported until the alias table or expected shape is updated.
@@ -84,6 +86,8 @@ Runtime text generation has real GGML-layout fused matvec support for Q4_K, Q5_K
 A manual text alignment target is available for the same text GGUF: `MINICPM_O_TEXT_GGUF=/path/to/MiniCPM-o-4_5-Q4_K_M.gguf LLAMA_COMPLETION_BIN=/path/to/llama-completion make text-real-align`. It compares Uya and llama.cpp greedy one-token text output for the same prompt before moving deeper into audio/TTS alignment.
 
 A manual audio preprocessing probe is available as `build/minicpm-o-uya audio-real-preprocess-probe <audio.wav|audio.uyap.pcm>`, and a numeric mel probe is available as `MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-mel-probe`. It validates 16 kHz mono PCM16/F32 WAV or UYAP input and prints the llama.cpp-omni MiniCPM-o preprocessing plan: `frame_size=400`, `filter_bins=201`, `hop_length=160`, `mel_bins=80`, 100ms sample alignment, 200-sample center padding on each side, conv2 downsampling, and pool(5,5) `encoder_positions`. The `audio2audio-real --audit-only` input path now prints this plan for both ref and user audio. The numeric mel probe runs periodic Hann, DFT/STFT power, the GGUF `filters` mel filterbank, and llama.cpp-omni style log10 clamp/normalization, then prints frames/elements/checksum/sample values.
+
+A correctness-first encoder forward probe is now available as `MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-encode-probe`. It runs the official `encoder.conv1/2`, 24-layer transformer, `encoder.ln_post`, `audio_projector.linear1/2`, and final pool(5,5), then prints `mel_frames`, `conv_tokens`, `pooled_tokens`, `n_pos`, `n_embd`, embedding checksum, and encode wall time. On the local 1-second sample `/tmp/minicpm-o-uya-real-probe.wav`, the current reference implementation reports `n_pos=10`, `n_embd=4096`, checksum `0xb95329ca`, and `encode_ms≈96870.831`, so this path is still intended for correctness/alignment work rather than speed.
 
 `audio-real-mel-probe` also accepts `--dump-f32 out.uyml`, which writes a compact binary dump for full-array comparison:
 
@@ -106,7 +110,7 @@ Current manual alignment thresholds default to `max_abs <= 2e-3` and `mean_abs <
 - `complex2_0000.wav` vs `log_mel_spectrogram_0000.json`: `mean_abs=0.000012707`, `max_abs=0.001426596`
 - `complex2_0001.wav` vs `log_mel_spectrogram_0001.json`: `mean_abs=0.000012695`, `max_abs=0.001400372`
 
-Current upstream `llama.cpp-omni/tools/omni/audition.cpp` writes `log_mel_spectrogram.json` only when the local `debug` argument passed into `log_mel_spectrogram(...)` is switched from `false` to `true`; there is not yet a CLI flag for this. Audio encoder forward remains the next major implementation layer after numeric mel alignment.
+Current upstream `llama.cpp-omni/tools/omni/audition.cpp` writes `log_mel_spectrogram.json` only when the local `debug` argument passed into `log_mel_spectrogram(...)` is switched from `false` to `true`; there is not yet a CLI flag for this. For Uya, `audio2audio-real --audit-only` also accepts an optional `--encode-probe` flag, which runs the same correctness-first encoder probe on the validated ref/user audio inputs and prints the resulting embedding diagnostics.
 
 ## Required GGUF Files
 
@@ -169,7 +173,7 @@ After alias classification, these token2wav files should have zero unknown tenso
 
 `audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, or `--test-prefix prefix --count N` for the llama.cpp-omni convention where `0000` is reference voice and `0001..` are user turns. The next implementation layer is to run the official audio encoder forward and bind the remaining TTS/token2wav tensor families discovered by audit:
 
-- Audio encoder: bind-only complete for `encoder.*` and `audio_projector.*`; forward kernels still pending.
+- Audio encoder: bind complete, and `audio-real-encode-probe` now runs correctness-first `conv + transformer + projector + pool` forward for short real clips; it is still too slow for practical long-turn inference.
 - TTS model: bind-only complete for `emb_code.*`, `emb_text.*`, decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, and `head_code.*`; decode/cache forward still pending.
 - Projector: `linear1.*`, `linear2.*`
 - Token2wav encoder: `after_norm.*` and encoder blocks

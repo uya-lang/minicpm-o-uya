@@ -55,6 +55,7 @@ Generated files:
 - `vision-fixture` for raw image tensor smoke, RGB preprocessing, image/video manifest handling, tile counts, and checksum stability.
 - `audio-real-preprocess-probe` is manual and checks real WAV/UYAP input shape, 100ms alignment, center padding, and encoder-position planning.
 - `audio-real-mel-probe` is manual and computes numeric MiniCPM-o mel features from a real audio GGUF plus WAV/UYAP input; it also supports `--dump-f32 out.uyml` for full-array comparison and is not part of default CI because it needs the external official bundle.
+- `audio-real-encode-probe` is manual and runs the official audio encoder `conv + transformer + projector + pool` path for a real audio GGUF plus WAV/UYAP input. It is correctness-first and currently much slower than llama.cpp-omni.
 - `audio-real-mel-align` is manual and compares a Uya `--dump-f32` mel dump against a `llama.cpp-omni` `log_mel_spectrogram.json` dump from the same audio input. The current default acceptance bound is `max_abs <= 2e-3` and `mean_abs <= 2e-5`.
 - `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
 - `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.
@@ -131,6 +132,9 @@ build/minicpm-o-uya tensors "$MINICPM_O_GGUF" --mmap
 build/minicpm-o-uya qwen3-bind "$MINICPM_O_TEXT_GGUF"
 build/minicpm-o-uya vision-smoke "$MINICPM_O_GGUF" "$MINICPM_O_IMAGE_RAW"
 build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
+build/minicpm-o-uya audio-real-preprocess-probe /path/to/user.wav
+build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
+build/minicpm-o-uya audio-real-encode-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_TEXT_GGUF" --audio-model "$MINICPM_O_AUDIO_GGUF" --speech-model "$MINICPM_O_SPEECH_GGUF" --vocoder-model "$MINICPM_O_VOCODER_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
