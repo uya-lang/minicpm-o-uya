@@ -194,6 +194,23 @@ This is the first real Uya implementation of:
 
 Current limitation: the local saved `llama.cpp-omni` `audio_tokens_chunk_*.txt` files were generated from an unpinned sampler seed, so exact token-by-token replay is not yet expected to match. The Uya probe already supports `--compare-dir` for future seeded baselines, but today's `round_000/tts_wav` artifacts should be treated as a structural/debug reference rather than a strict deterministic oracle.
 
+Even without a pinned baseline seed, the probe is now observability-friendly:
+
+- `tts-simplex prompt: ... prefill_ms=...`
+- `tts-simplex timing: chunk=N merge_ms=... decode_ms=... cache_tokens=... generated=...`
+- `tts-simplex compare-summary: chunk=N ref=... uya=... prefix_match=... exact=...`
+
+For repeated manual comparison runs, use:
+
+```sh
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf \
+MINICPM_O_TTS_LLM_DEBUG_DIR=/path/to/llm_debug \
+MINICPM_O_TTS_COMPARE_DIR=/path/to/tts_wav \
+make tts-token-align
+```
+
+If you have a future seeded baseline and want strict pass/fail, add `MINICPM_O_TTS_REQUIRE_EXACT=1`.
+
 ## Required GGUF Files
 
 The official bundle must include:

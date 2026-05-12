@@ -502,6 +502,7 @@
   - [x] `tts-simplex-probe --out-dir DIR` 已输出相同命名的 `audio_tokens_chunk_*.txt/bin`，内容为 relative audio token ids。
 - [ ] 增加 TTS token 级对照：相同 hidden/text chunk 下，audio token 前 N 个与 baseline 对比。
   - [x] `tts-simplex-probe --compare-dir DIR` 已支持逐 chunk exact compare。
+  - [x] `make tts-token-align` / `tests/compare_tts_token_alignment.py` 已支持逐 chunk `count/prefix_match/exact` 汇总。
   - [ ] 当前本地 `round_000/tts_wav` baseline 未固定 sampler seed，暂不作为严格 deterministic token oracle。
 
 验收标准：
@@ -509,6 +510,7 @@
 - Uya 能从 LLM 回答文本/hidden states 生成非空 audio token 序列。
 - audio token 分片数量、EOS 行为、首 token/audio_bos 行为与 llama.cpp-omni 可对照。
 - TTS 阶段输出耗时、token count、cache length 可观测。
+  - [x] `tts-simplex-probe` 已输出 prompt prefill、per-chunk merge/decode 毫秒、`cache_tokens`、`generated`。
 
 ### 21.6 Token2Wav/HiFiGAN 真实声码器
 

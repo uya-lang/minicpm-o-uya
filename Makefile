@@ -5,7 +5,7 @@ RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 AUDIO2AUDIO_REAL_ENCODE_PROBE_FLAG := $(if $(MINICPM_O_REAL_ENCODE_PROBE),--encode-probe,)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind tts-condition-probe tts-simplex-probe tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit clean FORCE
 
 build: build-release
 
@@ -270,6 +270,23 @@ tts-simplex-probe: build
 		$$( [ -n "$${MINICPM_O_TTS_MAX_AUDIO_TOKENS:-}" ] && printf '%s' "--max-audio-tokens $${MINICPM_O_TTS_MAX_AUDIO_TOKENS}" ) \
 		$$( [ -n "$${MINICPM_O_TTS_SEED:-}" ] && printf '%s' "--seed $${MINICPM_O_TTS_SEED}" ) \
 		$$( [ -n "$${MINICPM_O_TTS_GREEDY:-}" ] && printf '%s' "--greedy" )
+
+tts-token-align: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_TTS_LLM_DEBUG_DIR)" ] || [ -z "$(MINICPM_O_TTS_COMPARE_DIR)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_TTS_LLM_DEBUG_DIR=/path/to/llm_debug MINICPM_O_TTS_COMPARE_DIR=/path/to/tts_wav [MINICPM_O_TTS_CHUNK_COUNT=1] [MINICPM_O_TTS_MAX_AUDIO_TOKENS=500] [MINICPM_O_TTS_SEED=1] [MINICPM_O_TTS_GREEDY=1] [MINICPM_O_TTS_REQUIRE_EXACT=1] make tts-token-align"; \
+		exit 2; \
+	fi
+	python3 tests/compare_tts_token_alignment.py \
+		--uya "$(OUT)" \
+		--tts-model "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf" \
+		--projector-model "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-projector-F16.gguf" \
+		--llm-debug-dir "$(MINICPM_O_TTS_LLM_DEBUG_DIR)" \
+		--ref-dir "$(MINICPM_O_TTS_COMPARE_DIR)" \
+		--count "$${MINICPM_O_TTS_CHUNK_COUNT:-1}" \
+		--max-audio-tokens "$${MINICPM_O_TTS_MAX_AUDIO_TOKENS:-500}" \
+		--seed "$${MINICPM_O_TTS_SEED:-1}" \
+		$$( [ -n "$${MINICPM_O_TTS_GREEDY:-}" ] && printf '%s' "--greedy" ) \
+		$$( [ -n "$${MINICPM_O_TTS_REQUIRE_EXACT:-}" ] && printf '%s' "--require-exact" )
 
 audio-real-mel-probe: build
 	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_REAL_USER_AUDIO)" ]; then \

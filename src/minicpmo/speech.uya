@@ -1,5 +1,7 @@
 use libc.FILE;
 use libc.calloc;
+use libc.clock;
+use libc.CLOCKS_PER_SEC;
 use libc.cosf;
 use libc.fclose;
 use libc.fopen;
@@ -185,6 +187,13 @@ struct TtsSimplexConfig {
     greedy: bool,
 }
 
+struct TtsTokenCompareResult {
+    ref_count: usize,
+    prefix_match: usize,
+    first_mismatch_index: usize,
+    exact: bool,
+}
+
 export fn speech_config_init() SpeechConfig {
     return SpeechConfig{ hidden_size: 0, codec_vocab_size: 0, acoustic_vocab_size: 0, token_count: 4, schema_kind: [] };
 }
@@ -278,6 +287,10 @@ fn tts_decoder_runtime_init() TtsDecoderRuntime {
 
 fn tts_simplex_config_init() TtsSimplexConfig {
     return TtsSimplexConfig{ max_audio_tokens: TTS_SIMPLEX_DEFAULT_MAX_AUDIO_TOKENS, seed: TTS_SIMPLEX_DEFAULT_SEED, greedy: false };
+}
+
+fn tts_token_compare_result_init() TtsTokenCompareResult {
+    return TtsTokenCompareResult{ ref_count: 0, prefix_match: 0, first_mismatch_index: 0, exact: false };
 }
 
 fn speech_copy_cstr(dest: &byte, cap: usize, src: &const byte) void {
@@ -933,6 +946,15 @@ fn speech_dump_token_ids_text(path: &const byte, token_ids: &const u32, token_co
         return false;
     }
     return fclose(file) == 0;
+}
+
+fn speech_clock_micros() u64 {
+    return (clock() as u64) * (1000000 as u64) / (CLOCKS_PER_SEC as u64);
+}
+
+fn speech_elapsed_micros(start: u64, end: u64) u64 {
+    if end < start { return 0; }
+    return end - start;
 }
 
 fn tts_condition_probe_usage() void {
@@ -1847,29 +1869,38 @@ fn tts_simplex_generate_chunk(config: &TtsDecoderConfig, weights: &TtsDecoderWei
     return out_count[0] > 0;
 }
 
-fn tts_simplex_compare_chunk(reference_path: &const byte, tokens: &const u32, token_count: usize) bool {
+fn tts_simplex_compare_chunk(reference_path: &const byte, tokens: &const u32, token_count: usize, result: &TtsTokenCompareResult) bool {
+    result[0] = tts_token_compare_result_init();
     var ref_tokens: [u32: 8192] = [];
     var ref_count: usize = 0;
     if !speech_load_token_ids_text(reference_path, &ref_tokens[0], &ref_count) { return false; }
-    if ref_count != token_count {
-        _ = printf("tts-simplex compare: count mismatch ref=%zu uya=%zu path=%s\n", ref_count, token_count, reference_path);
-        return false;
-    }
+    result.ref_count = ref_count;
+    var min_count: usize = ref_count;
+    if token_count < min_count { min_count = token_count; }
     var i: usize = 0;
-    while i < token_count {
+    while i < min_count {
         if ref_tokens[i] != tokens[i] {
-            _ = printf("tts-simplex compare: first mismatch index=%zu ref=%u uya=%u path=%s\n", i, ref_tokens[i], tokens[i], reference_path);
-            return false;
+            result.first_mismatch_index = i;
+            result.exact = false;
+            _ = printf("tts-simplex compare: path=%s ref=%zu uya=%zu prefix_match=%zu first_mismatch=%zu ref_token=%u uya_token=%u\n", reference_path, ref_count, token_count, result.prefix_match, i, ref_tokens[i], tokens[i]);
+            return true;
         }
+        result.prefix_match = result.prefix_match + 1;
         i = i + 1;
     }
-    _ = printf("tts-simplex compare: PASS path=%s tokens=%zu\n", reference_path, token_count);
+    result.first_mismatch_index = min_count;
+    result.exact = token_count == ref_count;
+    if result.exact {
+        _ = printf("tts-simplex compare: PASS path=%s tokens=%zu\n", reference_path, token_count);
+    } else {
+        _ = printf("tts-simplex compare: path=%s ref=%zu uya=%zu prefix_match=%zu first_mismatch=%zu reason=count-mismatch\n", reference_path, ref_count, token_count, result.prefix_match, result.first_mismatch_index);
+    }
     return true;
 }
 
 fn tts_simplex_probe_usage() void {
     _ = printf("usage: minicpm-o-uya tts-simplex-probe <tts.gguf> <projector.gguf> <llm_debug_dir>\n");
-    _ = printf("       [--count N] [--out-dir dir] [--compare-dir dir] [--max-audio-tokens N] [--seed S] [--greedy]\n");
+    _ = printf("       [--count N] [--out-dir dir] [--compare-dir dir] [--require-exact] [--max-audio-tokens N] [--seed S] [--greedy]\n");
 }
 
 export fn speech_tts_simplex_probe_cli(argc: i32, argv: & &byte) i32 {
@@ -1884,6 +1915,7 @@ export fn speech_tts_simplex_probe_cli(argc: i32, argv: & &byte) i32 {
     var has_chunk_count: bool = false;
     var out_dir: &const byte = null;
     var compare_dir: &const byte = null;
+    var require_exact: bool = false;
     var simplex: TtsSimplexConfig = tts_simplex_config_init();
     var i: i32 = 5;
     while i < argc {
@@ -1904,6 +1936,11 @@ export fn speech_tts_simplex_probe_cli(argc: i32, argv: & &byte) i32 {
             if i + 1 >= argc { tts_simplex_probe_usage(); return 1; }
             compare_dir = argv[i + 1] as &const byte;
             i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--require-exact\0" as *const byte) == 0 {
+            require_exact = true;
+            i = i + 1;
             continue;
         }
         if strcmp(argv[i] as *const byte, "--max-audio-tokens\0" as *const byte) == 0 {
@@ -1985,6 +2022,7 @@ export fn speech_tts_simplex_probe_cli(argc: i32, argv: & &byte) i32 {
         tensor_weight_table_detach_mmap(&projector_table);
         return 1;
     }
+    const prompt_start_us: u64 = speech_clock_micros();
     var prompt_index: usize = 0;
     while prompt_index < prompt_count {
         if !tts_decoder_forward_token_id(&decoder_config, &decoder_weights, &runtime, prompt_ids[prompt_index]) {
@@ -1995,7 +2033,8 @@ export fn speech_tts_simplex_probe_cli(argc: i32, argv: & &byte) i32 {
         }
         prompt_index = prompt_index + 1;
     }
-    _ = printf("tts-simplex prompt: tokens=%zu context_after_prompt=%zu\n", prompt_count, runtime.total_tokens);
+    const prompt_elapsed_us: u64 = speech_elapsed_micros(prompt_start_us, speech_clock_micros());
+    _ = printf("tts-simplex prompt: tokens=%zu context_after_prompt=%zu prefill_ms=%llu.%03llu\n", prompt_count, runtime.total_tokens, prompt_elapsed_us / (1000 as u64), prompt_elapsed_us % (1000 as u64));
     var all_generated: [u32: 32768] = [];
     var all_generated_count: usize = 0;
     var compare_ok: bool = true;
@@ -2006,17 +2045,22 @@ export fn speech_tts_simplex_probe_cli(argc: i32, argv: & &byte) i32 {
         if !tts_simplex_build_chunk_path(&token_path[0], @len(token_path), llm_debug_dir, chunk_index, "llm_token_ids.txt\0" as &const byte) { compare_ok = false; break; }
         if !tts_simplex_build_chunk_path(&hidden_path[0], @len(hidden_path), llm_debug_dir, chunk_index, "llm_hidden_states.bin\0" as &const byte) { compare_ok = false; break; }
         var merged_chunk: TtsMergedChunk = tts_merged_chunk_init();
+        const merge_start_us: u64 = speech_clock_micros();
         if !tts_condition_build_merged_from_files(&cond_config, &cond_weights, &token_path[0] as &const byte, &hidden_path[0] as &const byte, &merged_chunk) {
             compare_ok = false;
             break;
         }
+        const merge_elapsed_us: u64 = speech_elapsed_micros(merge_start_us, speech_clock_micros());
         var chunk_tokens: [u32: 1024] = [];
         var chunk_token_count: usize = 0;
+        const decode_start_us: u64 = speech_clock_micros();
         if !tts_simplex_generate_chunk(&decoder_config, &decoder_weights, &runtime, merged_chunk.merged as &const f32, merged_chunk.token_count, chunk_index, chunk_index + 1 == chunk_count, &simplex, &all_generated[0], &all_generated_count, &chunk_tokens[0], &chunk_token_count) {
             free(merged_chunk.merged as &void);
             compare_ok = false;
             break;
         }
+        const decode_elapsed_us: u64 = speech_elapsed_micros(decode_start_us, speech_clock_micros());
+        _ = printf("tts-simplex timing: chunk=%u merge_ms=%llu.%03llu decode_ms=%llu.%03llu cache_tokens=%zu generated=%zu\n", chunk_index, merge_elapsed_us / (1000 as u64), merge_elapsed_us % (1000 as u64), decode_elapsed_us / (1000 as u64), decode_elapsed_us % (1000 as u64), runtime.total_tokens, chunk_token_count);
         if out_dir != null {
             var out_txt: [byte: 512] = [];
             var out_bin: [byte: 512] = [];
@@ -2025,8 +2069,14 @@ export fn speech_tts_simplex_probe_cli(argc: i32, argv: & &byte) i32 {
         }
         if compare_dir != null {
             var ref_txt: [byte: 512] = [];
-            if !tts_simplex_build_out_path(&ref_txt[0], @len(ref_txt), compare_dir, chunk_index, "txt\0" as &const byte) || !tts_simplex_compare_chunk(&ref_txt[0] as &const byte, &chunk_tokens[0] as &const u32, chunk_token_count) {
+            var compare: TtsTokenCompareResult = tts_token_compare_result_init();
+            if !tts_simplex_build_out_path(&ref_txt[0], @len(ref_txt), compare_dir, chunk_index, "txt\0" as &const byte) || !tts_simplex_compare_chunk(&ref_txt[0] as &const byte, &chunk_tokens[0] as &const u32, chunk_token_count, &compare) {
                 compare_ok = false;
+            } else {
+                var exact_flag: u32 = 0;
+                if compare.exact { exact_flag = 1; }
+                _ = printf("tts-simplex compare-summary: chunk=%u ref=%zu uya=%zu prefix_match=%zu exact=%u\n", chunk_index, compare.ref_count, chunk_token_count, compare.prefix_match, exact_flag);
+                if require_exact && !compare.exact { compare_ok = false; }
             }
         }
         free(merged_chunk.merged as &void);

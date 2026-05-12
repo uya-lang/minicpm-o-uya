@@ -55,6 +55,7 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `audio-real-encode-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real audio encoder forward probe | Correctness-first `conv + transformer + projector + pool` path |
 | `tts-condition-probe <tts.gguf> <projector.gguf> <llm_token_ids.txt> <llm_hidden_states.bin>` | Real TTS conditioning merge probe | `emb_text + projector_semantic + L2 normalize + merge`; optional merged/condition dump |
 | `tts-simplex-probe <tts.gguf> <projector.gguf> <llm_debug_dir>` | Real TTS decoder/audio-token probe | Official TTS decoder KV cache + assistant prompt prefill + chunked audio token dump |
+| `make tts-token-align` | Real TTS token compare helper | Runs simplex probe and reports per-chunk count/prefix/exact match vs `audio_tokens_chunk_*.txt` |
 | `audio2audio-smoke <model.gguf> [--audio-model audio.gguf] [--speech-model speech.gguf] [--vocoder-model vocoder.gguf] <audio.pcm\|audio.raw> [out.wav]` | Audio input to WAV smoke | PCM/mel -> audio encoder -> speech/vocoder WAV; optional split GGUF tables |
 | `speech-smoke <model.gguf> <prompt> [out.wav]` | Speech/vocoder smoke | Deterministic tiny WAV output only |
 | `omni-smoke <model.gguf> <manifest.json>` | Compile mixed text/image/audio/speech manifest | Fixed test JSON schema |
@@ -143,6 +144,7 @@ build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.w
 build/minicpm-o-uya audio-real-encode-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya tts-condition-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_token_ids.txt /path/to/llm_hidden_states.bin --dump-merged /tmp/minicpm-o-uya-merged.bin
 build/minicpm-o-uya tts-simplex-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_debug --count 4 --out-dir /tmp/minicpm-o-uya-ttsprobe
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_TTS_LLM_DEBUG_DIR=/path/to/llm_debug MINICPM_O_TTS_COMPARE_DIR=/path/to/tts_wav make tts-token-align
 build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_TEXT_GGUF" --audio-model "$MINICPM_O_AUDIO_GGUF" --speech-model "$MINICPM_O_SPEECH_GGUF" --vocoder-model "$MINICPM_O_VOCODER_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"

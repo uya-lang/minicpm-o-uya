@@ -59,6 +59,7 @@ Generated files:
 - `audio-real-mel-align` is manual and compares a Uya `--dump-f32` mel dump against a `llama.cpp-omni` `log_mel_spectrogram.json` dump from the same audio input. The current default acceptance bound is `max_abs <= 2e-3` and `mean_abs <= 2e-5`.
 - `tts-condition-probe` is manual and runs the real `emb_text + projector_semantic + L2 normalize + merge` path from `llama.cpp-omni` `llm_debug/chunk_*` token-id and hidden-state dumps. `tts-merge-align` compares the resulting Uya `merged` dump against `llama.cpp-omni` `merged_embeddings.bin` with default bounds `max_abs <= 1e-5` and `mean_abs <= 1e-6`.
 - `tts-simplex-probe` is manual and runs the official 20-layer TTS decoder over a whole `llm_debug/chunk_*` directory, keeps KV cache across chunks, and writes `audio_tokens_chunk_*.txt/bin` in the same relative-token format as `llama.cpp-omni`.
+- `tts-token-align` is manual and wraps the simplex probe with per-chunk `count`, `prefix_match`, and `exact` summaries against a reference `tts_wav` directory. It supports non-strict exploratory comparison and strict exact mode for future seeded baselines.
 - `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
 - `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.
 - `audio2audio-fixture` for PCM/mel audio input through audio encoder, speech decoder, vocoder, and WAV output.
