@@ -1827,8 +1827,9 @@ export fn qwen3_append_prompt_embeddings(config: &Qwen3Config, weights: &Qwen3We
     return true;
 }
 
-export fn qwen3_generate_capture(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, sampler: &Qwen3SamplerConfig, tok: &Tokenizer, logits: &f32, text_label: &const byte, preserve_final_cache: bool, capture: &byte, capture_cap: usize, capture_len: &usize) i32 {
+export fn qwen3_generate_capture_timed(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, sampler: &Qwen3SamplerConfig, tok: &Tokenizer, logits: &f32, text_label: &const byte, preserve_final_cache: bool, capture: &byte, capture_cap: usize, capture_len: &usize, first_token_us: &u64) i32 {
     capture_len[0] = 0;
+    first_token_us[0] = 0;
     if capture_cap > 0 {
         capture[0] = 0;
     }
@@ -1841,6 +1842,7 @@ export fn qwen3_generate_capture(config: &Qwen3Config, weights: &Qwen3Weights, r
     }
     _ = printf("%s: ", text_label);
     _ = fflush(stdout);
+    const generate_start_us: u64 = qwen3_bench_clock_micros();
     while sampler.max_new_tokens == 0 || generated < sampler.max_new_tokens as usize {
         if runtime.total_tokens >= config.context_length as usize || runtime.total_tokens >= runtime.context_capacity {
             _ = printf("\n");
@@ -1866,6 +1868,7 @@ export fn qwen3_generate_capture(config: &Qwen3Config, weights: &Qwen3Weights, r
             _ = printf("error: generated capture exceeds buffer cap=%zu\n", capture_cap);
             return 1;
         }
+        if generated == 0 { first_token_us[0] = qwen3_bench_elapsed_micros(generate_start_us, qwen3_bench_clock_micros()); }
         _ = printf("%s", &piece_text[0]);
         _ = fflush(stdout);
         runtime.prompt_ids[runtime.total_tokens] = next_id;
@@ -1888,6 +1891,11 @@ export fn qwen3_generate_capture(config: &Qwen3Config, weights: &Qwen3Weights, r
         _ = printf("stop: max_new_tokens=%u\n", sampler.max_new_tokens);
     }
     return 0;
+}
+
+export fn qwen3_generate_capture(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, sampler: &Qwen3SamplerConfig, tok: &Tokenizer, logits: &f32, text_label: &const byte, preserve_final_cache: bool, capture: &byte, capture_cap: usize, capture_len: &usize) i32 {
+    var ignored_first_token_us: u64 = 0;
+    return qwen3_generate_capture_timed(config, weights, runtime, sampler, tok, logits, text_label, preserve_final_cache, capture, capture_cap, capture_len, &ignored_first_token_us);
 }
 
 fn qwen3_generate_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, sampler: &Qwen3SamplerConfig, tok: &Tokenizer, logits: &f32, text_label: &const byte, preserve_final_cache: bool) i32 {

@@ -469,6 +469,7 @@
   - [x] `audio-real-mel-probe` 已实现真实 WAV/UYAP -> periodic Hann -> DFT/STFT power -> GGUF `filters` mel filterbank -> log10 clamp/normalize，并输出 frames/elements/checksum/首值。
   - [x] `audio-real-mel-probe --dump-f32` 与 `tests/compare_audio_mel_alignment.py`/`make audio-real-mel-align` 已接好，可对比 `llama.cpp-omni` 的 `log_mel_spectrogram.json` dump。
   - [x] 已与本地 `llama.cpp-omni` `log_mel_spectrogram` dump 做数值误差对齐：`outputs/complex_case2/complex2_0000.wav` 为 `mean_abs=1.2707e-5`、`max_abs=1.4266e-3`，`complex2_0001.wav` 为 `mean_abs=1.2695e-5`、`max_abs=1.4004e-3`；当前默认阈值取 `mean_abs <= 2e-5`、`max_abs <= 2e-3`。
+  - [x] `audio-real-encode-probe` / `audio2audio-real --text-only` 现已对长单文件音频按 encoder context 自动分块 forward，并输出 `chunks=` 诊断，避免单段长音频直接撞 `n_pos=1500` 上限。
 - [x] 移除 tiny audio cap，支持真实用户语音长度和多 chunk 输入。
   - [x] 输入 probe 流式扫描真实 WAV/UYAP，不受 tiny mel cap 限制；`audio-real-encode-probe` 已移除 `480000 samples` 上限，可直接跑更长真实音频。
   - [x] `audio2audio-real --text-only/--no-tts --test-prefix PREFIX --count N` 现已按 `0000=ref, 0001..=same user query chunks` 顺序 prefill 多个 user 音频 chunk，并复用同一个 audio encoder session，避免每个 chunk 重复加载/绑定 audio GGUF。
