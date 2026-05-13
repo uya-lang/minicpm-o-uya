@@ -40,7 +40,7 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `piece <model.gguf> <token-id>` | Print token piece | GGUF tokenizer metadata |
 | `encode <model.gguf> <text>` | Encode text to token ids | Tiny BPE/special-token coverage |
 | `decode <model.gguf> <token-id>...` | Decode token ids to text | Tiny tokenizer coverage |
-| `format-chat <model.gguf> <user-text>` | Apply ChatML-like template | Qwen/MiniCPM-o style templates only |
+| `format-chat <model.gguf> <user-text> [--system TEXT] [--enable-thinking] [--tts-template]` | Apply ChatML-like template | Qwen/MiniCPM-o style templates only |
 | `tensors <model.gguf> [--mmap]` | Build tensor view table and cache skeleton | Bounds, dtype, mmap diagnostics |
 | `qwen3-bind <model.gguf>` | Bind Qwen3 text config and weights | Tiny Qwen3-like fixture; real layouts may report missing tensors |
 | `generate <model.gguf> <prompt> [sampler args...]` | Tiny text generation smoke | Deterministic reference path, not production generation |

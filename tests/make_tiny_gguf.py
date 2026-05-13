@@ -216,6 +216,13 @@ def main() -> None:
     out_dir = Path(__file__).resolve().parent / "fixtures"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    base_tokens = [
+        "<unk>", "<s>", "</s>", "<pad>", "hello", " ", "world", "!",
+        "你好", "，", "世界", "\n", "<image>", "<audio>", "<video>", "<|im_start|>", "<|im_end|>", "user", "assistant",
+    ]
+    base_scores = [0.0, 0.0, 0.0, 0.0, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6, -0.7, -0.8, 0.0, 0.0, 0.0, 0.0, 0.0, -0.9, -1.0]
+    base_token_types = [3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 1, 1]
+
     metadata = [
         metadata_string("general.architecture", "minicpmo-qwen3"),
         metadata_string("general.name", "tiny phase2 audit fixture"),
@@ -259,12 +266,9 @@ def main() -> None:
         metadata_u32("audio.projector.output_length", 8),
         metadata_string("speech.cosyvoice2.kind", "codec-vocoder"),
         metadata_string("tokenizer.ggml.model", "gpt2"),
-        metadata_string_array("tokenizer.ggml.tokens", [
-            "<unk>", "<s>", "</s>", "<pad>", "hello", " ", "world", "!",
-            "你好", "，", "世界", "\n", "<image>", "<audio>", "<video>", "<|im_start|>", "<|im_end|>", "user", "assistant",
-        ]),
-        metadata_f32_array("tokenizer.ggml.scores", [0.0, 0.0, 0.0, 0.0, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6, -0.7, -0.8, 0.0, 0.0, 0.0, 0.0, 0.0, -0.9, -1.0]),
-        metadata_i32_array("tokenizer.ggml.token_type", [3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 1, 1]),
+        metadata_string_array("tokenizer.ggml.tokens", base_tokens),
+        metadata_f32_array("tokenizer.ggml.scores", base_scores),
+        metadata_i32_array("tokenizer.ggml.token_type", base_token_types),
         metadata_string_array("tokenizer.ggml.merges", ["h e", "he l", "hel lo", "w o", "wo r", "wor ld"]),
         metadata_u32("tokenizer.ggml.unknown_token_id", 0),
         metadata_u32("tokenizer.ggml.bos_token_id", 1),
@@ -278,9 +282,9 @@ def main() -> None:
     ]
 
     text_tensor_specs = [
-        ("token_embd.weight", [8, 19], GGML_TYPE_F16),
+        ("token_embd.weight", [8, len(base_tokens)], GGML_TYPE_F16),
         ("output_norm.weight", [8], GGML_TYPE_F32),
-        ("output.weight", [8, 19], GGML_TYPE_F16),
+        ("output.weight", [8, len(base_tokens)], GGML_TYPE_F16),
         ("blk.0.attn_norm.weight", [8], GGML_TYPE_F32),
         ("blk.0.attn_q.weight", [8, 8], GGML_TYPE_F32),
         ("blk.0.attn_k.weight", [8, 4], GGML_TYPE_F32),
@@ -349,6 +353,104 @@ def main() -> None:
     (out_dir / "tiny.gguf").write_bytes(fixture)
     (out_dir / "tiny.gguf.part").write_bytes(fixture[:48])
     (out_dir / "tiny_data_truncated.gguf").write_bytes(fixture[:-17])
+
+    template_tokens = base_tokens + ["<think>", "</think>", "<|tts_bos|>"]
+    template_scores = base_scores + [0.0, 0.0, 0.0]
+    template_token_types = base_token_types + [3, 3, 3]
+    template_metadata = [
+        metadata_string("general.architecture", "minicpmo-qwen3"),
+        metadata_string("general.name", "tiny template/rope scaling fixture"),
+        metadata_u32("general.alignment", 32),
+        metadata_u32("qwen3.context_length", 32),
+        metadata_u32("qwen3.embedding_length", 8),
+        metadata_u32("qwen3.feed_forward_length", 16),
+        metadata_u32("qwen3.block_count", 1),
+        metadata_u32("qwen3.attention.head_count", 2),
+        metadata_u32("qwen3.attention.head_count_kv", 1),
+        metadata_u32("qwen3.rope.dimension_count", 4),
+        metadata_f32("qwen3.attention.layer_norm_rms_epsilon", 0.000001),
+        metadata_f32("qwen3.rope.freq_base", 1000000.0),
+        metadata_string("qwen3.rope.scaling.type", "linear"),
+        metadata_f32("qwen3.rope.scaling.factor", 2.0),
+        metadata_u32("qwen3.rope.scaling.original_context_length", 16),
+        metadata_u32("vision.image_width", 2),
+        metadata_u32("vision.image_height", 2),
+        metadata_u32("vision.channel_count", 3),
+        metadata_u32("vision.patch_size", 2),
+        metadata_u32("vision.preprocess.target_width", 2),
+        metadata_u32("vision.preprocess.target_height", 2),
+        metadata_u32("vision.preprocess.crop_width", 2),
+        metadata_u32("vision.preprocess.crop_height", 2),
+        metadata_u32("vision.preprocess.tile_width", 2),
+        metadata_u32("vision.preprocess.tile_height", 2),
+        metadata_f32("vision.preprocess.mean_r", 0.5),
+        metadata_f32("vision.preprocess.mean_g", 0.5),
+        metadata_f32("vision.preprocess.mean_b", 0.5),
+        metadata_f32("vision.preprocess.std_r", 0.5),
+        metadata_f32("vision.preprocess.std_g", 0.5),
+        metadata_f32("vision.preprocess.std_b", 0.5),
+        metadata_u32("vision.embedding_length", 4),
+        metadata_u32("vision.siglip2.block_count", 1),
+        metadata_u32("vision.attention.head_count", 1),
+        metadata_u32("vision.feed_forward_length", 8),
+        metadata_u32("vision.projector.output_length", 8),
+        metadata_u32("audio.log_mel.frame_count", 1),
+        metadata_u32("audio.log_mel.bin_count", 4),
+        metadata_u32("audio.embedding_length", 4),
+        metadata_u32("audio.whisper.block_count", 1),
+        metadata_u32("audio.attention.head_count", 1),
+        metadata_u32("audio.feed_forward_length", 8),
+        metadata_u32("audio.projector.output_length", 8),
+        metadata_string("speech.cosyvoice2.kind", "codec-vocoder"),
+        metadata_string("tokenizer.ggml.model", "gpt2"),
+        metadata_string_array("tokenizer.ggml.tokens", template_tokens),
+        metadata_f32_array("tokenizer.ggml.scores", template_scores),
+        metadata_i32_array("tokenizer.ggml.token_type", template_token_types),
+        metadata_string_array("tokenizer.ggml.merges", ["h e", "he l", "hel lo", "w o", "wo r", "wor ld"]),
+        metadata_u32("tokenizer.ggml.unknown_token_id", 0),
+        metadata_u32("tokenizer.ggml.bos_token_id", 1),
+        metadata_u32("tokenizer.ggml.eos_token_id", 16),
+        metadata_u32("tokenizer.ggml.padding_token_id", 3),
+        metadata_string("tokenizer.chat_template", "{%- if messages[0].role == 'system' %}<|im_start|>system\n{{ messages[0].content }}<|im_end|>\n{%- endif %}{%- for message in messages %}{%- if message.role == 'user' %}<|im_start|>user\n{{ message.content }}<|im_end|>\n{%- endif %}{%- endfor %}{%- if add_generation_prompt %}<|im_start|>assistant\n{%- if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{%- endif %}{%- if use_tts_template is defined and use_tts_template is true %}<|tts_bos|>{%- endif %}{%- endif %}"),
+        metadata_u32("minicpmo.media.image_token_id", 12),
+        metadata_u32("minicpmo.media.audio_token_id", 13),
+        metadata_i32("test.scalar_i32", -7),
+        metadata_u32_array("test.array_u32", [1, 2, 3, 5, 8]),
+    ]
+    template_text_specs = [
+        ("token_embd.weight", [8, len(template_tokens)], GGML_TYPE_F16),
+        ("output_norm.weight", [8], GGML_TYPE_F32),
+        ("output.weight", [8, len(template_tokens)], GGML_TYPE_F16),
+        ("blk.0.attn_norm.weight", [8], GGML_TYPE_F32),
+        ("blk.0.attn_q.weight", [8, 8], GGML_TYPE_F32),
+        ("blk.0.attn_k.weight", [8, 4], GGML_TYPE_F32),
+        ("blk.0.attn_v.weight", [8, 4], GGML_TYPE_F32),
+        ("blk.0.attn_output.weight", [8, 8], GGML_TYPE_F32),
+        ("blk.0.attn_q_norm.weight", [4], GGML_TYPE_F32),
+        ("blk.0.attn_k_norm.weight", [4], GGML_TYPE_F32),
+        ("blk.0.ffn_norm.weight", [8], GGML_TYPE_F32),
+        ("blk.0.ffn_gate.weight", [8, 16], GGML_TYPE_F16),
+        ("blk.0.ffn_up.weight", [8, 16], GGML_TYPE_F16),
+        ("blk.0.ffn_down.weight", [16, 8], GGML_TYPE_F16),
+    ]
+    template_specs = template_text_specs + branch_tensor_specs
+    template_tensors = []
+    template_tensor_data = bytearray()
+    offset = 0
+    for _, (name, dims, ggml_type) in enumerate(template_specs):
+        offset = align_up(offset, 32)
+        if len(template_tensor_data) < offset:
+            template_tensor_data.extend(b"\x00" * (offset - len(template_tensor_data)))
+        size = tensor_size(dims, ggml_type)
+        template_tensors.append(tensor_info(name, dims, ggml_type, offset))
+        template_tensor_data.extend(pack_tensor_values(name, dims, ggml_type))
+        offset += size
+    template_header = struct.pack("<IIQQ", 0x46554747, 3, len(template_tensors), len(template_metadata))
+    template_directory = template_header + b"".join(template_metadata) + b"".join(template_tensors)
+    template_data_start = align_up(len(template_directory), 32)
+    template_padding = b"\x00" * (template_data_start - len(template_directory))
+    template_fixture = template_directory + template_padding + bytes(template_tensor_data)
+    (out_dir / "tiny_template.gguf").write_bytes(template_fixture)
 
     bpe_metadata = [
         metadata_string("general.architecture", "tokenizer-only"),

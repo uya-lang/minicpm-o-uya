@@ -25,6 +25,7 @@ make fixtures
 Generated files:
 
 - `tests/fixtures/tiny.gguf` — deterministic GGUF v3 fixture with Qwen3, tokenizer, vision, audio, speech, scalar, string, and array metadata plus branchable tensors.
+- `tests/fixtures/tiny_template.gguf` — tiny Qwen3 fixture with linear RoPE scaling metadata plus a MiniCPM-o/Qwen-style Jinja chat template, `<think>`, and `<|tts_bos|>` tokens for prompt-format coverage.
 - `tests/fixtures/tiny_bpe.gguf` — tokenizer-only byte-BPE fixture covering merge-based English, leading-space, and UTF-8 Chinese byte-piece encoding.
 - `tests/fixtures/tiny.gguf.part` — truncated file used to verify short-read errors.
 - `tests/fixtures/tiny_data_truncated.gguf` — tensor-data truncation case used to verify weight-table bounds checks.
@@ -45,7 +46,7 @@ Generated files:
 `make test` builds the CLI, regenerates fixtures, and runs:
 
 - `inspect-fixture` and `audit-fixture` for GGUF parsing, schema summaries, and unsupported diagnostics.
-- `tokenizer-fixture` for `piece`, `encode`, `decode`, and `format-chat` goldens.
+- `tokenizer-fixture` for `piece`, `encode`, `decode`, and `format-chat` goldens, including system/TTS assistant prompt formatting.
 - `tensor-fixture` for tensor table conversion, mmap view setup, cache skeletons, unknown dtype errors, and tensor-data bounds errors.
 - `kernels-fixture` for scalar reference kernel goldens.
 - `quant-fixture` for selected GGML quant kernel goldens and unsupported dtype diagnostics.

@@ -27,7 +27,7 @@ use minicpmo.speech.speech_tts_simplex_probe_cli;
 use minicpmo.speech.speech_tts_bind_cli;
 use minicpmo.tokenizer.tokenizer_decode_cli;
 use minicpmo.tokenizer.tokenizer_encode_cli;
-use minicpmo.tokenizer.tokenizer_format_chat_cli;
+use minicpmo.tokenizer.tokenizer_format_chat_args_cli;
 use minicpmo.tokenizer.tokenizer_piece_cli;
 use minicpmo.tensor.tensor_table_cli;
 use minicpmo.token2wav.token2wav_bind_dir_cli;
@@ -47,7 +47,7 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya piece <model.gguf> <token-id>\n");
     _ = printf("  minicpm-o-uya encode <model.gguf> <text>\n");
     _ = printf("  minicpm-o-uya decode <model.gguf> <token-id>...\n");
-    _ = printf("  minicpm-o-uya format-chat <model.gguf> <user-text>\n");
+    _ = printf("  minicpm-o-uya format-chat <model.gguf> <user-text> [--system TEXT] [--enable-thinking] [--tts-template]\n");
     _ = printf("  minicpm-o-uya tensors <model.gguf> [--mmap]\n");
     _ = printf("  minicpm-o-uya qwen3-bind <model.gguf>\n");
     _ = printf("  minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose] [--dump-hidden]\n");
@@ -141,11 +141,11 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
         return tokenizer_decode_cli(argv[2] as &const byte, argc, argv as & &byte, 3);
     }
     if strcmp(argv[1] as *const byte, "format-chat\0" as *const byte) == 0 {
-        if argc != 4 {
-            _ = printf("usage: minicpm-o-uya format-chat <model.gguf> <user-text>\n");
+        if argc < 4 {
+            _ = printf("usage: minicpm-o-uya format-chat <model.gguf> <user-text> [--system TEXT] [--enable-thinking] [--tts-template]\n");
             return 1;
         }
-        return tokenizer_format_chat_cli(argv[2] as &const byte, argv[3] as &const byte);
+        return tokenizer_format_chat_args_cli(argc, argv as & &byte);
     }
     if strcmp(argv[1] as *const byte, "qwen3-bind\0" as *const byte) == 0 {
         if argc != 3 {

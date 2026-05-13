@@ -444,9 +444,9 @@
   - [x] 实现 GGML 布局的 Q4_K/Q5_K/Q6_K fused matvec，并覆盖 Q4_K/Q5_K/Q6_K token embedding 行反量化。
   - [x] 官方 `MiniCPM-o-4_5-Q4_K_M.gguf` 可执行 text-only `generate --max-new-tokens 1`。
   - [x] 官方 `MiniCPM-o-4_5-Q4_K_M.gguf` 已验证只命中 `F32/Q4_K/Q6_K`；`Q8_K/IQ*` 仍保留 runtime 显式 unsupported，不静默执行。
-- [ ] 支持 Qwen3/MiniCPM-o 4.5 的 rope、q/k norm、GQA、KV cache layout 和 chat template。
+- [x] 支持 Qwen3/MiniCPM-o 4.5 的 rope、q/k norm、GQA、KV cache layout 和 chat template。
   - [x] 当前 forward 已包含 q/k norm、GQA 维度、KV cache 和预计算 RoPE 的基本执行路径，能跑官方模型 smoke。
-  - [ ] 与 llama.cpp 对齐 RoPE scaling/chat template/stop token 细节。
+  - [x] 与 llama.cpp 对齐 RoPE scaling/chat template/stop token 细节。
 - [x] 支持 prompt prefill 分块、decode step、sampler、stop token、hidden state capture。
   - [x] text-only prompt prefill、decode step、sampler 和 stop token smoke 可执行。
   - [x] `generate --dump-hidden` 已接出 prompt/generated token 的 LLM hidden state summary，供后续 TTS projector 消费。

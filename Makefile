@@ -72,6 +72,10 @@ tokenizer-fixture: build fixtures
 	$(OUT) format-chat tests/fixtures/tiny.gguf "<image> hello" >/tmp/minicpm-o-uya-chat.out
 	grep -q "<|im_start|>user" /tmp/minicpm-o-uya-chat.out
 	grep -q "<image> hello<|im_end|>" /tmp/minicpm-o-uya-chat.out
+	$(OUT) format-chat tests/fixtures/tiny_template.gguf "hello" --system "voice ref" --tts-template >/tmp/minicpm-o-uya-chat-template.out
+	grep -q "<|im_start|>system" /tmp/minicpm-o-uya-chat-template.out
+	grep -q "<think>" /tmp/minicpm-o-uya-chat-template.out
+	grep -q "<|tts_bos|>" /tmp/minicpm-o-uya-chat-template.out
 
 
 tensor-fixture: build fixtures
@@ -98,6 +102,9 @@ qwen3-fixture: build fixtures
 	$(OUT) qwen3-bind tests/fixtures/tiny.gguf >/tmp/minicpm-o-uya-qwen3.out
 	grep -q "qwen3 bind: PASS" /tmp/minicpm-o-uya-qwen3.out
 	grep -q "q_norm=yes k_norm=yes" /tmp/minicpm-o-uya-qwen3.out
+	$(OUT) qwen3-bind tests/fixtures/tiny_template.gguf >/tmp/minicpm-o-uya-qwen3-template.out
+	grep -q "rope_scaling=linear" /tmp/minicpm-o-uya-qwen3-template.out
+	grep -q "rope_orig_ctx=16" /tmp/minicpm-o-uya-qwen3-template.out
 	@if $(OUT) qwen3-bind tests/fixtures/tiny_qwen3_missing_q.gguf >/tmp/minicpm-o-uya-qwen3-missing.out 2>&1; then \
 		echo "expected missing q projection binding to fail"; \
 		exit 1; \

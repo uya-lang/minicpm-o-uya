@@ -36,6 +36,7 @@ use minicpmo.tensor.tensor_weight_table_detach_mmap;
 use minicpmo.tensor.tensor_weight_table_load;
 use minicpmo.tokenizer.Tokenizer;
 use minicpmo.tokenizer.tokenizer_encode_to_ids;
+use minicpmo.tokenizer.tokenizer_format_assistant_prompt;
 use minicpmo.tokenizer.tokenizer_init;
 use minicpmo.tokenizer.tokenizer_load;
 
@@ -2016,7 +2017,12 @@ export fn speech_tts_simplex_probe_cli(argc: i32, argv: & &byte) i32 {
     }
     var prompt_ids: [u32: 256] = [];
     var prompt_count: usize = 0;
-    if !tokenizer_encode_to_ids(&tok, TTS_SIMPLEX_ASSISTANT_PROMPT, &prompt_ids[0], @len(prompt_ids), &prompt_count) {
+    var prompt_text: [byte: 512] = [];
+    var prompt_source: &const byte = TTS_SIMPLEX_ASSISTANT_PROMPT;
+    if tokenizer_format_assistant_prompt(&tok, true, false, true, &prompt_text[0], @len(prompt_text)) {
+        prompt_source = &prompt_text[0] as &const byte;
+    }
+    if !tokenizer_encode_to_ids(&tok, prompt_source, &prompt_ids[0], @len(prompt_ids), &prompt_count) {
         tts_decoder_runtime_free(&runtime);
         tensor_weight_table_detach_mmap(&tts_table);
         tensor_weight_table_detach_mmap(&projector_table);
