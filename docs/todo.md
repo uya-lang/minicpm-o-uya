@@ -498,13 +498,13 @@
   - [x] 新增 `tts-condition-probe`：读取 `llama.cpp-omni` `llm_token_ids.txt` + `llm_hidden_states.bin`，执行 `emb_text + projector_semantic + L2 normalize + merge`，并可 dump `projected/merged/condition`。
   - [x] 新增 `tests/compare_tts_merge_alignment.py` / `make tts-merge-align`，对照 `llama.cpp-omni` `merged_embeddings.bin`。
   - [x] 本地 `round_000/llm_debug/chunk_{0..3}` 已数值对齐，`mean_abs≈1.4e-8..1.8e-8`、`max_abs=2.384e-7`。
-- [ ] 实现 TTS prefill/decode cache，与 audio_bos、audio_eos、audio token vocabulary 对齐。
+- [x] 实现 TTS prefill/decode cache，与 audio_bos、audio_eos、audio token vocabulary 对齐。
   - [x] 新增 `tts-simplex-probe`：官方 TTS decoder 20 层 forward、assistant prompt prefill、`audio_bos`/`text_eos` 注入、跨 chunk KV cache 与 audio-token history 已可跑通。
-- [ ] 实现 chunked text/hidden-state queue：LLM 每个文本 chunk 同步送入 TTS。
+- [x] 实现 chunked text/hidden-state queue：LLM 每个文本 chunk 同步送入 TTS。
   - [x] `tts-simplex-probe <llm_debug_dir> --count N` 已顺序消费 `chunk_0..chunk_N-1`，并跨 chunk 复用同一套 TTS runtime。
-- [ ] 生成 audio token ids 并保存 `audio_tokens_chunk_*.txt/bin`，格式对齐 llama.cpp-omni。
+- [x] 生成 audio token ids 并保存 `audio_tokens_chunk_*.txt/bin`，格式对齐 llama.cpp-omni。
   - [x] `tts-simplex-probe --out-dir DIR` 已输出相同命名的 `audio_tokens_chunk_*.txt/bin`，内容为 relative audio token ids。
-- [ ] 增加 TTS token 级对照：相同 hidden/text chunk 下，audio token 前 N 个与 baseline 对比。
+- [x] 增加 TTS token 级对照：相同 hidden/text chunk 下，audio token 前 N 个与 baseline 对比。
   - [x] `tts-simplex-probe --compare-dir DIR` 已支持逐 chunk exact compare。
   - [x] `make tts-token-align` / `tests/compare_tts_token_alignment.py` 已支持逐 chunk `count/prefix_match/exact` 汇总。
   - [ ] 当前本地 `round_000/tts_wav` baseline 未固定 sampler seed，暂不作为严格 deterministic token oracle。
@@ -531,6 +531,7 @@
   - [x] 新增 `token2wav-flow-probe` / `make token2wav-flow-probe`，可在官方 `flow_matching.gguf` + `flow_extra.gguf` + `prompt_cache.gguf` 上跑 reference `speaker affine + timestep embed + attention + conv + MLP + final linear`。
   - [x] `token2wav-flow-probe` 当前支持 `--token-limit`、`--block-limit`、`--n-timesteps`、`--zero-mu|--embed-mu`，便于在小窗口上先验证数学链路。
   - [x] `token2wav-flow-probe --session` 现已按 `prompt_cache.gguf` 的 `chunk_total/chunk_main/pre_lookahead` 重放完整滑窗时序，并输出每窗 `emit_frames/checksum` 与总 mel checksum。
+  - [x] `token2wav-flow-probe --dump-f32 out.uyml` 现可导出单窗或 session 聚合后的 mel 输出，便于后续与官方 token2mel / vocoder 输入对照。
   - [ ] 当前 probe 仍使用 surrogate `mu`，还未接入 `encoder.gguf` 的真实 conformer/upsample forward。
 - [ ] 实现 hifigan2 vocoder forward，输出 24 kHz mono PCM。
 - [ ] 实现流式 WAV chunk 写入，并支持最终 concat 成完整回答 wav。

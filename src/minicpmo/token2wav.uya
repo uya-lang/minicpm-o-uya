@@ -3,10 +3,16 @@ use libc.cosf;
 use libc.expf;
 use libc.free;
 use libc.logf;
+use libc.O_CREAT;
+use libc.O_TRUNC;
+use libc.O_WRONLY;
 use libc.printf;
 use libc.snprintf;
 use libc.sqrtf;
 use libc.strcmp;
+use libc.sys_close;
+use libc.sys_open;
+use libc.sys_write;
 use minicpmo.kernels.gelu;
 use minicpmo.kernels.silu;
 use minicpmo.kernels.softmax;
@@ -64,6 +70,54 @@ const T2W_FLOW_IN: usize = 320;
 const T2W_FLOW_T_EMBED: usize = 256;
 const T2W_FLOW_MAX_BLOCKS: usize = 64;
 const T2W_PAD_TOKEN_DEFAULT: u32 = 4218;
+const T2W_MEL_DUMP_MAGIC: u32 = 0x4c4d5955;
+const T2W_MEL_DUMP_VERSION: u32 = 1;
+const T2W_ENCODER_MAX_BLOCKS: usize = 16;
+
+struct T2WEncoderLayerWeights {
+    norm_ff_weight: &TensorView,
+    norm_ff_bias: &TensorView,
+    norm_mha_weight: &TensorView,
+    norm_mha_bias: &TensorView,
+    q_weight: &TensorView,
+    q_bias: &TensorView,
+    k_weight: &TensorView,
+    k_bias: &TensorView,
+    v_weight: &TensorView,
+    v_bias: &TensorView,
+    out_weight: &TensorView,
+    out_bias: &TensorView,
+    pos_weight: &TensorView,
+    pos_bias_u: &TensorView,
+    pos_bias_v: &TensorView,
+    ff1_weight: &TensorView,
+    ff1_bias: &TensorView,
+    ff2_weight: &TensorView,
+    ff2_bias: &TensorView,
+}
+
+struct T2WEncoderWeights {
+    embed0_weight: &TensorView,
+    embed0_bias: &TensorView,
+    embed1_weight: &TensorView,
+    embed1_bias: &TensorView,
+    pre_conv1_weight: &TensorView,
+    pre_conv1_bias: &TensorView,
+    pre_conv2_weight: &TensorView,
+    pre_conv2_bias: &TensorView,
+    up_layer_weight: &TensorView,
+    up_layer_bias: &TensorView,
+    up_embed0_weight: &TensorView,
+    up_embed0_bias: &TensorView,
+    up_embed1_weight: &TensorView,
+    up_embed1_bias: &TensorView,
+    after_norm_weight: &TensorView,
+    after_norm_bias: &TensorView,
+    encoders: [T2WEncoderLayerWeights: T2W_ENCODER_MAX_BLOCKS],
+    up_encoders: [T2WEncoderLayerWeights: T2W_ENCODER_MAX_BLOCKS],
+    encoder_count: u32,
+    up_encoder_count: u32,
+}
 
 struct T2WFlowExtraWeights {
     input_embedding: &TensorView,
@@ -121,6 +175,7 @@ struct T2WFlowProbeConfig {
     n_timesteps: u32,
     zero_mu: bool,
     session: bool,
+    dump_path: &const byte,
 }
 
 fn t2w_dtype_supported(dtype: TensorDType) bool {
@@ -160,6 +215,55 @@ fn t2w_flow_extra_weights_init() T2WFlowExtraWeights {
         spk_affine_bias: null,
         encoder_proj_weight: null,
         encoder_proj_bias: null,
+    };
+}
+
+fn t2w_encoder_layer_weights_init() T2WEncoderLayerWeights {
+    return T2WEncoderLayerWeights{
+        norm_ff_weight: null,
+        norm_ff_bias: null,
+        norm_mha_weight: null,
+        norm_mha_bias: null,
+        q_weight: null,
+        q_bias: null,
+        k_weight: null,
+        k_bias: null,
+        v_weight: null,
+        v_bias: null,
+        out_weight: null,
+        out_bias: null,
+        pos_weight: null,
+        pos_bias_u: null,
+        pos_bias_v: null,
+        ff1_weight: null,
+        ff1_bias: null,
+        ff2_weight: null,
+        ff2_bias: null,
+    };
+}
+
+fn t2w_encoder_weights_init() T2WEncoderWeights {
+    return T2WEncoderWeights{
+        embed0_weight: null,
+        embed0_bias: null,
+        embed1_weight: null,
+        embed1_bias: null,
+        pre_conv1_weight: null,
+        pre_conv1_bias: null,
+        pre_conv2_weight: null,
+        pre_conv2_bias: null,
+        up_layer_weight: null,
+        up_layer_bias: null,
+        up_embed0_weight: null,
+        up_embed0_bias: null,
+        up_embed1_weight: null,
+        up_embed1_bias: null,
+        after_norm_weight: null,
+        after_norm_bias: null,
+        encoders: [],
+        up_encoders: [],
+        encoder_count: 0,
+        up_encoder_count: 0,
     };
 }
 
@@ -216,6 +320,7 @@ fn t2w_flow_probe_config_init() T2WFlowProbeConfig {
         n_timesteps: 0,
         zero_mu: false,
         session: false,
+        dump_path: null,
     };
 }
 
@@ -850,6 +955,64 @@ fn t2w_flow_bind_matching_weights(table: &TensorWeightTable, weights: &T2WFlowMa
     return true;
 }
 
+fn t2w_bind_encoder_layer_weights(table: &TensorWeightTable, prefix: &const byte, layer_index: u32, weights: &T2WEncoderLayerWeights) bool {
+    weights[0] = t2w_encoder_layer_weights_init();
+    weights.norm_ff_weight = t2w_require_layer(table, prefix, layer_index, "norm_ff.weight\0" as &const byte, "encoder norm_ff weight\0" as &const byte);
+    weights.norm_ff_bias = t2w_require_layer(table, prefix, layer_index, "norm_ff.bias\0" as &const byte, "encoder norm_ff bias\0" as &const byte);
+    weights.norm_mha_weight = t2w_require_layer(table, prefix, layer_index, "norm_mha.weight\0" as &const byte, "encoder norm_mha weight\0" as &const byte);
+    weights.norm_mha_bias = t2w_require_layer(table, prefix, layer_index, "norm_mha.bias\0" as &const byte, "encoder norm_mha bias\0" as &const byte);
+    weights.q_weight = t2w_require_layer(table, prefix, layer_index, "self_attn.linear_q.weight\0" as &const byte, "encoder q weight\0" as &const byte);
+    weights.q_bias = t2w_require_layer(table, prefix, layer_index, "self_attn.linear_q.bias\0" as &const byte, "encoder q bias\0" as &const byte);
+    weights.k_weight = t2w_require_layer(table, prefix, layer_index, "self_attn.linear_k.weight\0" as &const byte, "encoder k weight\0" as &const byte);
+    weights.k_bias = t2w_require_layer(table, prefix, layer_index, "self_attn.linear_k.bias\0" as &const byte, "encoder k bias\0" as &const byte);
+    weights.v_weight = t2w_require_layer(table, prefix, layer_index, "self_attn.linear_v.weight\0" as &const byte, "encoder v weight\0" as &const byte);
+    weights.v_bias = t2w_require_layer(table, prefix, layer_index, "self_attn.linear_v.bias\0" as &const byte, "encoder v bias\0" as &const byte);
+    weights.out_weight = t2w_require_layer(table, prefix, layer_index, "self_attn.linear_out.weight\0" as &const byte, "encoder out weight\0" as &const byte);
+    weights.out_bias = t2w_require_layer(table, prefix, layer_index, "self_attn.linear_out.bias\0" as &const byte, "encoder out bias\0" as &const byte);
+    weights.pos_weight = t2w_require_layer(table, prefix, layer_index, "self_attn.linear_pos.weight\0" as &const byte, "encoder pos weight\0" as &const byte);
+    weights.pos_bias_u = t2w_require_layer(table, prefix, layer_index, "self_attn.pos_bias_u\0" as &const byte, "encoder pos_bias_u\0" as &const byte);
+    weights.pos_bias_v = t2w_require_layer(table, prefix, layer_index, "self_attn.pos_bias_v\0" as &const byte, "encoder pos_bias_v\0" as &const byte);
+    weights.ff1_weight = t2w_require_layer(table, prefix, layer_index, "feed_forward.w_1.weight\0" as &const byte, "encoder ff1 weight\0" as &const byte);
+    weights.ff1_bias = t2w_require_layer(table, prefix, layer_index, "feed_forward.w_1.bias\0" as &const byte, "encoder ff1 bias\0" as &const byte);
+    weights.ff2_weight = t2w_require_layer(table, prefix, layer_index, "feed_forward.w_2.weight\0" as &const byte, "encoder ff2 weight\0" as &const byte);
+    weights.ff2_bias = t2w_require_layer(table, prefix, layer_index, "feed_forward.w_2.bias\0" as &const byte, "encoder ff2 bias\0" as &const byte);
+    return weights.norm_ff_weight != null && weights.norm_ff_bias != null && weights.norm_mha_weight != null && weights.norm_mha_bias != null && weights.q_weight != null && weights.q_bias != null && weights.k_weight != null && weights.k_bias != null && weights.v_weight != null && weights.v_bias != null && weights.out_weight != null && weights.out_bias != null && weights.pos_weight != null && weights.pos_bias_u != null && weights.pos_bias_v != null && weights.ff1_weight != null && weights.ff1_bias != null && weights.ff2_weight != null && weights.ff2_bias != null;
+}
+
+fn t2w_bind_encoder_weights(table: &TensorWeightTable, weights: &T2WEncoderWeights) bool {
+    weights[0] = t2w_encoder_weights_init();
+    weights.encoder_count = t2w_count_layers(table, "encoders.\0" as &const byte, "self_attn.linear_q.weight\0" as &const byte, T2W_ENCODER_MAX_BLOCKS as u32);
+    weights.up_encoder_count = t2w_count_layers(table, "up_encoders.\0" as &const byte, "self_attn.linear_q.weight\0" as &const byte, T2W_ENCODER_MAX_BLOCKS as u32);
+    weights.embed0_weight = t2w_require(table, "embed.out.0.weight\0" as &const byte, "encoder embed0 weight\0" as &const byte);
+    weights.embed0_bias = t2w_require(table, "embed.out.0.bias\0" as &const byte, "encoder embed0 bias\0" as &const byte);
+    weights.embed1_weight = t2w_require(table, "embed.out.1.weight\0" as &const byte, "encoder embed1 weight\0" as &const byte);
+    weights.embed1_bias = t2w_require(table, "embed.out.1.bias\0" as &const byte, "encoder embed1 bias\0" as &const byte);
+    weights.pre_conv1_weight = t2w_require(table, "pre_lookahead_layer.conv1.weight\0" as &const byte, "encoder pre_conv1 weight\0" as &const byte);
+    weights.pre_conv1_bias = t2w_require(table, "pre_lookahead_layer.conv1.bias\0" as &const byte, "encoder pre_conv1 bias\0" as &const byte);
+    weights.pre_conv2_weight = t2w_require(table, "pre_lookahead_layer.conv2.weight\0" as &const byte, "encoder pre_conv2 weight\0" as &const byte);
+    weights.pre_conv2_bias = t2w_require(table, "pre_lookahead_layer.conv2.bias\0" as &const byte, "encoder pre_conv2 bias\0" as &const byte);
+    weights.up_layer_weight = t2w_require(table, "up_layer.conv.weight\0" as &const byte, "encoder up_layer weight\0" as &const byte);
+    weights.up_layer_bias = t2w_require(table, "up_layer.conv.bias\0" as &const byte, "encoder up_layer bias\0" as &const byte);
+    weights.up_embed0_weight = t2w_require(table, "up_embed.out.0.weight\0" as &const byte, "encoder up_embed0 weight\0" as &const byte);
+    weights.up_embed0_bias = t2w_require(table, "up_embed.out.0.bias\0" as &const byte, "encoder up_embed0 bias\0" as &const byte);
+    weights.up_embed1_weight = t2w_require(table, "up_embed.out.1.weight\0" as &const byte, "encoder up_embed1 weight\0" as &const byte);
+    weights.up_embed1_bias = t2w_require(table, "up_embed.out.1.bias\0" as &const byte, "encoder up_embed1 bias\0" as &const byte);
+    weights.after_norm_weight = t2w_require(table, "after_norm.weight\0" as &const byte, "encoder after_norm weight\0" as &const byte);
+    weights.after_norm_bias = t2w_require(table, "after_norm.bias\0" as &const byte, "encoder after_norm bias\0" as &const byte);
+    if weights.embed0_weight == null || weights.embed0_bias == null || weights.embed1_weight == null || weights.embed1_bias == null || weights.pre_conv1_weight == null || weights.pre_conv1_bias == null || weights.pre_conv2_weight == null || weights.pre_conv2_bias == null || weights.up_layer_weight == null || weights.up_layer_bias == null || weights.up_embed0_weight == null || weights.up_embed0_bias == null || weights.up_embed1_weight == null || weights.up_embed1_bias == null || weights.after_norm_weight == null || weights.after_norm_bias == null || weights.encoder_count == 0 || weights.up_encoder_count == 0 { return false; }
+    var i: u32 = 0;
+    while i < weights.encoder_count {
+        if !t2w_bind_encoder_layer_weights(table, "encoders.\0" as &const byte, i, &weights.encoders[i as usize]) { return false; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < weights.up_encoder_count {
+        if !t2w_bind_encoder_layer_weights(table, "up_encoders.\0" as &const byte, i, &weights.up_encoders[i as usize]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
 fn t2w_copy_embedding_row(dst: &f32, emb: &TensorView, token_id: u32, hidden: usize, vocab: usize) bool {
     if token_id as usize >= vocab {
         _ = printf("error: token2wav token id=%u exceeds vocab=%zu\n", token_id, vocab);
@@ -1282,6 +1445,56 @@ fn t2w_fill_deterministic_noise(dst: &f32, count: usize, temperature: f32) void 
     }
 }
 
+fn t2w_write_u32_le(dst: &byte, offset: usize, value: u32) void {
+    dst[offset] = (value & (0xff as u32)) as byte;
+    dst[offset + (1 as usize)] = ((value >> 8) & (0xff as u32)) as byte;
+    dst[offset + (2 as usize)] = ((value >> 16) & (0xff as u32)) as byte;
+    dst[offset + (3 as usize)] = ((value >> 24) & (0xff as u32)) as byte;
+}
+
+fn t2w_write_all(fd: i32, src: &const byte, count: usize, path: &const byte, label: &const byte) bool {
+    var done: usize = 0;
+    while done < count {
+        const write_result: !isize = sys_write(fd, (&src[done]) as *const byte, count - done);
+        const wrote: isize = write_result catch {
+            _ = printf("error: token2wav dump %s write syscall failed path=%s\n", label, path);
+            return false;
+        };
+        if wrote <= (0 as isize) {
+            _ = printf("error: token2wav dump %s short write path=%s wrote=%lld remaining=%zu\n", label, path, wrote as i64, count - done);
+            return false;
+        }
+        done = done + (wrote as usize);
+    }
+    return true;
+}
+
+fn t2w_mel_dump_write(path: &const byte, mel_values: &f32, mel_frames: usize) bool {
+    if mel_frames > 0xffffffff as usize { _ = printf("error: token2wav mel dump frames=%zu exceed u32 header limit\n", mel_frames); return false; }
+    const fd_result: !i32 = sys_open(path as *const byte, (O_WRONLY | O_CREAT | O_TRUNC) as i32, 420);
+    const fd: i32 = fd_result catch {
+        _ = printf("error: token2wav mel dump open failed path=%s\n", path);
+        return false;
+    };
+    var header: [byte: 16] = [];
+    t2w_write_u32_le(&header[0], 0, T2W_MEL_DUMP_MAGIC);
+    t2w_write_u32_le(&header[0], 4, T2W_MEL_DUMP_VERSION);
+    t2w_write_u32_le(&header[0], 8, mel_frames as u32);
+    t2w_write_u32_le(&header[0], 12, T2W_FLOW_MEL as u32);
+    if !t2w_write_all(fd, &header[0] as &const byte, 16, path, "header\0" as &const byte) { _ = sys_close(fd); return false; }
+    const data_bytes: usize = mel_frames * T2W_FLOW_MEL * 4;
+    if data_bytes > 0 {
+        if !t2w_write_all(fd, mel_values as &const byte, data_bytes, path, "payload\0" as &const byte) { _ = sys_close(fd); return false; }
+    }
+    const close_result: !i32 = sys_close(fd);
+    close_result catch {
+        _ = printf("error: token2wav mel dump close failed path=%s\n", path);
+        return false;
+    };
+    _ = printf("token2wav mel dump: path=%s format=uyml-f32 frames=%zu mel_bins=%zu bytes=%zu\n", path, mel_frames, T2W_FLOW_MEL, data_bytes + 16);
+    return true;
+}
+
 fn t2w_append_mel_time_major(dst: &f32, dst_frames: &usize, src: &const f32, src_frames: usize) void {
     var i: usize = 0;
     const dst_offset: usize = (*dst_frames) * T2W_FLOW_MEL;
@@ -1389,7 +1602,7 @@ fn t2w_run_flow_window(out: &f32, out_frames: &usize, spk_proj: &const f32, toke
 
 fn t2w_flow_probe_usage() void {
     _ = printf("usage: minicpm-o-uya token2wav-flow-probe <flow_matching.gguf> <flow_extra.gguf> <prompt_cache.gguf> <audio_tokens_chunk.txt>\n");
-    _ = printf("  [--token-limit N] [--block-limit N] [--n-timesteps N] [--zero-mu|--embed-mu] [--session]\n");
+    _ = printf("  [--token-limit N] [--block-limit N] [--n-timesteps N] [--zero-mu|--embed-mu] [--session] [--dump-f32 out.uyml]\n");
 }
 
 export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
@@ -1432,6 +1645,12 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
         if strcmp(argv[i] as *const byte, "--session\0" as *const byte) == 0 {
             probe.session = true;
             i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--dump-f32\0" as *const byte) == 0 {
+            if i + 1 >= argc { t2w_flow_probe_usage(); return 1; }
+            probe.dump_path = argv[i + 1] as &const byte;
+            i = i + 2;
             continue;
         }
         t2w_flow_probe_usage();
@@ -1570,6 +1789,13 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
         }
         _ = printf("token2wav flow probe: mode=session-%s tokens_total=%zu tokens_used=%zu windows=%u blocks=%zu/%u emitted_frames=%zu n_timesteps=%zu temperature_bits=0x%x\n", mode, token_count, tokens_used, call_index, blocks_used, matching.block_count, emitted_frames, n_timesteps, prompt_config.temperature_bits);
         _ = printf("token2wav flow probe: up_rate=%u chunk_total=%u chunk_main=%u pre_lookahead=%u checksum_spk=0x%x checksum_out=0x%x\n", prompt_config.up_rate, prompt_config.chunk_total, prompt_config.chunk_main, prompt_config.pre_lookahead, t2w_checksum_f32(spk_proj as &const f32, T2W_FLOW_MEL), t2w_checksum_f32(stream_out as &const f32, emitted_frames * T2W_FLOW_MEL));
+        if probe.dump_path != null {
+            if !t2w_mel_dump_write(probe.dump_path, stream_out, emitted_frames) {
+                free(stream_out as &void); free(window_out as &void); free(tail_tokens as &void); free(spk_norm as &void); free(spk_proj as &void);
+                t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+                return 1;
+            }
+        }
         _ = printf("token2wav flow probe: PASS\n");
         free(stream_out as &void); free(window_out as &void); free(tail_tokens as &void); free(spk_norm as &void); free(spk_proj as &void);
         t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
@@ -1591,6 +1817,14 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
     _ = printf("token2wav flow probe: mode=%s tokens_total=%zu tokens_used=%zu blocks=%zu/%u mel_frames=%zu n_timesteps=%zu temperature_bits=0x%x\n", mode, token_count, tokens_used, blocks_used, matching.block_count, single_frames, n_timesteps, prompt_config.temperature_bits);
     _ = printf("token2wav flow probe: up_rate=%u pre_lookahead=%u checksum_spk=0x%x checksum_out=0x%x\n", prompt_config.up_rate, prompt_config.pre_lookahead, t2w_checksum_f32(spk_proj as &const f32, T2W_FLOW_MEL), t2w_checksum_f32(single_out as &const f32, single_frames * T2W_FLOW_MEL));
     _ = printf("token2wav flow probe: out0=%.6f out1=%.6f out2=%.6f\n", single_out[0], out1, out2);
+    if probe.dump_path != null {
+        if !t2w_mel_dump_write(probe.dump_path, single_out, single_frames) {
+            free(single_out as &void);
+            free(spk_norm as &void); free(spk_proj as &void);
+            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+            return 1;
+        }
+    }
     _ = printf("token2wav flow probe: PASS\n");
     free(single_out as &void);
     free(spk_norm as &void);

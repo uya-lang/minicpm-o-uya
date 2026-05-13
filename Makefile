@@ -253,7 +253,7 @@ token2wav-window-probe: build
 
 token2wav-flow-probe: build
 	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_AUDIO_TOKENS_TXT)" ]; then \
-		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_AUDIO_TOKENS_TXT=/path/to/audio_tokens_chunk.txt [MINICPM_O_T2W_TOKEN_LIMIT=2] [MINICPM_O_T2W_BLOCK_LIMIT=2] [MINICPM_O_T2W_N_TIMESTEPS=5] [MINICPM_O_T2W_ZERO_MU=1] make token2wav-flow-probe"; \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_AUDIO_TOKENS_TXT=/path/to/audio_tokens_chunk.txt [MINICPM_O_T2W_TOKEN_LIMIT=2] [MINICPM_O_T2W_BLOCK_LIMIT=2] [MINICPM_O_T2W_N_TIMESTEPS=5] [MINICPM_O_T2W_ZERO_MU=1] [MINICPM_O_T2W_SESSION=1] [MINICPM_O_T2W_DUMP_F32=/tmp/out.uyml] make token2wav-flow-probe"; \
 		exit 2; \
 	fi
 	$(OUT) token2wav-flow-probe \
@@ -264,6 +264,8 @@ token2wav-flow-probe: build
 		--token-limit "$${MINICPM_O_T2W_TOKEN_LIMIT:-2}" \
 		--block-limit "$${MINICPM_O_T2W_BLOCK_LIMIT:-2}" \
 		--n-timesteps "$${MINICPM_O_T2W_N_TIMESTEPS:-5}" \
+		$$( [ -n "$${MINICPM_O_T2W_DUMP_F32:-}" ] && printf '%s' "--dump-f32 $${MINICPM_O_T2W_DUMP_F32}" ) \
+		$$( [ "$${MINICPM_O_T2W_SESSION:-0}" = "1" ] && printf '%s' --session ) \
 		$$(if [ "$${MINICPM_O_T2W_ZERO_MU:-0}" = "1" ]; then printf '%s' --zero-mu; else printf '%s' --embed-mu; fi)
 
 tts-condition-probe: build
