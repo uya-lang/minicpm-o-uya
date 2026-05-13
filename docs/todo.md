@@ -530,6 +530,7 @@
   - [x] `flow_matching` bind 已补齐 `bias/q_norm.bias/conv bias/mlp bias/final bias` 等张量校验，不再只检查主 weight。
   - [x] 新增 `token2wav-flow-probe` / `make token2wav-flow-probe`，可在官方 `flow_matching.gguf` + `flow_extra.gguf` + `prompt_cache.gguf` 上跑 reference `speaker affine + timestep embed + attention + conv + MLP + final linear`。
   - [x] `token2wav-flow-probe` 当前支持 `--token-limit`、`--block-limit`、`--n-timesteps`、`--zero-mu|--embed-mu`，便于在小窗口上先验证数学链路。
+  - [x] `token2wav-flow-probe --session` 现已按 `prompt_cache.gguf` 的 `chunk_total/chunk_main/pre_lookahead` 重放完整滑窗时序，并输出每窗 `emit_frames/checksum` 与总 mel checksum。
   - [ ] 当前 probe 仍使用 surrogate `mu`，还未接入 `encoder.gguf` 的真实 conformer/upsample forward。
 - [ ] 实现 hifigan2 vocoder forward，输出 24 kHz mono PCM。
 - [ ] 实现流式 WAV chunk 写入，并支持最终 concat 成完整回答 wav。
@@ -550,6 +551,7 @@
   - [x] 支持单轮 `--input-prefix PREFIX`，自动解析 `PREFIX_0000.wav` 为 ref、`PREFIX_0001.wav` 为 user。
   - [x] `--test-prefix PREFIX --count N` 会逐个 probe `PREFIX_0001.wav..PREFIX_%04u.wav`，用于多 user turn 输入审计。
 - [ ] 输出回答文本、answer wav、turn wav、audio token chunks、timing log。
+  - [x] `audio2audio-real --text-only/--no-tts --out PATH` 现已写出 `PATH.txt` 与 `PATH.timing.log`，记录回答文本与 `audio_load/prefill/first_token/decode/total` 时序。
 - [x] 增加 `--text-only`、`--no-tts`、`--dump-hidden`、`--dump-embeddings` 诊断模式。
 - [x] 所有真实模型命令默认要求显式路径，不从仓库内隐式下载模型。
 

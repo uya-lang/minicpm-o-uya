@@ -63,6 +63,7 @@ const T2W_FLOW_SPK: usize = 192;
 const T2W_FLOW_IN: usize = 320;
 const T2W_FLOW_T_EMBED: usize = 256;
 const T2W_FLOW_MAX_BLOCKS: usize = 64;
+const T2W_PAD_TOKEN_DEFAULT: u32 = 4218;
 
 struct T2WFlowExtraWeights {
     input_embedding: &TensorView,
@@ -119,6 +120,7 @@ struct T2WFlowProbeConfig {
     block_limit: u32,
     n_timesteps: u32,
     zero_mu: bool,
+    session: bool,
 }
 
 fn t2w_dtype_supported(dtype: TensorDType) bool {
@@ -213,6 +215,7 @@ fn t2w_flow_probe_config_init() T2WFlowProbeConfig {
         block_limit: 2,
         n_timesteps: 0,
         zero_mu: false,
+        session: false,
     };
 }
 
@@ -1279,9 +1282,114 @@ fn t2w_fill_deterministic_noise(dst: &f32, count: usize, temperature: f32) void 
     }
 }
 
+fn t2w_append_mel_time_major(dst: &f32, dst_frames: &usize, src: &const f32, src_frames: usize) void {
+    var i: usize = 0;
+    const dst_offset: usize = (*dst_frames) * T2W_FLOW_MEL;
+    while i < src_frames * T2W_FLOW_MEL {
+        dst[dst_offset + i] = src[i];
+        i = i + 1;
+    }
+    dst_frames[0] = dst_frames[0] + src_frames;
+}
+
+fn t2w_run_flow_window(out: &f32, out_frames: &usize, spk_proj: &const f32, tokens: &const u32, token_count: usize, blocks_used: usize, n_timesteps: usize, up_rate: usize, temperature: f32, zero_mu: bool, extra: &T2WFlowExtraWeights, matching: &T2WFlowMatchingWeights) bool {
+    const mel_frames: usize = token_count * up_rate;
+    out_frames[0] = 0;
+    if mel_frames == 0 { return true; }
+    const mu: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-mu\0" as &const byte);
+    const cond: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-cond\0" as &const byte);
+    const x_noise: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-noise\0" as &const byte);
+    const x_cur: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-state\0" as &const byte);
+    const x_cat: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_IN, "flow-x-cat\0" as &const byte);
+    const hidden: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_HIDDEN, "flow-hidden\0" as &const byte);
+    const t_freq: &f32 = t2w_alloc_f32(T2W_FLOW_T_EMBED, "flow-t-freq\0" as &const byte);
+    const t_embed1: &f32 = t2w_alloc_f32(T2W_FLOW_HIDDEN, "flow-t-embed1\0" as &const byte);
+    const t_embed2: &f32 = t2w_alloc_f32(T2W_FLOW_HIDDEN, "flow-t-embed2\0" as &const byte);
+    const mel_out: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-out\0" as &const byte);
+    const t_span: &f32 = t2w_alloc_f32(n_timesteps + (1 as usize), "flow-t-span\0" as &const byte);
+    if mu == null || cond == null || x_noise == null || x_cur == null || x_cat == null || hidden == null || t_freq == null || t_embed1 == null || t_embed2 == null || mel_out == null || t_span == null {
+        if mu != null { free(mu as &void); }
+        if cond != null { free(cond as &void); }
+        if x_noise != null { free(x_noise as &void); }
+        if x_cur != null { free(x_cur as &void); }
+        if x_cat != null { free(x_cat as &void); }
+        if hidden != null { free(hidden as &void); }
+        if t_freq != null { free(t_freq as &void); }
+        if t_embed1 != null { free(t_embed1 as &void); }
+        if t_embed2 != null { free(t_embed2 as &void); }
+        if mel_out != null { free(mel_out as &void); }
+        if t_span != null { free(t_span as &void); }
+        return false;
+    }
+    var zero_i: usize = 0;
+    while zero_i < mel_frames * T2W_FLOW_MEL {
+        mu[zero_i] = 0.0;
+        cond[zero_i] = 0.0;
+        zero_i = zero_i + 1;
+    }
+    if !zero_mu {
+        if !t2w_build_surrogate_mu(mu, tokens, token_count, extra, up_rate) {
+            free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
+            return false;
+        }
+    }
+    t2w_fill_deterministic_noise(x_noise, mel_frames * T2W_FLOW_MEL, temperature);
+    var copy_i: usize = 0;
+    while copy_i < mel_frames * T2W_FLOW_MEL { x_cur[copy_i] = x_noise[copy_i]; copy_i = copy_i + 1; }
+    t2w_build_cosine_t_span(t_span, n_timesteps);
+    var step: usize = 0;
+    while step < n_timesteps {
+        var frame: usize = 0;
+        while frame < mel_frames {
+            var ch: usize = 0;
+            while ch < T2W_FLOW_MEL {
+                x_cat[frame * T2W_FLOW_IN + ch] = x_cur[frame * T2W_FLOW_MEL + ch];
+                x_cat[frame * T2W_FLOW_IN + T2W_FLOW_MEL + ch] = mu[frame * T2W_FLOW_MEL + ch];
+                x_cat[frame * T2W_FLOW_IN + T2W_FLOW_MEL * 2 + ch] = spk_proj[ch];
+                x_cat[frame * T2W_FLOW_IN + T2W_FLOW_MEL * 3 + ch] = cond[frame * T2W_FLOW_MEL + ch];
+                ch = ch + 1;
+            }
+            frame = frame + 1;
+        }
+        t2w_timestep_embedding(t_freq, T2W_FLOW_T_EMBED, t_span[step]);
+        t2w_linear_vec(t_embed1, t_freq as &const f32, T2W_FLOW_T_EMBED, T2W_FLOW_HIDDEN, matching.t_embed1_weight, matching.t_embed1_bias);
+        var ti: usize = 0;
+        while ti < T2W_FLOW_HIDDEN { t_embed1[ti] = silu(t_embed1[ti]); ti = ti + 1; }
+        t2w_linear_vec(t_embed2, t_embed1 as &const f32, T2W_FLOW_HIDDEN, T2W_FLOW_HIDDEN, matching.t_embed2_weight, matching.t_embed2_bias);
+        t2w_linear_seq(hidden, x_cat as &const f32, mel_frames, T2W_FLOW_IN, T2W_FLOW_HIDDEN, matching.in_proj_weight, matching.in_proj_bias);
+        var block_index: usize = 0;
+        while block_index < blocks_used {
+            if !t2w_flow_block_forward(hidden, mel_frames, t_embed2 as &const f32, &matching.blocks[block_index]) {
+                free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
+                return false;
+            }
+            block_index = block_index + 1;
+        }
+        if !t2w_flow_final_forward(mel_out, hidden as &const f32, mel_frames, t_embed2 as &const f32, matching) {
+            free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
+            return false;
+        }
+        const dt: f32 = t_span[step + 1] - t_span[step];
+        var mel_index: usize = 0;
+        while mel_index < mel_frames * T2W_FLOW_MEL {
+            x_cur[mel_index] = x_cur[mel_index] + mel_out[mel_index] * dt;
+            mel_index = mel_index + 1;
+        }
+        step = step + 1;
+    }
+    copy_i = 0;
+    while copy_i < mel_frames * T2W_FLOW_MEL {
+        out[copy_i] = x_cur[copy_i];
+        copy_i = copy_i + 1;
+    }
+    out_frames[0] = mel_frames;
+    free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
+    return true;
+}
+
 fn t2w_flow_probe_usage() void {
     _ = printf("usage: minicpm-o-uya token2wav-flow-probe <flow_matching.gguf> <flow_extra.gguf> <prompt_cache.gguf> <audio_tokens_chunk.txt>\n");
-    _ = printf("  [--token-limit N] [--block-limit N] [--n-timesteps N] [--zero-mu|--embed-mu]\n");
+    _ = printf("  [--token-limit N] [--block-limit N] [--n-timesteps N] [--zero-mu|--embed-mu] [--session]\n");
 }
 
 export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
@@ -1318,6 +1426,11 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
         }
         if strcmp(argv[i] as *const byte, "--embed-mu\0" as *const byte) == 0 {
             probe.zero_mu = false;
+            i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--session\0" as *const byte) == 0 {
+            probe.session = true;
             i = i + 1;
             continue;
         }
@@ -1378,35 +1491,12 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
     if n_timesteps == 0 { n_timesteps = 1; }
     var up_rate: usize = 2;
     if prompt_config.up_rate != 0 { up_rate = prompt_config.up_rate as usize; }
-    const mel_frames: usize = tokens_used * up_rate;
     const temperature: f32 = t2w_bits_f32(prompt_config.temperature_bits);
     const spk_norm: &f32 = t2w_alloc_f32(T2W_FLOW_SPK, "flow-spk-norm\0" as &const byte);
     const spk_proj: &f32 = t2w_alloc_f32(T2W_FLOW_MEL, "flow-spk-proj\0" as &const byte);
-    const mu: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-mu\0" as &const byte);
-    const cond: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-cond\0" as &const byte);
-    const x_noise: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-noise\0" as &const byte);
-    const x_cur: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-state\0" as &const byte);
-    const x_cat: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_IN, "flow-x-cat\0" as &const byte);
-    const hidden: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_HIDDEN, "flow-hidden\0" as &const byte);
-    const t_freq: &f32 = t2w_alloc_f32(T2W_FLOW_T_EMBED, "flow-t-freq\0" as &const byte);
-    const t_embed1: &f32 = t2w_alloc_f32(T2W_FLOW_HIDDEN, "flow-t-embed1\0" as &const byte);
-    const t_embed2: &f32 = t2w_alloc_f32(T2W_FLOW_HIDDEN, "flow-t-embed2\0" as &const byte);
-    const mel_out: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-out\0" as &const byte);
-    const t_span: &f32 = t2w_alloc_f32(n_timesteps + (1 as usize), "flow-t-span\0" as &const byte);
-    if spk_norm == null || spk_proj == null || mu == null || cond == null || x_noise == null || x_cur == null || x_cat == null || hidden == null || t_freq == null || t_embed1 == null || t_embed2 == null || mel_out == null || t_span == null {
+    if spk_norm == null || spk_proj == null {
         if spk_norm != null { free(spk_norm as &void); }
         if spk_proj != null { free(spk_proj as &void); }
-        if mu != null { free(mu as &void); }
-        if cond != null { free(cond as &void); }
-        if x_noise != null { free(x_noise as &void); }
-        if x_cur != null { free(x_cur as &void); }
-        if x_cat != null { free(x_cat as &void); }
-        if hidden != null { free(hidden as &void); }
-        if t_freq != null { free(t_freq as &void); }
-        if t_embed1 != null { free(t_embed1 as &void); }
-        if t_embed2 != null { free(t_embed2 as &void); }
-        if mel_out != null { free(mel_out as &void); }
-        if t_span != null { free(t_span as &void); }
         t2w_close_table(&prompt_table);
         t2w_close_table(&flow_extra_table);
         t2w_close_table(&flow_matching_table);
@@ -1414,88 +1504,97 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
     }
     t2w_l2_normalize(spk_norm, spk_cb.data as &const f32, T2W_FLOW_SPK, 0.000000000001 as f32);
     t2w_linear_vec(spk_proj, spk_norm as &const f32, T2W_FLOW_SPK, T2W_FLOW_MEL, extra.spk_affine_weight, extra.spk_affine_bias);
-    var zero_i: usize = 0;
-    while zero_i < mel_frames * T2W_FLOW_MEL {
-        mu[zero_i] = 0.0;
-        cond[zero_i] = 0.0;
-        zero_i = zero_i + 1;
-    }
-    if !probe.zero_mu {
-        if !t2w_build_surrogate_mu(mu, &tokens[0] as &const u32, tokens_used, &extra, up_rate) {
-            free(spk_norm as &void); free(spk_proj as &void); free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
+    var mode: &const byte = "embed-mu\0" as &const byte;
+    if probe.zero_mu { mode = "zero-mu\0" as &const byte; }
+    if probe.session {
+        if prompt_config.chunk_total == 0 || prompt_config.chunk_main == 0 || prompt_config.chunk_total < prompt_config.chunk_main {
+            _ = printf("error: token2wav flow session invalid window config chunk_total=%u chunk_main=%u\n", prompt_config.chunk_total, prompt_config.chunk_main);
+            free(spk_norm as &void); free(spk_proj as &void);
             t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
             return 1;
         }
-    }
-    t2w_fill_deterministic_noise(x_noise, mel_frames * T2W_FLOW_MEL, temperature);
-    var copy_i: usize = 0;
-    while copy_i < mel_frames * T2W_FLOW_MEL { x_cur[copy_i] = x_noise[copy_i]; copy_i = copy_i + 1; }
-    t2w_build_cosine_t_span(t_span, n_timesteps);
-    var step: usize = 0;
-    while step < n_timesteps {
-        var frame: usize = 0;
-        while frame < mel_frames {
-            var ch: usize = 0;
-            while ch < T2W_FLOW_MEL {
-                x_cat[frame * T2W_FLOW_IN + ch] = x_cur[frame * T2W_FLOW_MEL + ch];
-                x_cat[frame * T2W_FLOW_IN + T2W_FLOW_MEL + ch] = mu[frame * T2W_FLOW_MEL + ch];
-                x_cat[frame * T2W_FLOW_IN + T2W_FLOW_MEL * 2 + ch] = spk_proj[ch];
-                x_cat[frame * T2W_FLOW_IN + T2W_FLOW_MEL * 3 + ch] = cond[frame * T2W_FLOW_MEL + ch];
-                ch = ch + 1;
-            }
-            frame = frame + 1;
+        const window_tokens_cap: usize = prompt_config.chunk_total as usize;
+        const window_frames_cap: usize = window_tokens_cap * up_rate;
+        const stream_frames_cap: usize = tokens_used * up_rate;
+        const stream_out: &f32 = t2w_alloc_f32(stream_frames_cap * T2W_FLOW_MEL, "flow-session-out\0" as &const byte);
+        const window_out: &f32 = t2w_alloc_f32(window_frames_cap * T2W_FLOW_MEL, "flow-session-window\0" as &const byte);
+        const tail_tokens: &u32 = calloc(window_tokens_cap, 4) as &u32;
+        if stream_out == null || window_out == null || tail_tokens == null {
+            if stream_out != null { free(stream_out as &void); }
+            if window_out != null { free(window_out as &void); }
+            if tail_tokens != null { free(tail_tokens as &void); }
+            free(spk_norm as &void); free(spk_proj as &void);
+            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+            return 1;
         }
-        t2w_timestep_embedding(t_freq, T2W_FLOW_T_EMBED, t_span[step]);
-        t2w_linear_vec(t_embed1, t_freq as &const f32, T2W_FLOW_T_EMBED, T2W_FLOW_HIDDEN, matching.t_embed1_weight, matching.t_embed1_bias);
-        var ti: usize = 0;
-        while ti < T2W_FLOW_HIDDEN { t_embed1[ti] = silu(t_embed1[ti]); ti = ti + 1; }
-        t2w_linear_vec(t_embed2, t_embed1 as &const f32, T2W_FLOW_HIDDEN, T2W_FLOW_HIDDEN, matching.t_embed2_weight, matching.t_embed2_bias);
-        t2w_linear_seq(hidden, x_cat as &const f32, mel_frames, T2W_FLOW_IN, T2W_FLOW_HIDDEN, matching.in_proj_weight, matching.in_proj_bias);
-        var block_index: usize = 0;
-        while block_index < blocks_used {
-            if !t2w_flow_block_forward(hidden, mel_frames, t_embed2 as &const f32, &matching.blocks[block_index]) {
-                free(spk_norm as &void); free(spk_proj as &void); free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
+        var emitted_frames: usize = 0;
+        var consumed: usize = 0;
+        var call_index: u32 = 0;
+        while tokens_used - consumed >= window_tokens_cap {
+            var full_frames: usize = 0;
+            if !t2w_run_flow_window(window_out, &full_frames, spk_proj as &const f32, &tokens[consumed] as &const u32, window_tokens_cap, blocks_used, n_timesteps, up_rate, temperature, probe.zero_mu, &extra, &matching) {
+                free(stream_out as &void); free(window_out as &void); free(tail_tokens as &void); free(spk_norm as &void); free(spk_proj as &void);
                 t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
                 return 1;
             }
-            block_index = block_index + 1;
+            var emit_frames: usize = prompt_config.chunk_main as usize * up_rate;
+            if emit_frames > full_frames { emit_frames = full_frames; }
+            t2w_append_mel_time_major(stream_out, &emitted_frames, window_out as &const f32, emit_frames);
+            _ = printf("token2wav flow session[%u]: mode=full start=%zu size=%u emit_frames=%zu first=%u last=%u checksum=0x%x\n", call_index, consumed, prompt_config.chunk_total, emit_frames, tokens[consumed], tokens[consumed + window_tokens_cap - 1], t2w_checksum_f32(window_out as &const f32, emit_frames * T2W_FLOW_MEL));
+            consumed = consumed + prompt_config.chunk_main as usize;
+            call_index = call_index + 1;
         }
-        if !t2w_flow_final_forward(mel_out, hidden as &const f32, mel_frames, t_embed2 as &const f32, &matching) {
-            free(spk_norm as &void); free(spk_proj as &void); free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
-            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
-            return 1;
+        const tail_count: usize = tokens_used - consumed;
+        if tail_count > 0 {
+            var fill_i: usize = 0;
+            while fill_i < window_tokens_cap {
+                tail_tokens[fill_i] = T2W_PAD_TOKEN_DEFAULT;
+                fill_i = fill_i + 1;
+            }
+            fill_i = 0;
+            while fill_i < tail_count {
+                tail_tokens[fill_i] = tokens[consumed + fill_i];
+                fill_i = fill_i + 1;
+            }
+            var tail_frames_full: usize = 0;
+            if !t2w_run_flow_window(window_out, &tail_frames_full, spk_proj as &const f32, tail_tokens as &const u32, window_tokens_cap, blocks_used, n_timesteps, up_rate, temperature, probe.zero_mu, &extra, &matching) {
+                free(stream_out as &void); free(window_out as &void); free(tail_tokens as &void); free(spk_norm as &void); free(spk_proj as &void);
+                t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+                return 1;
+            }
+            var emit_tail_frames: usize = tail_count * up_rate;
+            if emit_tail_frames > tail_frames_full { emit_tail_frames = tail_frames_full; }
+            t2w_append_mel_time_major(stream_out, &emitted_frames, window_out as &const f32, emit_tail_frames);
+            _ = printf("token2wav flow session[%u]: mode=tail start=%zu size=%zu emit_frames=%zu first=%u last=%u checksum=0x%x\n", call_index, consumed, tail_count, emit_tail_frames, tail_tokens[0], tail_tokens[tail_count - 1], t2w_checksum_f32(window_out as &const f32, emit_tail_frames * T2W_FLOW_MEL));
+            call_index = call_index + 1;
         }
-        const dt: f32 = t_span[step + 1] - t_span[step];
-        var mel_index: usize = 0;
-        while mel_index < mel_frames * T2W_FLOW_MEL {
-            x_cur[mel_index] = x_cur[mel_index] + mel_out[mel_index] * dt;
-            mel_index = mel_index + 1;
-        }
-        step = step + 1;
+        _ = printf("token2wav flow probe: mode=session-%s tokens_total=%zu tokens_used=%zu windows=%u blocks=%zu/%u emitted_frames=%zu n_timesteps=%zu temperature_bits=0x%x\n", mode, token_count, tokens_used, call_index, blocks_used, matching.block_count, emitted_frames, n_timesteps, prompt_config.temperature_bits);
+        _ = printf("token2wav flow probe: up_rate=%u chunk_total=%u chunk_main=%u pre_lookahead=%u checksum_spk=0x%x checksum_out=0x%x\n", prompt_config.up_rate, prompt_config.chunk_total, prompt_config.chunk_main, prompt_config.pre_lookahead, t2w_checksum_f32(spk_proj as &const f32, T2W_FLOW_MEL), t2w_checksum_f32(stream_out as &const f32, emitted_frames * T2W_FLOW_MEL));
+        _ = printf("token2wav flow probe: PASS\n");
+        free(stream_out as &void); free(window_out as &void); free(tail_tokens as &void); free(spk_norm as &void); free(spk_proj as &void);
+        t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+        return 0;
     }
-    var mode: &const byte = "embed-mu\0" as &const byte;
-    if probe.zero_mu { mode = "zero-mu\0" as &const byte; }
+    const mel_frames: usize = tokens_used * up_rate;
+    const single_out: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-single-out\0" as &const byte);
+    var single_frames: usize = 0;
+    if single_out == null || !t2w_run_flow_window(single_out, &single_frames, spk_proj as &const f32, &tokens[0] as &const u32, tokens_used, blocks_used, n_timesteps, up_rate, temperature, probe.zero_mu, &extra, &matching) {
+        if single_out != null { free(single_out as &void); }
+        free(spk_norm as &void); free(spk_proj as &void);
+        t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+        return 1;
+    }
     var out1: f32 = 0.0;
     var out2: f32 = 0.0;
-    if mel_frames * T2W_FLOW_MEL > 1 { out1 = x_cur[1]; }
-    if mel_frames * T2W_FLOW_MEL > 2 { out2 = x_cur[2]; }
-    _ = printf("token2wav flow probe: mode=%s tokens_total=%zu tokens_used=%zu blocks=%zu/%u mel_frames=%zu n_timesteps=%zu temperature_bits=0x%x\n", mode, token_count, tokens_used, blocks_used, matching.block_count, mel_frames, n_timesteps, prompt_config.temperature_bits);
-    _ = printf("token2wav flow probe: up_rate=%u pre_lookahead=%u cfg_rate=0.0 checksum_spk=0x%x checksum_mu=0x%x checksum_noise=0x%x checksum_out=0x%x\n", prompt_config.up_rate, prompt_config.pre_lookahead, t2w_checksum_f32(spk_proj as &const f32, T2W_FLOW_MEL), t2w_checksum_f32(mu as &const f32, mel_frames * T2W_FLOW_MEL), t2w_checksum_f32(x_noise as &const f32, mel_frames * T2W_FLOW_MEL), t2w_checksum_f32(x_cur as &const f32, mel_frames * T2W_FLOW_MEL));
-    _ = printf("token2wav flow probe: t_span[0]=%.6f t_span[last]=%.6f out0=%.6f out1=%.6f out2=%.6f\n", t_span[0], t_span[n_timesteps], x_cur[0], out1, out2);
+    if single_frames * T2W_FLOW_MEL > 1 { out1 = single_out[1]; }
+    if single_frames * T2W_FLOW_MEL > 2 { out2 = single_out[2]; }
+    _ = printf("token2wav flow probe: mode=%s tokens_total=%zu tokens_used=%zu blocks=%zu/%u mel_frames=%zu n_timesteps=%zu temperature_bits=0x%x\n", mode, token_count, tokens_used, blocks_used, matching.block_count, single_frames, n_timesteps, prompt_config.temperature_bits);
+    _ = printf("token2wav flow probe: up_rate=%u pre_lookahead=%u checksum_spk=0x%x checksum_out=0x%x\n", prompt_config.up_rate, prompt_config.pre_lookahead, t2w_checksum_f32(spk_proj as &const f32, T2W_FLOW_MEL), t2w_checksum_f32(single_out as &const f32, single_frames * T2W_FLOW_MEL));
+    _ = printf("token2wav flow probe: out0=%.6f out1=%.6f out2=%.6f\n", single_out[0], out1, out2);
     _ = printf("token2wav flow probe: PASS\n");
+    free(single_out as &void);
     free(spk_norm as &void);
     free(spk_proj as &void);
-    free(mu as &void);
-    free(cond as &void);
-    free(x_noise as &void);
-    free(x_cur as &void);
-    free(x_cat as &void);
-    free(hidden as &void);
-    free(t_freq as &void);
-    free(t_embed1 as &void);
-    free(t_embed2 as &void);
-    free(mel_out as &void);
-    free(t_span as &void);
     t2w_close_table(&prompt_table);
     t2w_close_table(&flow_extra_table);
     t2w_close_table(&flow_matching_table);

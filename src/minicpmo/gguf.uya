@@ -1657,13 +1657,10 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
         return 0;
     }
     if text_path_only {
-        if out_path != null {
-            _ = printf("audio2audio-real: note: --out is ignored in text-only/no-tts mode until WAV synthesis is implemented\n");
-        }
         if test_prefix != null {
-            return audio2audio_real_text_test_prefix_cli(llm_path, audio_path, ref_audio_path, test_prefix, test_count, &sampler, dump_embeddings);
+            return audio2audio_real_text_test_prefix_cli(llm_path, audio_path, ref_audio_path, test_prefix, test_count, &sampler, dump_embeddings, out_path);
         }
-        return audio2audio_real_text_cli(llm_path, audio_path, ref_audio_path, user_audio_path, &sampler, dump_embeddings);
+        return audio2audio_real_text_cli(llm_path, audio_path, ref_audio_path, user_audio_path, &sampler, dump_embeddings, out_path);
     }
     _ = printf("error: audio2audio-real inference is not implemented yet; use --audit-only to validate bundle and input protocol\n");
     _ = printf("audio2audio-real: inference_supported=false next=run-with---no-tts-for-text-only-or-continue-token2wav-and-hifigan-forward\n");
