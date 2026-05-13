@@ -530,8 +530,10 @@
   - [x] `token2wav-flow-probe` 当前支持 `--token-limit`、`--block-limit`、`--n-timesteps`、`--zero-mu|--embed-mu`，便于在小窗口上先验证数学链路。
   - [ ] 当前 probe 仍使用 surrogate `mu`，还未接入 `encoder.gguf` 的真实 conformer/upsample forward。
 - [ ] 实现 hifigan2 vocoder forward，输出 24 kHz mono PCM。
-- [ ] 实现流式 WAV chunk 写入，并支持最终 concat 成完整回答 wav。
-- [ ] 支持 CPU reference 后端；GPU/多线程优化另设后续任务。
+- [x] 实现流式 WAV chunk 写入，并支持最终 concat 成完整回答 wav。
+  - [x] `audio2audio-real` 现会在输出目录落盘 `answer_chunk_*.wav`、`answer.wav`、`turn.wav`，并保留 `audio_tokens_chunk_*.txt/bin` 供逐段对照。
+- [x] 支持 CPU reference 后端；GPU/多线程优化另设后续任务。
+  - [x] 当前接入 `flow_matching + flow_extra + prompt_cache + hifigan2` 核心张量的 CPU reference `tts2wav` 路径，仍明确保留 `surrogate mu` / 非精确 HiFiGAN2 source-resblock 的限制说明。
 
 验收标准：
 
@@ -547,9 +549,8 @@
 - [x] 支持 llama.cpp-omni 测试格式：`--test-prefix PREFIX --count N`，其中 `0000` 是 ref，`0001..` 是 user turn。
   - [x] 支持单轮 `--input-prefix PREFIX`，自动解析 `PREFIX_0000.wav` 为 ref、`PREFIX_0001.wav` 为 user。
   - [x] `--test-prefix PREFIX --count N` 会逐个 probe `PREFIX_0001.wav..PREFIX_%04u.wav`，用于多 user turn 输入审计。
-- [ ] 输出回答文本、answer wav、turn wav、audio token chunks、timing log。
-  - [x] `audio2audio-real` 现已在真实路径落盘 `answer.txt`、`llm_token_ids_chunk_*.txt`、`llm_hidden_states_chunk_*.bin`、`audio_tokens_chunk_*.txt/bin`、`timing.log`。
-  - [ ] `answer.wav`、`turn.wav` 仍依赖 21.6 的 token2wav/HiFiGAN 真 WAV 收尾。
+- [x] 输出回答文本、answer wav、turn wav、audio token chunks、timing log。
+  - [x] `audio2audio-real` 现已在真实路径落盘 `answer.txt`、`llm_token_ids_chunk_*.txt`、`llm_hidden_states_chunk_*.bin`、`audio_tokens_chunk_*.txt/bin`、`answer_chunk_*.wav`、`answer.wav`、`turn.wav`、`timing.log`。
 - [x] 增加 `--text-only`、`--no-tts`、`--dump-hidden`、`--dump-embeddings` 诊断模式。
 - [x] 所有真实模型命令默认要求显式路径，不从仓库内隐式下载模型。
 
@@ -574,12 +575,14 @@ build/minicpm-o-uya audio2audio-real \
 
 ### 21.8 性能对齐与回归
 
-- [ ] 为真实 audio-to-audio 增加 benchmark 指标：load time、audio prefill、LLM prefill、first audio response、total wall time、peak RSS、answer duration、RTF。
-  - [x] `audio2audio-real --text-only` / 完整 TTS audio-token 路径现已输出 `ref/user encode`、`llm load/prefill/decode`、`tts_ms`、`generated_tokens`、`tts_audio_tokens`、`total_ms`，并写入 `timing.log`。
+- [x] 为真实 audio-to-audio 增加 benchmark 指标：load time、audio prefill、LLM prefill、first audio response、total wall time、peak RSS、answer duration、RTF。
+  - [x] `audio2audio-real --text-only` / 完整 TTS audio-token 路径现已输出 `ref/user encode`、`llm load/prefill/decode`、`tts_ms`、`generated_tokens`、`tts_audio_tokens`、`token2wav_ms`、`first_audio_ms`、`peak_rss_kb`、`answer_duration_ms`、`rtf`、`total_ms`，并写入 `timing.log`。
 - [ ] 与 `llama.cpp-omni` 同用例对照，记录 CPU-only 基线。
 - [ ] 增加长音频、短音频、静音、中文、英文、中英混合、复杂多项要求用例。
-- [ ] 增加 deterministic smoke 保持无模型 CI 可跑，真实模型测试只在显式环境变量启用。
-- [ ] 文档记录当前速度预期：第一版先正确，再优化，不承诺立即达到 llama.cpp-omni 性能。
+- [x] 增加 deterministic smoke 保持无模型 CI 可跑，真实模型测试只在显式环境变量启用。
+  - [x] `make test` 现只跑 tiny fixtures；真实 `audio2audio-real-*` 仍通过 `MINICPM_O_REAL_BUNDLE` / 手工命令显式启用。
+- [x] 文档记录当前速度预期：第一版先正确，再优化，不承诺立即达到 llama.cpp-omni 性能。
+  - [x] `docs/audio2audio-real.md` 已明确当前是 correctness-first 的 CPU reference `tts2wav`，并保留 surrogate `mu` / 非精确 HiFiGAN2 parity 的限制说明。
 
 验收标准：
 

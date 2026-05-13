@@ -1562,6 +1562,10 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
         audit_bundle_usage();
         return 1;
     }
+    if !audit_only && !text_path_only && out_path == null {
+        _ = printf("error: audio2audio-real full audio path requires --out so answer.wav/turn.wav and debug artifacts have a directory target\n");
+        return 1;
+    }
     if test_prefix != null {
         if input_prefix != null || ref_audio_path != null || user_audio_path != null {
             _ = printf("error: audio2audio-real --test-prefix cannot be combined with --input-prefix/--ref-audio/--user-audio\n");
@@ -1658,12 +1662,12 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
     } }
     if audit_only {
         _ = printf("audio2audio-real: audit-only PASS files=9\n");
-        _ = printf("audio2audio-real: inference_supported=false next=token2wav-flow-forward-and-hifigan-forward\n");
+        _ = printf("audio2audio-real: runtime_supported=cpu-reference-tts2wav next=run-with--out-for-answer-wav\n");
         return 0;
     }
     if text_path_only {
         return audio2audio_real_text_cli(llm_path, audio_path, ref_audio_path, user_audio_path, &sampler, dump_embeddings);
     }
     _ = printf("audio2audio-real: token2wav bundle validated; running through TTS audio-token generation before final WAV synthesis\n");
-    return audio2audio_real_tts_tokens_cli(llm_path, audio_path, tts_path, projector_path, ref_audio_path, user_audio_path, out_path, &sampler, dump_embeddings);
+    return audio2audio_real_tts_tokens_cli(llm_path, audio_path, tts_path, projector_path, token2wav_dir, ref_audio_path, user_audio_path, out_path, &sampler, dump_embeddings);
 }

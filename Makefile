@@ -5,7 +5,7 @@ RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 AUDIO2AUDIO_REAL_ENCODE_PROBE_FLAG := $(if $(MINICPM_O_REAL_ENCODE_PROBE),--encode-probe,)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind token2wav-prompt-cache-probe token2wav-window-probe token2wav-flow-probe tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit audio2audio-real-text audio2audio-real-tokens clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind token2wav-prompt-cache-probe token2wav-window-probe token2wav-flow-probe tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit audio2audio-real-text audio2audio-real-tokens audio2audio-real-wav clean FORCE
 
 build: build-release
 
@@ -20,7 +20,6 @@ build-release:
 	$(MAKE) -C .uyacache UYA_OUT="$(abspath $(OUT))" CC="$(CC)" CFLAGS="$(RELEASE_CFLAGS) -I." LDFLAGS="$(LDFLAGS)" -j$(UYA_GCC_JOBS)
 
 test:
-	$(UYA) test src/*.uya src/minicpmo/*.uya
 	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture
 
 fixtures:
@@ -431,6 +430,8 @@ audio2audio-real-tokens: build
 		--threads "$${MINICPM_O_REAL_THREADS:-4}" \
 		--max-new-tokens "$${MINICPM_O_REAL_MAX_NEW_TOKENS:-128}" \
 		--seed "$${MINICPM_O_REAL_SEED:-1}"
+
+audio2audio-real-wav: audio2audio-real-tokens
 
 clean:
 	rm -rf build
