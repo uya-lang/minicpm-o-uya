@@ -471,6 +471,7 @@
   - [x] 已与本地 `llama.cpp-omni` `log_mel_spectrogram` dump 做数值误差对齐：`outputs/complex_case2/complex2_0000.wav` 为 `mean_abs=1.2707e-5`、`max_abs=1.4266e-3`，`complex2_0001.wav` 为 `mean_abs=1.2695e-5`、`max_abs=1.4004e-3`；当前默认阈值取 `mean_abs <= 2e-5`、`max_abs <= 2e-3`。
 - [ ] 移除 tiny audio cap，支持真实用户语音长度和多 chunk 输入。
   - [x] 输入 probe 流式扫描真实 WAV/UYAP，不受 tiny mel cap 限制；`audio-real-encode-probe` 已移除 `480000 samples` 上限，可直接跑更长真实音频，但多 chunk 调度仍待补齐。
+  - [x] `audio2audio-real --test-prefix PREFIX --count N` 现已支持真实多 user turn 会话；audio encoder GGUF/filterbank、reference embedding 与 Qwen runtime/KV cache 会在整场会话内复用，不再按 turn 重载。
 - [x] 绑定官方 audio encoder tensors，并实现对应 conv/transformer/projector forward。
   - [x] `audio-bind`/`audio2audio-real --audit-only` 已绑定官方 `encoder.conv*`、24 层 `encoder.blocks.*`、`encoder.ln_post.*`、`audio_projector.linear{1,2}.*`，共 371 个 tensor。
   - [x] `audio-real-encode-probe` 已实现官方 `conv + transformer + projector + pool(5,5)` forward，并输出 `mel_frames/conv_tokens/n_pos/n_embd/checksum/encode_ms`。
@@ -496,16 +497,17 @@
   - [x] 新增 `tts-condition-probe`：读取 `llama.cpp-omni` `llm_token_ids.txt` + `llm_hidden_states.bin`，执行 `emb_text + projector_semantic + L2 normalize + merge`，并可 dump `projected/merged/condition`。
   - [x] 新增 `tests/compare_tts_merge_alignment.py` / `make tts-merge-align`，对照 `llama.cpp-omni` `merged_embeddings.bin`。
   - [x] 本地 `round_000/llm_debug/chunk_{0..3}` 已数值对齐，`mean_abs≈1.4e-8..1.8e-8`、`max_abs=2.384e-7`。
-- [ ] 实现 TTS prefill/decode cache，与 audio_bos、audio_eos、audio token vocabulary 对齐。
+- [x] 实现 TTS prefill/decode cache，与 audio_bos、audio_eos、audio token vocabulary 对齐。
   - [x] 新增 `tts-simplex-probe`：官方 TTS decoder 20 层 forward、assistant prompt prefill、`audio_bos`/`text_eos` 注入、跨 chunk KV cache 与 audio-token history 已可跑通。
-- [ ] 实现 chunked text/hidden-state queue：LLM 每个文本 chunk 同步送入 TTS。
+- [x] 实现 chunked text/hidden-state queue：LLM 每个文本 chunk 同步送入 TTS。
   - [x] `tts-simplex-probe <llm_debug_dir> --count N` 已顺序消费 `chunk_0..chunk_N-1`，并跨 chunk 复用同一套 TTS runtime。
-- [ ] 生成 audio token ids 并保存 `audio_tokens_chunk_*.txt/bin`，格式对齐 llama.cpp-omni。
+- [x] 生成 audio token ids 并保存 `audio_tokens_chunk_*.txt/bin`，格式对齐 llama.cpp-omni。
   - [x] `tts-simplex-probe --out-dir DIR` 已输出相同命名的 `audio_tokens_chunk_*.txt/bin`，内容为 relative audio token ids。
-- [ ] 增加 TTS token 级对照：相同 hidden/text chunk 下，audio token 前 N 个与 baseline 对比。
+- [x] 增加 TTS token 级对照：相同 hidden/text chunk 下，audio token 前 N 个与 baseline 对比。
   - [x] `tts-simplex-probe --compare-dir DIR` 已支持逐 chunk exact compare。
   - [x] `make tts-token-align` / `tests/compare_tts_token_alignment.py` 已支持逐 chunk `count/prefix_match/exact` 汇总。
   - [ ] 当前本地 `round_000/tts_wav` baseline 未固定 sampler seed，暂不作为严格 deterministic token oracle。
+  - [x] `audio2audio-real --test-prefix` 真实路径现会在多 turn 间复用同一套 TTS 权重、tokenizer 与 decoder runtime，仅按 turn 重置 cache/token 状态。
 
 验收标准：
 
@@ -529,7 +531,8 @@
   - [x] 新增 `token2wav-flow-probe` / `make token2wav-flow-probe`，可在官方 `flow_matching.gguf` + `flow_extra.gguf` + `prompt_cache.gguf` 上跑 reference `speaker affine + timestep embed + attention + conv + MLP + final linear`。
   - [x] `token2wav-flow-probe` 当前支持 `--token-limit`、`--block-limit`、`--n-timesteps`、`--zero-mu|--embed-mu`，便于在小窗口上先验证数学链路。
   - [ ] 当前 probe 仍使用 surrogate `mu`，还未接入 `encoder.gguf` 的真实 conformer/upsample forward。
-- [ ] 实现 hifigan2 vocoder forward，输出 24 kHz mono PCM。
+- [x] 实现 hifigan2 vocoder forward，输出 24 kHz mono PCM。
+- [x] `audio2audio-real --test-prefix` 真实路径现会在多 turn 间复用 `prompt_cache.gguf` / `flow_extra.gguf` / `flow_matching.gguf` / `hifigan2.gguf` 的已绑定权重，避免每轮重复 mmap/bind。
 - [x] 实现流式 WAV chunk 写入，并支持最终 concat 成完整回答 wav。
   - [x] `audio2audio-real` 现会在输出目录落盘 `answer_chunk_*.wav`、`answer.wav`、`turn.wav`，并保留 `audio_tokens_chunk_*.txt/bin` 供逐段对照。
 - [x] 支持 CPU reference 后端；GPU/多线程优化另设后续任务。
@@ -548,7 +551,7 @@
 - [x] 支持输入参数：`--ref-audio`、`--user-audio`/`--input-audio`、`--out`。
 - [x] 支持 llama.cpp-omni 测试格式：`--test-prefix PREFIX --count N`，其中 `0000` 是 ref，`0001..` 是 user turn。
   - [x] 支持单轮 `--input-prefix PREFIX`，自动解析 `PREFIX_0000.wav` 为 ref、`PREFIX_0001.wav` 为 user。
-  - [x] `--test-prefix PREFIX --count N` 会逐个 probe `PREFIX_0001.wav..PREFIX_%04u.wav`，用于多 user turn 输入审计。
+  - [x] `--test-prefix PREFIX --count N` 现已覆盖 audit、`--text-only` 与完整 `--out` 路径；多 turn 输出按 `turn_0001_*`、`turn_0002_*` 前缀分桶，最后一轮仍可写回显式 `--out` alias。
 - [x] 输出回答文本、answer wav、turn wav、audio token chunks、timing log。
   - [x] `audio2audio-real` 现已在真实路径落盘 `answer.txt`、`llm_token_ids_chunk_*.txt`、`llm_hidden_states_chunk_*.bin`、`audio_tokens_chunk_*.txt/bin`、`answer_chunk_*.wav`、`answer.wav`、`turn.wav`、`timing.log`。
 - [x] 增加 `--text-only`、`--no-tts`、`--dump-hidden`、`--dump-embeddings` 诊断模式。
@@ -577,6 +580,7 @@ build/minicpm-o-uya audio2audio-real \
 
 - [x] 为真实 audio-to-audio 增加 benchmark 指标：load time、audio prefill、LLM prefill、first audio response、total wall time、peak RSS、answer duration、RTF。
   - [x] `audio2audio-real --text-only` / 完整 TTS audio-token 路径现已输出 `ref/user encode`、`llm load/prefill/decode`、`tts_ms`、`generated_tokens`、`tts_audio_tokens`、`token2wav_ms`、`first_audio_ms`、`peak_rss_kb`、`answer_duration_ms`、`rtf`、`total_ms`，并写入 `timing.log`。
+  - [x] 新增 `make audio2audio-real-prefix-{audit,text,tokens,wav}` 与 `make audio2audio-real-report`；多 turn `--test-prefix` 会话可直接生成 per-turn `timing.log` 报表 JSON，便于后续和 `llama.cpp-omni` 对照。
 - [ ] 与 `llama.cpp-omni` 同用例对照，记录 CPU-only 基线。
 - [ ] 增加长音频、短音频、静音、中文、英文、中英混合、复杂多项要求用例。
 - [x] 增加 deterministic smoke 保持无模型 CI 可跑，真实模型测试只在显式环境变量启用。

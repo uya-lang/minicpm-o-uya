@@ -6,7 +6,9 @@ use minicpmo.audio.audio_real_encode_probe_file;
 use minicpmo.audio.audio_real_preprocess_probe_file;
 use minicpmo.audio.audio_real_bind_file;
 use minicpmo.audio.audio2audio_real_text_cli;
+use minicpmo.audio.audio2audio_real_test_prefix_text_cli;
 use minicpmo.audio.audio2audio_real_tts_tokens_cli;
+use minicpmo.audio.audio2audio_real_test_prefix_tts_tokens_cli;
 use minicpmo.qwen3.Qwen3SamplerConfig;
 use minicpmo.qwen3.qwen3_sampler_init;
 use minicpmo.speech.speech_tts_bind_file;
@@ -1595,11 +1597,6 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
         _ = printf("error: audio2audio-real requires both ref and user audio; use --ref-audio with --user-audio, --input-prefix, or --test-prefix with --count\n");
         return 1;
     }
-    if text_path_only && test_prefix != null {
-        _ = printf("error: audio2audio-real text-only path currently supports a single user turn; use --ref-audio with --user-audio or --input-prefix\n");
-        return 1;
-    }
-
     _ = printf("audio2audio-real: bundle validation\n");
     var ok: bool = true;
     if !audit_bundle_one("llm\0" as &const byte, llm_path) { ok = false; }
@@ -1666,8 +1663,14 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
         return 0;
     }
     if text_path_only {
+        if test_prefix != null {
+            return audio2audio_real_test_prefix_text_cli(llm_path, audio_path, ref_audio_path, test_prefix, test_count, &sampler, dump_embeddings);
+        }
         return audio2audio_real_text_cli(llm_path, audio_path, ref_audio_path, user_audio_path, &sampler, dump_embeddings);
     }
     _ = printf("audio2audio-real: token2wav bundle validated; running through TTS audio-token generation before final WAV synthesis\n");
+    if test_prefix != null {
+        return audio2audio_real_test_prefix_tts_tokens_cli(llm_path, audio_path, tts_path, projector_path, token2wav_dir, ref_audio_path, test_prefix, test_count, out_path, &sampler, dump_embeddings);
+    }
     return audio2audio_real_tts_tokens_cli(llm_path, audio_path, tts_path, projector_path, token2wav_dir, ref_audio_path, user_audio_path, out_path, &sampler, dump_embeddings);
 }

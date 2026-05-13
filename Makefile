@@ -5,7 +5,7 @@ RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 AUDIO2AUDIO_REAL_ENCODE_PROBE_FLAG := $(if $(MINICPM_O_REAL_ENCODE_PROBE),--encode-probe,)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind token2wav-prompt-cache-probe token2wav-window-probe token2wav-flow-probe tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit audio2audio-real-text audio2audio-real-tokens audio2audio-real-wav clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind token2wav-prompt-cache-probe token2wav-window-probe token2wav-flow-probe tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit audio2audio-real-text audio2audio-real-tokens audio2audio-real-wav audio2audio-real-prefix-audit audio2audio-real-prefix-text audio2audio-real-prefix-tokens audio2audio-real-prefix-wav audio2audio-real-report clean FORCE
 
 build: build-release
 
@@ -432,6 +432,70 @@ audio2audio-real-tokens: build
 		--seed "$${MINICPM_O_REAL_SEED:-1}"
 
 audio2audio-real-wav: audio2audio-real-tokens
+
+audio2audio-real-prefix-audit: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_REAL_PREFIX)" ] || [ -z "$(MINICPM_O_REAL_COUNT)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_PREFIX=/path/to/case_prefix MINICPM_O_REAL_COUNT=2 [MINICPM_O_REAL_OUT=/tmp/minicpm-o-uya-answer.wav] [MINICPM_O_REAL_ENCODE_PROBE=1] make audio2audio-real-prefix-audit"; \
+		exit 2; \
+	fi
+	$(OUT) audio2audio-real --audit-only \
+		$(AUDIO2AUDIO_REAL_ENCODE_PROBE_FLAG) \
+		--llm "$(MINICPM_O_REAL_BUNDLE)/MiniCPM-o-4_5-Q4_K_M.gguf" \
+		--audio "$(MINICPM_O_REAL_BUNDLE)/audio/MiniCPM-o-4_5-audio-F16.gguf" \
+		--tts "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf" \
+		--projector "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-projector-F16.gguf" \
+		--token2wav-dir "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf" \
+		--test-prefix "$(MINICPM_O_REAL_PREFIX)" \
+		--count "$(MINICPM_O_REAL_COUNT)" \
+		--out "$${MINICPM_O_REAL_OUT:-/tmp/minicpm-o-uya-answer.wav}"
+
+audio2audio-real-prefix-text: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_REAL_PREFIX)" ] || [ -z "$(MINICPM_O_REAL_COUNT)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_PREFIX=/path/to/case_prefix MINICPM_O_REAL_COUNT=2 [MINICPM_O_REAL_THREADS=4] [MINICPM_O_REAL_MAX_NEW_TOKENS=128] [MINICPM_O_REAL_SEED=1] make audio2audio-real-prefix-text"; \
+		exit 2; \
+	fi
+	$(OUT) audio2audio-real --text-only \
+		--llm "$(MINICPM_O_REAL_BUNDLE)/MiniCPM-o-4_5-Q4_K_M.gguf" \
+		--audio "$(MINICPM_O_REAL_BUNDLE)/audio/MiniCPM-o-4_5-audio-F16.gguf" \
+		--test-prefix "$(MINICPM_O_REAL_PREFIX)" \
+		--count "$(MINICPM_O_REAL_COUNT)" \
+		--threads "$${MINICPM_O_REAL_THREADS:-4}" \
+		--max-new-tokens "$${MINICPM_O_REAL_MAX_NEW_TOKENS:-128}" \
+		--seed "$${MINICPM_O_REAL_SEED:-1}"
+
+audio2audio-real-prefix-tokens: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_REAL_PREFIX)" ] || [ -z "$(MINICPM_O_REAL_COUNT)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_PREFIX=/path/to/case_prefix MINICPM_O_REAL_COUNT=2 [MINICPM_O_REAL_OUT=/tmp/minicpm-o-uya-answer.wav] [MINICPM_O_REAL_THREADS=4] [MINICPM_O_REAL_MAX_NEW_TOKENS=128] [MINICPM_O_REAL_SEED=1] make audio2audio-real-prefix-tokens"; \
+		exit 2; \
+	fi
+	$(OUT) audio2audio-real \
+		--llm "$(MINICPM_O_REAL_BUNDLE)/MiniCPM-o-4_5-Q4_K_M.gguf" \
+		--audio "$(MINICPM_O_REAL_BUNDLE)/audio/MiniCPM-o-4_5-audio-F16.gguf" \
+		--tts "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-tts-F16.gguf" \
+		--projector "$(MINICPM_O_REAL_BUNDLE)/tts/MiniCPM-o-4_5-projector-F16.gguf" \
+		--token2wav-dir "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf" \
+		--test-prefix "$(MINICPM_O_REAL_PREFIX)" \
+		--count "$(MINICPM_O_REAL_COUNT)" \
+		--out "$${MINICPM_O_REAL_OUT:-/tmp/minicpm-o-uya-answer.wav}" \
+		--threads "$${MINICPM_O_REAL_THREADS:-4}" \
+		--max-new-tokens "$${MINICPM_O_REAL_MAX_NEW_TOKENS:-128}" \
+		--seed "$${MINICPM_O_REAL_SEED:-1}"
+
+audio2audio-real-prefix-wav: audio2audio-real-prefix-tokens
+
+audio2audio-real-report:
+	@if [ -z "$(MINICPM_O_REAL_ARTIFACT_DIR)" ] && [ -z "$(MINICPM_O_REAL_OUT)" ]; then \
+		echo "usage: MINICPM_O_REAL_ARTIFACT_DIR=/path/to/output_dir [MINICPM_O_REAL_REPORT=/path/to/report.json] make audio2audio-real-report"; \
+		echo "   or: MINICPM_O_REAL_OUT=/path/to/output/answer.wav [MINICPM_O_REAL_REPORT=/path/to/report.json] make audio2audio-real-report"; \
+		exit 2; \
+	fi
+	@artifact_dir="$(MINICPM_O_REAL_ARTIFACT_DIR)"; \
+	if [ -z "$$artifact_dir" ]; then artifact_dir="$$(dirname "$(MINICPM_O_REAL_OUT)")"; fi; \
+	if [ -n "$(MINICPM_O_REAL_REPORT)" ]; then \
+		python3 tests/audio2audio_real_manifest.py "$$artifact_dir" --output "$(MINICPM_O_REAL_REPORT)"; \
+	else \
+		python3 tests/audio2audio_real_manifest.py "$$artifact_dir"; \
+	fi
 
 clean:
 	rm -rf build

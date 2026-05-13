@@ -86,6 +86,19 @@ export struct Token2WavReferenceRun {
     max_chunk_samples: usize,
 }
 
+export struct Token2WavReferenceSession {
+    prompt_config: T2WPromptCacheConfig,
+    prompt_table: TensorWeightTable,
+    flow_extra_table: TensorWeightTable,
+    flow_matching_table: TensorWeightTable,
+    hifigan_table: TensorWeightTable,
+    extra: T2WFlowExtraWeights,
+    matching: T2WFlowMatchingWeights,
+    hifigan: T2WHifiganLiteWeights,
+    spk_proj: &f32,
+    up_rate: u32,
+}
+
 struct T2WHifiganLiteWeights {
     conv_pre_weight: &TensorView,
     conv_pre_bias: &TensorView,
@@ -270,6 +283,21 @@ export fn token2wav_reference_run_init() Token2WavReferenceRun {
         up_rate: 0,
         n_timesteps: 0,
         max_chunk_samples: 0,
+    };
+}
+
+export fn token2wav_reference_session_init() Token2WavReferenceSession {
+    return Token2WavReferenceSession{
+        prompt_config: t2w_prompt_cache_config_init(),
+        prompt_table: tensor_table_init(),
+        flow_extra_table: tensor_table_init(),
+        flow_matching_table: tensor_table_init(),
+        hifigan_table: tensor_table_init(),
+        extra: t2w_flow_extra_weights_init(),
+        matching: t2w_flow_matching_weights_init(),
+        hifigan: t2w_hifigan_lite_weights_init(),
+        spk_proj: null,
+        up_rate: 0,
     };
 }
 
@@ -1918,12 +1946,35 @@ fn t2w_render_chunk_pcm(weights: &T2WHifiganLiteWeights, mel_values: &const f32,
     return true;
 }
 
-export fn token2wav_reference_run_dir(token2wav_dir: &const byte, artifact_dir: &const byte, chunk_count: u32, run: &Token2WavReferenceRun) bool {
-    run[0] = token2wav_reference_run_init();
-    if chunk_count == 0 || chunk_count > T2W_REFERENCE_MAX_AUDIO_CHUNKS as u32 {
-        _ = printf("error: token2wav reference chunk_count=%u unsupported cap=%zu\n", chunk_count, T2W_REFERENCE_MAX_AUDIO_CHUNKS);
-        return false;
+fn t2w_build_chunk_token_path(out: &byte, cap: usize, artifact_dir: &const byte, artifact_prefix: &const byte, chunk_index: u32) bool {
+    var written: i32 = 0;
+    if artifact_prefix == null || artifact_prefix[0] == 0 {
+        written = snprintf(out as *byte, cap, "%s/audio_tokens_chunk_%u.bin\0" as *const byte, artifact_dir, chunk_index);
+    } else {
+        written = snprintf(out as *byte, cap, "%s/%s_audio_tokens_chunk_%u.bin\0" as *const byte, artifact_dir, artifact_prefix, chunk_index);
     }
+    return written >= 0 && (written as usize) < cap;
+}
+
+export fn token2wav_reference_run_dir_prefixed(token2wav_dir: &const byte, artifact_dir: &const byte, artifact_prefix: &const byte, chunk_count: u32, run: &Token2WavReferenceRun) bool {
+    var session: Token2WavReferenceSession = token2wav_reference_session_init();
+    if !token2wav_reference_session_open(token2wav_dir, &session) { return false; }
+    const ok: bool = token2wav_reference_session_run_dir_prefixed(&session, artifact_dir, artifact_prefix, chunk_count, run);
+    token2wav_reference_session_close(&session);
+    return ok;
+}
+
+export fn token2wav_reference_session_close(session: &Token2WavReferenceSession) void {
+    if session.spk_proj != null { free(session.spk_proj as &void); }
+    t2w_close_table(&session.prompt_table);
+    t2w_close_table(&session.flow_extra_table);
+    t2w_close_table(&session.flow_matching_table);
+    t2w_close_table(&session.hifigan_table);
+    session[0] = token2wav_reference_session_init();
+}
+
+export fn token2wav_reference_session_open(token2wav_dir: &const byte, session: &Token2WavReferenceSession) bool {
+    session[0] = token2wav_reference_session_init();
     var prompt_cache_path: [byte: 512] = [];
     var flow_extra_path: [byte: 512] = [];
     var flow_matching_path: [byte: 512] = [];
@@ -1934,16 +1985,52 @@ export fn token2wav_reference_run_dir(token2wav_dir: &const byte, artifact_dir: 
        !t2w_join_path(&hifigan_path[0], @len(hifigan_path), token2wav_dir, "hifigan2.gguf\0" as &const byte) {
         return false;
     }
-    var prompt_config: T2WPromptCacheConfig = t2w_prompt_cache_config_init();
-    if !t2w_load_prompt_cache_metadata(&prompt_cache_path[0] as &const byte, &prompt_config) { return false; }
-    var up_rate: usize = 2;
-    if prompt_config.up_rate != 0 { up_rate = prompt_config.up_rate as usize; }
+    if !t2w_load_prompt_cache_metadata(&prompt_cache_path[0] as &const byte, &session.prompt_config) { return false; }
+    if session.prompt_config.up_rate != 0 { session.up_rate = session.prompt_config.up_rate; }
+    else { session.up_rate = 2; }
+    if !t2w_open_table(&prompt_cache_path[0] as &const byte, &session.prompt_table) ||
+       !t2w_open_table(&flow_extra_path[0] as &const byte, &session.flow_extra_table) ||
+       !t2w_open_table(&flow_matching_path[0] as &const byte, &session.flow_matching_table) ||
+       !t2w_open_table(&hifigan_path[0] as &const byte, &session.hifigan_table) {
+        token2wav_reference_session_close(session);
+        return false;
+    }
+    if !t2w_flow_bind_extra_weights(&session.flow_extra_table, &session.extra) ||
+       !t2w_flow_bind_matching_weights(&session.flow_matching_table, &session.matching) ||
+       !t2w_bind_hifigan_lite_weights(&session.hifigan_table, &session.hifigan) {
+        token2wav_reference_session_close(session);
+        return false;
+    }
+    const spk_cb: &TensorView = t2w_require(&session.prompt_table, "prompt_cache.spk_cb\0" as &const byte, "token2wav reference spk_cb\0" as &const byte);
+    if spk_cb == null {
+        token2wav_reference_session_close(session);
+        return false;
+    }
+    const spk_norm: &f32 = t2w_alloc_f32(T2W_FLOW_SPK, "token2wav-reference-spk-norm\0" as &const byte);
+    session.spk_proj = t2w_alloc_f32(T2W_FLOW_MEL, "token2wav-reference-spk-proj\0" as &const byte);
+    if spk_norm == null || session.spk_proj == null {
+        if spk_norm != null { free(spk_norm as &void); }
+        token2wav_reference_session_close(session);
+        return false;
+    }
+    t2w_l2_normalize(spk_norm, spk_cb.data as &const f32, T2W_FLOW_SPK, 0.000000000001 as f32);
+    t2w_linear_vec(session.spk_proj, spk_norm as &const f32, T2W_FLOW_SPK, T2W_FLOW_MEL, session.extra.spk_affine_weight, session.extra.spk_affine_bias);
+    free(spk_norm as &void);
+    return true;
+}
+
+export fn token2wav_reference_session_run_dir_prefixed(session: &Token2WavReferenceSession, artifact_dir: &const byte, artifact_prefix: &const byte, chunk_count: u32, run: &Token2WavReferenceRun) bool {
+    run[0] = token2wav_reference_run_init();
+    if chunk_count == 0 || chunk_count > T2W_REFERENCE_MAX_AUDIO_CHUNKS as u32 {
+        _ = printf("error: token2wav reference chunk_count=%u unsupported cap=%zu\n", chunk_count, T2W_REFERENCE_MAX_AUDIO_CHUNKS);
+        return false;
+    }
+    const up_rate: usize = session.up_rate as usize;
     var total_samples: usize = 0;
     var chunk_index: u32 = 0;
     while chunk_index < chunk_count {
         var token_path: [byte: 512] = [];
-        const written: i32 = snprintf(&token_path[0] as *byte, @len(token_path), "%s/audio_tokens_chunk_%u.bin\0" as *const byte, artifact_dir, chunk_index);
-        if written < 0 || (written as usize) >= @len(token_path) {
+        if !t2w_build_chunk_token_path(&token_path[0], @len(token_path), artifact_dir, artifact_prefix, chunk_index) {
             _ = printf("error: token2wav reference token path too long dir=%s chunk=%u\n", artifact_dir, chunk_index);
             return false;
         }
@@ -1969,101 +2056,40 @@ export fn token2wav_reference_run_dir(token2wav_dir: &const byte, artifact_dir: 
     run.sample_count = total_samples;
     run.chunk_count = chunk_count;
     run.up_rate = up_rate as u32;
-    run.n_timesteps = prompt_config.n_timesteps;
-
-    var prompt_table: TensorWeightTable = tensor_table_init();
-    var flow_extra_table: TensorWeightTable = tensor_table_init();
-    var flow_matching_table: TensorWeightTable = tensor_table_init();
-    var hifigan_table: TensorWeightTable = tensor_table_init();
-    if !t2w_open_table(&prompt_cache_path[0] as &const byte, &prompt_table) ||
-       !t2w_open_table(&flow_extra_path[0] as &const byte, &flow_extra_table) ||
-       !t2w_open_table(&flow_matching_path[0] as &const byte, &flow_matching_table) ||
-       !t2w_open_table(&hifigan_path[0] as &const byte, &hifigan_table) {
-        token2wav_reference_run_free(run);
-        t2w_close_table(&prompt_table);
-        t2w_close_table(&flow_extra_table);
-        t2w_close_table(&flow_matching_table);
-        t2w_close_table(&hifigan_table);
-        return false;
-    }
-    var extra: T2WFlowExtraWeights = t2w_flow_extra_weights_init();
-    var matching: T2WFlowMatchingWeights = t2w_flow_matching_weights_init();
-    var hifigan: T2WHifiganLiteWeights = t2w_hifigan_lite_weights_init();
-    if !t2w_flow_bind_extra_weights(&flow_extra_table, &extra) || !t2w_flow_bind_matching_weights(&flow_matching_table, &matching) || !t2w_bind_hifigan_lite_weights(&hifigan_table, &hifigan) {
-        token2wav_reference_run_free(run);
-        t2w_close_table(&prompt_table);
-        t2w_close_table(&flow_extra_table);
-        t2w_close_table(&flow_matching_table);
-        t2w_close_table(&hifigan_table);
-        return false;
-    }
-    const spk_cb: &TensorView = t2w_require(&prompt_table, "prompt_cache.spk_cb\0" as &const byte, "token2wav reference spk_cb\0" as &const byte);
-    if spk_cb == null {
-        token2wav_reference_run_free(run);
-        t2w_close_table(&prompt_table);
-        t2w_close_table(&flow_extra_table);
-        t2w_close_table(&flow_matching_table);
-        t2w_close_table(&hifigan_table);
-        return false;
-    }
-    const spk_norm: &f32 = t2w_alloc_f32(T2W_FLOW_SPK, "token2wav-reference-spk-norm\0" as &const byte);
-    const spk_proj: &f32 = t2w_alloc_f32(T2W_FLOW_MEL, "token2wav-reference-spk-proj\0" as &const byte);
-    if spk_norm == null || spk_proj == null {
-        if spk_norm != null { free(spk_norm as &void); }
-        if spk_proj != null { free(spk_proj as &void); }
-        token2wav_reference_run_free(run);
-        t2w_close_table(&prompt_table);
-        t2w_close_table(&flow_extra_table);
-        t2w_close_table(&flow_matching_table);
-        t2w_close_table(&hifigan_table);
-        return false;
-    }
-    t2w_l2_normalize(spk_norm, spk_cb.data as &const f32, T2W_FLOW_SPK, 0.000000000001 as f32);
-    t2w_linear_vec(spk_proj, spk_norm as &const f32, T2W_FLOW_SPK, T2W_FLOW_MEL, extra.spk_affine_weight, extra.spk_affine_bias);
+    run.n_timesteps = session.prompt_config.n_timesteps;
 
     const total_start_us: u64 = t2w_clock_us();
     chunk_index = 0;
     while chunk_index < chunk_count {
         var token_path2: [byte: 512] = [];
-        const written2: i32 = snprintf(&token_path2[0] as *byte, @len(token_path2), "%s/audio_tokens_chunk_%u.bin\0" as *const byte, artifact_dir, chunk_index);
-        if written2 < 0 || (written2 as usize) >= @len(token_path2) {
-            free(spk_norm as &void); free(spk_proj as &void);
+        if !t2w_build_chunk_token_path(&token_path2[0], @len(token_path2), artifact_dir, artifact_prefix, chunk_index) {
             token2wav_reference_run_free(run);
-            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table); t2w_close_table(&hifigan_table);
             return false;
         }
         var tokens: [u32: 8192] = [];
         var token_count2: usize = 0;
         if !t2w_load_tokens_bin(&token_path2[0] as &const byte, &tokens[0], @len(tokens), &token_count2) {
-            free(spk_norm as &void); free(spk_proj as &void);
             token2wav_reference_run_free(run);
-            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table); t2w_close_table(&hifigan_table);
             return false;
         }
         const mel_frames: usize = token_count2 * up_rate;
         const mel_values: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "token2wav-reference-mel\0" as &const byte);
         if mel_values == null {
-            free(spk_norm as &void); free(spk_proj as &void);
             token2wav_reference_run_free(run);
-            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table); t2w_close_table(&hifigan_table);
             return false;
         }
         var chunk_windows: u32 = 0;
         const chunk_start_us: u64 = t2w_clock_us();
-        if !t2w_render_chunk_mel(&prompt_config, &extra, &matching, spk_proj as &const f32, &tokens[0] as &const u32, token_count2, mel_values, &chunk_windows) {
+        if !t2w_render_chunk_mel(&session.prompt_config, &session.extra, &session.matching, session.spk_proj as &const f32, &tokens[0] as &const u32, token_count2, mel_values, &chunk_windows) {
             free(mel_values as &void);
-            free(spk_norm as &void); free(spk_proj as &void);
             token2wav_reference_run_free(run);
-            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table); t2w_close_table(&hifigan_table);
             return false;
         }
         var chunk_sample_count: usize = 0;
         const sample_offset: usize = run.chunk_sample_offsets[chunk_index as usize] as usize;
-        if !t2w_render_chunk_pcm(&hifigan, mel_values as &const f32, mel_frames, &run.samples[sample_offset], &chunk_sample_count) {
+        if !t2w_render_chunk_pcm(&session.hifigan, mel_values as &const f32, mel_frames, &run.samples[sample_offset], &chunk_sample_count) {
             free(mel_values as &void);
-            free(spk_norm as &void); free(spk_proj as &void);
             token2wav_reference_run_free(run);
-            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table); t2w_close_table(&hifigan_table);
             return false;
         }
         free(mel_values as &void);
@@ -2077,11 +2103,9 @@ export fn token2wav_reference_run_dir(token2wav_dir: &const byte, artifact_dir: 
         chunk_index = chunk_index + 1;
     }
     run.total_us = t2w_clock_us() - total_start_us;
-    free(spk_norm as &void);
-    free(spk_proj as &void);
-    t2w_close_table(&prompt_table);
-    t2w_close_table(&flow_extra_table);
-    t2w_close_table(&flow_matching_table);
-    t2w_close_table(&hifigan_table);
     return true;
+}
+
+export fn token2wav_reference_run_dir(token2wav_dir: &const byte, artifact_dir: &const byte, chunk_count: u32, run: &Token2WavReferenceRun) bool {
+    return token2wav_reference_run_dir_prefixed(token2wav_dir, artifact_dir, null as &const byte, chunk_count, run);
 }
