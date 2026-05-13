@@ -7,6 +7,7 @@ use libc.cosf;
 use libc.free;
 use libc.log10f;
 use libc.printf;
+use libc.snprintf;
 use libc.sinf;
 use libc.sqrtf;
 use libc.strcmp;
@@ -223,6 +224,15 @@ struct AudioRealFilterBank {
     values: &f32,
 }
 
+struct AudioRealEncoderSession {
+    config: AudioConfig,
+    table: TensorWeightTable,
+    filters: AudioRealFilterBank,
+    cos_table: &f32,
+    sin_table: &f32,
+    ready: bool,
+}
+
 struct AudioRealEncodedSpan {
     values: &f32,
     sample_count: u64,
@@ -407,6 +417,17 @@ fn audio_real_filter_bank_init() AudioRealFilterBank {
     return AudioRealFilterBank{ mel_bins: 0, filter_bins: 0, value_count: 0, values: null };
 }
 
+fn audio_real_encoder_session_init() AudioRealEncoderSession {
+    return AudioRealEncoderSession{
+        config: audio_config_init(),
+        table: tensor_table_init(),
+        filters: audio_real_filter_bank_init(),
+        cos_table: null,
+        sin_table: null,
+        ready: false,
+    };
+}
+
 fn audio_real_encoded_span_init() AudioRealEncodedSpan {
     return AudioRealEncodedSpan{ values: null, sample_count: 0, mel_frames: 0, conv_tokens: 0, span_count: 0, hidden_size: 0, checksum: 0, encode_us: 0 };
 }
@@ -428,6 +449,16 @@ fn audio_real_filter_bank_free(filters: &AudioRealFilterBank) void {
     filters.value_count = 0;
     filters.mel_bins = 0;
     filters.filter_bins = 0;
+}
+
+fn audio_real_encoder_session_free(session: &AudioRealEncoderSession) void {
+    if session.cos_table != null { free(session.cos_table as &void); }
+    if session.sin_table != null { free(session.sin_table as &void); }
+    session.cos_table = null;
+    session.sin_table = null;
+    audio_real_filter_bank_free(&session.filters);
+    tensor_weight_table_detach_mmap(&session.table);
+    session[0] = audio_real_encoder_session_init();
 }
 
 fn audio_streaming_cache_init() AudioStreamingCache {
@@ -866,6 +897,39 @@ fn audio_real_filterbank_load(audio_model_path: &const byte, filters: &AudioReal
     return true;
 }
 
+fn audio_real_encoder_session_open(audio_model_path: &const byte, session: &AudioRealEncoderSession) bool {
+    session[0] = audio_real_encoder_session_init();
+    if !audio_config_load_metadata(audio_model_path, &session.config) { return false; }
+    if !tensor_weight_table_load(audio_model_path, &session.table) { audio_real_encoder_session_free(session); return false; }
+    if !audio_real_complete_config(&session.config, &session.table) { audio_real_encoder_session_free(session); return false; }
+    var checked: u32 = 0;
+    if !audio_real_bind_check(&session.table, &session.config, &checked) { audio_real_encoder_session_free(session); return false; }
+    if !tensor_weight_table_attach_mmap(audio_model_path, &session.table) { audio_real_encoder_session_free(session); return false; }
+    if !audio_real_filterbank_load(audio_model_path, &session.filters) { audio_real_encoder_session_free(session); return false; }
+    const trig_count: u64 = (AUDIO_REAL_FRAME_SIZE as u64) * (AUDIO_REAL_FILTER_BINS as u64);
+    session.cos_table = calloc(trig_count as usize, 4) as &f32;
+    session.sin_table = calloc(trig_count as usize, 4) as &f32;
+    if session.cos_table == null || session.sin_table == null {
+        _ = printf("error: audio-real-encode trig table allocation failed\n");
+        audio_real_encoder_session_free(session);
+        return false;
+    }
+    var k_pre: u32 = 0;
+    while k_pre < AUDIO_REAL_FILTER_BINS {
+        var n_pre: u32 = 0;
+        while n_pre < AUDIO_REAL_FRAME_SIZE {
+            const idx: usize = (k_pre * AUDIO_REAL_FRAME_SIZE + n_pre) as usize;
+            const phase: f32 = ((2.0 as f32) * AUDIO_PI * (k_pre as f32) * (n_pre as f32)) / (AUDIO_REAL_FRAME_SIZE as f32);
+            session.cos_table[idx] = cosf(phase);
+            session.sin_table[idx] = sinf(phase);
+            n_pre = n_pre + 1;
+        }
+        k_pre = k_pre + 1;
+    }
+    session.ready = true;
+    return true;
+}
+
 fn audio_real_load_samples_alloc(sample_count: u64, pcm: &AudioRealPcmHeap) bool {
     if sample_count == 0 { _ = printf("error: audio-real-mel has no samples\n"); return false; }
     pcm.sample_count = sample_count;
@@ -1085,26 +1149,11 @@ fn audio_real_mel_dump_write(path: &const byte, mel_values: &f32, mel_frames: u6
     return true;
 }
 
-fn audio_real_mel_compute(pcm: &AudioRealPcmHeap, filters: &AudioRealFilterBank, mel_values: &f32, mel_frames: u64, aligned_samples: u64) bool {
+fn audio_real_mel_compute(pcm: &AudioRealPcmHeap, filters: &AudioRealFilterBank, cos_table: &const f32, sin_table: &const f32, mel_values: &f32, mel_frames: u64, aligned_samples: u64) bool {
     var hann: [f32: 400] = [];
     var n_hann: u32 = 0;
     while n_hann < AUDIO_REAL_FRAME_SIZE { hann[n_hann as usize] = audio_real_hann(n_hann); n_hann = n_hann + 1; }
-    const trig_count: u64 = (AUDIO_REAL_FRAME_SIZE as u64) * (AUDIO_REAL_FILTER_BINS as u64);
-    var cos_table: &f32 = calloc(trig_count as usize, 4) as &f32;
-    var sin_table: &f32 = calloc(trig_count as usize, 4) as &f32;
-    if cos_table == null || sin_table == null { _ = printf("error: audio-real-mel trig table allocation failed\n"); if cos_table != null { free(cos_table as &void); } if sin_table != null { free(sin_table as &void); } return false; }
-    var k_pre: u32 = 0;
-    while k_pre < AUDIO_REAL_FILTER_BINS {
-        var n_pre: u32 = 0;
-        while n_pre < AUDIO_REAL_FRAME_SIZE {
-            const idx: usize = (k_pre * AUDIO_REAL_FRAME_SIZE + n_pre) as usize;
-            const phase: f32 = ((2.0 as f32) * AUDIO_PI * (k_pre as f32) * (n_pre as f32)) / (AUDIO_REAL_FRAME_SIZE as f32);
-            cos_table[idx] = cosf(phase);
-            sin_table[idx] = sinf(phase);
-            n_pre = n_pre + 1;
-        }
-        k_pre = k_pre + 1;
-    }
+    if cos_table == null || sin_table == null { _ = printf("error: audio-real-mel trig table unavailable\n"); return false; }
     var mmax: f32 = -1000000000.0;
     var frame: u64 = 0;
     while frame < mel_frames {
@@ -1149,24 +1198,22 @@ fn audio_real_mel_compute(pcm: &AudioRealPcmHeap, filters: &AudioRealFilterBank,
         mel_values[i as usize] = (value + 4.0) / 4.0;
         i = i + 1;
     }
-    free(cos_table as &void);
-    free(sin_table as &void);
     return true;
 }
 
 fn audio_real_mel_probe_run(audio_model_path: &const byte, audio_path: &const byte, dump_path: &const byte) i32 {
-    var filters: AudioRealFilterBank = audio_real_filter_bank_init();
-    if !audio_real_filterbank_load(audio_model_path, &filters) { return 1; }
+    var session: AudioRealEncoderSession = audio_real_encoder_session_init();
+    if !audio_real_encoder_session_open(audio_model_path, &session) { return 1; }
     var pcm: AudioRealPcmHeap = audio_real_pcm_heap_init();
-    if !audio_real_load_samples_file(audio_path, "probe\0" as &const byte, &pcm) { audio_real_filter_bank_free(&filters); return 1; }
+    if !audio_real_load_samples_file(audio_path, "probe\0" as &const byte, &pcm) { audio_real_encoder_session_free(&session); return 1; }
     const aligned_samples: u64 = audio_real_aligned_sample_count(pcm.sample_count);
     const padded_samples: u64 = aligned_samples + (AUDIO_REAL_CENTER_PAD as u64) * (2 as u64);
     const mel_frames: u64 = (padded_samples - (AUDIO_REAL_FRAME_SIZE as u64)) / (AUDIO_REAL_HOP_LENGTH as u64);
     const mel_count: u64 = mel_frames * (AUDIO_REAL_MEL_BINS as u64);
-    if mel_frames == 0 || mel_count == 0 { _ = printf("error: audio-real-mel produced empty mel frames\n"); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); return 1; }
+    if mel_frames == 0 || mel_count == 0 { _ = printf("error: audio-real-mel produced empty mel frames\n"); audio_real_pcm_heap_free(&pcm); audio_real_encoder_session_free(&session); return 1; }
     var mel_values: &f32 = calloc(mel_count as usize, 4) as &f32;
-    if mel_values == null { _ = printf("error: audio-real-mel output allocation failed elements=%llu\n", mel_count); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); return 1; }
-    if !audio_real_mel_compute(&pcm, &filters, mel_values, mel_frames, aligned_samples) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); return 1; }
+    if mel_values == null { _ = printf("error: audio-real-mel output allocation failed elements=%llu\n", mel_count); audio_real_pcm_heap_free(&pcm); audio_real_encoder_session_free(&session); return 1; }
+    if !audio_real_mel_compute(&pcm, &session.filters, session.cos_table as &const f32, session.sin_table as &const f32, mel_values, mel_frames, aligned_samples) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_encoder_session_free(&session); return 1; }
     var min_value: f32 = 0.0;
     var max_value: f32 = 0.0;
     var have: bool = false;
@@ -1180,12 +1227,12 @@ fn audio_real_mel_probe_run(audio_model_path: &const byte, audio_path: &const by
     _ = printf("audio-real-mel shape: frames=%llu mel_bins=%u elements=%llu filter_bins=%u conv_tokens=%llu encoder_positions=%llu checksum=0x%x min=%.6f max=%.6f\n", mel_frames, AUDIO_REAL_MEL_BINS, mel_count, AUDIO_REAL_FILTER_BINS, conv_tokens, encoder_positions, checksum, min_value as f64, max_value as f64);
     _ = printf("audio-real-mel values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", mel_values[0] as f64, mel_values[1] as f64, mel_values[2] as f64, mel_values[3] as f64, mel_values[4] as f64, mel_values[5] as f64);
     if dump_path != null {
-        if !audio_real_mel_dump_write(dump_path, mel_values, mel_frames, AUDIO_REAL_MEL_BINS) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); return 1; }
+        if !audio_real_mel_dump_write(dump_path, mel_values, mel_frames, AUDIO_REAL_MEL_BINS) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_encoder_session_free(&session); return 1; }
     }
     _ = printf("audio-real-mel-probe: PASS\n");
     free(mel_values as &void);
     audio_real_pcm_heap_free(&pcm);
-    audio_real_filter_bank_free(&filters);
+    audio_real_encoder_session_free(&session);
     return 0;
 }
 
@@ -1996,50 +2043,49 @@ fn audio_real_forward(table: &TensorWeightTable, config: &AudioConfig, mel_value
     return true;
 }
 
-fn audio_real_encode_collect(audio_model_path: &const byte, audio_path: &const byte, role: &const byte, span: &AudioRealEncodedSpan) bool {
+fn audio_real_encode_with_session(session: &AudioRealEncoderSession, audio_path: &const byte, role: &const byte, span: &AudioRealEncodedSpan) bool {
     span[0] = audio_real_encoded_span_init();
-    var config: AudioConfig = audio_config_init();
-    if !audio_config_load_metadata(audio_model_path, &config) { return false; }
-    var table: TensorWeightTable = tensor_table_init();
-    if !tensor_weight_table_load(audio_model_path, &table) { return false; }
-    if !audio_real_complete_config(&config, &table) { return false; }
-    var checked: u32 = 0;
-    if !audio_real_bind_check(&table, &config, &checked) { return false; }
-    if !tensor_weight_table_attach_mmap(audio_model_path, &table) { return false; }
-
-    var filters: AudioRealFilterBank = audio_real_filter_bank_init();
-    if !audio_real_filterbank_load(audio_model_path, &filters) { tensor_weight_table_detach_mmap(&table); return false; }
+    if !session.ready {
+        _ = printf("error: audio-real-encode session is not ready\n");
+        return false;
+    }
     var pcm: AudioRealPcmHeap = audio_real_pcm_heap_init();
-    if !audio_real_load_samples_file(audio_path, role, &pcm) { audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
+    if !audio_real_load_samples_file(audio_path, role, &pcm) { return false; }
     const aligned_samples: u64 = audio_real_aligned_sample_count(pcm.sample_count);
     const padded_samples: u64 = aligned_samples + (AUDIO_REAL_CENTER_PAD as u64) * (2 as u64);
     const mel_frames_u64: u64 = (padded_samples - (AUDIO_REAL_FRAME_SIZE as u64)) / (AUDIO_REAL_HOP_LENGTH as u64);
     const mel_count: u64 = mel_frames_u64 * (AUDIO_REAL_MEL_BINS as u64);
-    if mel_frames_u64 == 0 || mel_count == 0 { _ = printf("error: audio-real-encode[%s] empty mel frames\n", role); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
+    if mel_frames_u64 == 0 || mel_count == 0 { _ = printf("error: audio-real-encode[%s] empty mel frames\n", role); audio_real_pcm_heap_free(&pcm); return false; }
     var mel_values: &f32 = audio_real_alloc_f32(mel_count as usize, "mel-values\0" as &const byte);
-    if mel_values == null { audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
-    if !audio_real_mel_compute(&pcm, &filters, mel_values, mel_frames_u64, aligned_samples) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
+    if mel_values == null { audio_real_pcm_heap_free(&pcm); return false; }
+    if !audio_real_mel_compute(&pcm, &session.filters, session.cos_table as &const f32, session.sin_table as &const f32, mel_values, mel_frames_u64, aligned_samples) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); return false; }
 
     const conv_tokens: usize = audio_real_conv_output_tokens(mel_frames_u64 as usize, 3, 2);
     const pooled_tokens: usize = audio_real_pool_output_tokens(conv_tokens);
-    if pooled_tokens == 0 { _ = printf("error: audio-real-encode[%s] pooled_tokens=0 conv_tokens=%zu\n", role, conv_tokens); free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
-    span.values = audio_real_alloc_f32(pooled_tokens * (config.llm_hidden_size as usize), "embeddings\0" as &const byte);
-    if span.values == null { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false; }
+    if pooled_tokens == 0 { _ = printf("error: audio-real-encode[%s] pooled_tokens=0 conv_tokens=%zu\n", role, conv_tokens); free(mel_values as &void); audio_real_pcm_heap_free(&pcm); return false; }
+    span.values = audio_real_alloc_f32(pooled_tokens * (session.config.llm_hidden_size as usize), "embeddings\0" as &const byte);
+    if span.values == null { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); return false; }
     const encode_start_us: u64 = audio_real_clock_us();
-    if !audio_real_forward(&table, &config, mel_values as &const f32, mel_frames_u64 as usize, span.values, &span.span_count) {
-        audio_real_encoded_span_free(span); free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_filter_bank_free(&filters); tensor_weight_table_detach_mmap(&table); return false;
+    if !audio_real_forward(&session.table, &session.config, mel_values as &const f32, mel_frames_u64 as usize, span.values, &span.span_count) {
+        audio_real_encoded_span_free(span); free(mel_values as &void); audio_real_pcm_heap_free(&pcm); return false;
     }
     span.encode_us = audio_real_clock_us() - encode_start_us;
     span.sample_count = pcm.sample_count;
     span.mel_frames = mel_frames_u64;
     span.conv_tokens = conv_tokens;
-    span.hidden_size = config.llm_hidden_size as usize;
+    span.hidden_size = session.config.llm_hidden_size as usize;
     span.checksum = audio_checksum(span.values as &const f32, span.span_count * span.hidden_size);
     free(mel_values as &void);
     audio_real_pcm_heap_free(&pcm);
-    audio_real_filter_bank_free(&filters);
-    tensor_weight_table_detach_mmap(&table);
     return true;
+}
+
+fn audio_real_encode_collect(audio_model_path: &const byte, audio_path: &const byte, role: &const byte, span: &AudioRealEncodedSpan) bool {
+    var session: AudioRealEncoderSession = audio_real_encoder_session_init();
+    if !audio_real_encoder_session_open(audio_model_path, &session) { return false; }
+    const ok: bool = audio_real_encode_with_session(&session, audio_path, role, span);
+    audio_real_encoder_session_free(&session);
+    return ok;
 }
 
 export fn audio_real_encode_probe_file(audio_model_path: &const byte, audio_path: &const byte, role: &const byte) bool {
@@ -2057,17 +2103,33 @@ export fn audio_real_encode_probe_cli(audio_model_path: &const byte, audio_path:
     return 0;
 }
 
+fn audio2audio_real_append_user_span(config: &Qwen3Config, weights: &Qwen3Weights, tok: &Tokenizer, runtime: &Qwen3Runtime, audio_placeholder_id: u32, span: &AudioRealEncodedSpan, logits: &f32) bool {
+    return qwen3_append_prompt_text(config, weights, tok, runtime, AUDIO2AUDIO_REAL_USER_AUDIO_PREFIX, logits) &&
+           qwen3_append_prompt_embeddings(config, weights, runtime, audio_placeholder_id, span.values as &const f32, span.span_count, logits) &&
+           qwen3_append_prompt_text(config, weights, tok, runtime, AUDIO2AUDIO_REAL_USER_AUDIO_SUFFIX, logits);
+}
+
+fn audio2audio_real_dump_embedding(label: &const byte, span: &AudioRealEncodedSpan) void {
+    _ = printf("audio2audio-real embedding[%s] values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", label, span.values[0] as f64, span.values[1] as f64, span.values[2] as f64, span.values[3] as f64, span.values[4] as f64, span.values[5] as f64);
+}
+
 export fn audio2audio_real_text_cli(llm_path: &const byte, audio_model_path: &const byte, ref_audio_path: &const byte, user_audio_path: &const byte, sampler_in: &Qwen3SamplerConfig, dump_embeddings: bool) i32 {
+    const audio_load_start_us: u64 = audio_real_clock_us();
+    var session: AudioRealEncoderSession = audio_real_encoder_session_init();
+    if !audio_real_encoder_session_open(audio_model_path, &session) { return 1; }
+    const audio_load_us: u64 = audio_real_clock_us() - audio_load_start_us;
     var ref_span: AudioRealEncodedSpan = audio_real_encoded_span_init();
-    if !audio_real_encode_collect(audio_model_path, ref_audio_path, "ref\0" as &const byte, &ref_span) { return 1; }
+    if !audio_real_encode_with_session(&session, ref_audio_path, "ref\0" as &const byte, &ref_span) { audio_real_encoder_session_free(&session); return 1; }
     var user_span: AudioRealEncodedSpan = audio_real_encoded_span_init();
-    if !audio_real_encode_collect(audio_model_path, user_audio_path, "user\0" as &const byte, &user_span) { audio_real_encoded_span_free(&ref_span); return 1; }
+    if !audio_real_encode_with_session(&session, user_audio_path, "user\0" as &const byte, &user_span) { audio_real_encoded_span_free(&ref_span); audio_real_encoder_session_free(&session); return 1; }
     if ref_span.hidden_size != user_span.hidden_size {
         _ = printf("error: audio2audio-real hidden mismatch ref=%zu user=%zu\n", ref_span.hidden_size, user_span.hidden_size);
         audio_real_encoded_span_free(&user_span);
         audio_real_encoded_span_free(&ref_span);
+        audio_real_encoder_session_free(&session);
         return 1;
     }
+    audio_real_encoder_session_free(&session);
 
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
@@ -2116,9 +2178,7 @@ export fn audio2audio_real_text_cli(llm_path: &const byte, audio_model_path: &co
     if !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, AUDIO2AUDIO_REAL_SYSTEM_PREFIX, logits) ||
        !qwen3_append_prompt_embeddings(&config, &weights, &runtime, audio_placeholder_id, ref_span.values as &const f32, ref_span.span_count, logits) ||
        !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, AUDIO2AUDIO_REAL_SYSTEM_SUFFIX, logits) ||
-       !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, AUDIO2AUDIO_REAL_USER_AUDIO_PREFIX, logits) ||
-       !qwen3_append_prompt_embeddings(&config, &weights, &runtime, audio_placeholder_id, user_span.values as &const f32, user_span.span_count, logits) ||
-       !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, AUDIO2AUDIO_REAL_USER_AUDIO_SUFFIX, logits) ||
+       !audio2audio_real_append_user_span(&config, &weights, &tok, &runtime, audio_placeholder_id, &user_span, logits) ||
        !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, AUDIO2AUDIO_REAL_ASSISTANT_PROMPT, logits) {
         free(logits as &void);
         qwen3_close_runtime(&table, &tok, &runtime);
@@ -2130,10 +2190,10 @@ export fn audio2audio_real_text_cli(llm_path: &const byte, audio_model_path: &co
     const prompt_tokens: usize = runtime.total_tokens;
 
     _ = printf("audio2audio-real[text-only]: llm=%s ref_audio=%s user_audio=%s prompt_tokens=%zu stop_token=%u\n", llm_path, ref_audio_path, user_audio_path, prompt_tokens, sampler.stop_token);
-    _ = printf("audio2audio-real[text-only]: ref_n_pos=%zu ref_checksum=0x%x ref_encode_ms=%.3f user_n_pos=%zu user_checksum=0x%x user_encode_ms=%.3f prefill_ms=%.3f load_ms=%.3f\n", ref_span.span_count, ref_span.checksum, (ref_span.encode_us as f64) / 1000.0, user_span.span_count, user_span.checksum, (user_span.encode_us as f64) / 1000.0, (prefill_us as f64) / 1000.0, (load_us as f64) / 1000.0);
+    _ = printf("audio2audio-real[text-only]: ref_n_pos=%zu ref_checksum=0x%x ref_encode_ms=%.3f user_n_pos=%zu user_checksum=0x%x user_encode_ms=%.3f prefill_ms=%.3f audio_load_ms=%.3f llm_load_ms=%.3f\n", ref_span.span_count, ref_span.checksum, (ref_span.encode_us as f64) / 1000.0, user_span.span_count, user_span.checksum, (user_span.encode_us as f64) / 1000.0, (prefill_us as f64) / 1000.0, (audio_load_us as f64) / 1000.0, (load_us as f64) / 1000.0);
     if dump_embeddings {
-        _ = printf("audio2audio-real embedding[ref] values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", ref_span.values[0] as f64, ref_span.values[1] as f64, ref_span.values[2] as f64, ref_span.values[3] as f64, ref_span.values[4] as f64, ref_span.values[5] as f64);
-        _ = printf("audio2audio-real embedding[user] values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", user_span.values[0] as f64, user_span.values[1] as f64, user_span.values[2] as f64, user_span.values[3] as f64, user_span.values[4] as f64, user_span.values[5] as f64);
+        audio2audio_real_dump_embedding("ref\0" as &const byte, &ref_span);
+        audio2audio_real_dump_embedding("user\0" as &const byte, &user_span);
     }
 
     var answer: [byte: AUDIO2AUDIO_REAL_ANSWER_CAP] = [];
@@ -2142,12 +2202,156 @@ export fn audio2audio_real_text_cli(llm_path: &const byte, audio_model_path: &co
     const rc: i32 = qwen3_generate_capture(&config, &weights, &runtime, &sampler, &tok, logits, "audio2audio-real answer\0" as &const byte, false, &answer[0], @len(answer), &answer_len);
     const decode_us: u64 = audio_real_clock_us() - decode_start_us;
     if rc == 0 {
-        _ = printf("audio2audio-real[text-only]: answer_chars=%zu decode_ms=%.3f total_ms=%.3f\n", answer_len, (decode_us as f64) / 1000.0, ((load_us + ref_span.encode_us + user_span.encode_us + prefill_us + decode_us) as f64) / 1000.0);
+        _ = printf("audio2audio-real[text-only]: answer_chars=%zu decode_ms=%.3f total_ms=%.3f\n", answer_len, (decode_us as f64) / 1000.0, ((audio_load_us + load_us + ref_span.encode_us + user_span.encode_us + prefill_us + decode_us) as f64) / 1000.0);
     }
 
     free(logits as &void);
     qwen3_close_runtime(&table, &tok, &runtime);
     audio_real_encoded_span_free(&user_span);
+    audio_real_encoded_span_free(&ref_span);
+    return rc;
+}
+
+export fn audio2audio_real_text_test_prefix_cli(llm_path: &const byte, audio_model_path: &const byte, ref_audio_path: &const byte, test_prefix: &const byte, test_count: u32, sampler_in: &Qwen3SamplerConfig, dump_embeddings: bool) i32 {
+    if test_count < 2 { _ = printf("error: audio2audio-real text test-prefix requires count>=2\n"); return 1; }
+    const audio_load_start_us: u64 = audio_real_clock_us();
+    var session: AudioRealEncoderSession = audio_real_encoder_session_init();
+    if !audio_real_encoder_session_open(audio_model_path, &session) { return 1; }
+    const audio_load_us: u64 = audio_real_clock_us() - audio_load_start_us;
+    var ref_span: AudioRealEncodedSpan = audio_real_encoded_span_init();
+    if !audio_real_encode_with_session(&session, ref_audio_path, "ref\0" as &const byte, &ref_span) { audio_real_encoder_session_free(&session); return 1; }
+
+    var config: Qwen3Config = qwen3_config_init();
+    var table: TensorWeightTable = tensor_table_init();
+    var weights: Qwen3Weights = qwen3_weights_init();
+    var tok: Tokenizer = tokenizer_init();
+    var runtime: Qwen3Runtime = qwen3_runtime_init();
+    const load_start_us: u64 = audio_real_clock_us();
+    if !qwen3_open_runtime(llm_path, &config, &table, &weights, &tok, &runtime) {
+        audio_real_encoded_span_free(&ref_span);
+        audio_real_encoder_session_free(&session);
+        return 1;
+    }
+    const load_us: u64 = audio_real_clock_us() - load_start_us;
+    if ref_span.hidden_size != config.hidden_size as usize {
+        _ = printf("error: audio2audio-real projector output=%zu does not match qwen hidden=%u\n", ref_span.hidden_size, config.hidden_size);
+        qwen3_close_runtime(&table, &tok, &runtime);
+        audio_real_encoded_span_free(&ref_span);
+        audio_real_encoder_session_free(&session);
+        return 1;
+    }
+
+    var sampler: Qwen3SamplerConfig = sampler_in[0];
+    if sampler.max_new_tokens == 0 { sampler.max_new_tokens = AUDIO2AUDIO_REAL_DEFAULT_MAX_NEW_TOKENS; }
+    sampler.stop_token = tokenizer_chat_stop_token(&tok);
+    qwen3_set_thread_count(sampler.threads);
+    runtime.seed = sampler.seed;
+
+    var audio_placeholder_id: u32 = 0;
+    if !audio_real_single_token(&tok, "<audio>\0" as &const byte, &audio_placeholder_id) {
+        qwen3_close_runtime(&table, &tok, &runtime);
+        audio_real_encoded_span_free(&ref_span);
+        audio_real_encoder_session_free(&session);
+        return 1;
+    }
+
+    var logits: &f32 = calloc(config.vocab_size as usize, 4) as &f32;
+    if logits == null {
+        _ = printf("error: audio2audio-real logits allocation failed vocab=%u\n", config.vocab_size);
+        qwen3_close_runtime(&table, &tok, &runtime);
+        audio_real_encoded_span_free(&ref_span);
+        audio_real_encoder_session_free(&session);
+        return 1;
+    }
+
+    var prefill_us: u64 = 0;
+    var append_start_us: u64 = audio_real_clock_us();
+    if !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, AUDIO2AUDIO_REAL_SYSTEM_PREFIX, logits) ||
+       !qwen3_append_prompt_embeddings(&config, &weights, &runtime, audio_placeholder_id, ref_span.values as &const f32, ref_span.span_count, logits) ||
+       !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, AUDIO2AUDIO_REAL_SYSTEM_SUFFIX, logits) {
+        free(logits as &void);
+        qwen3_close_runtime(&table, &tok, &runtime);
+        audio_real_encoded_span_free(&ref_span);
+        audio_real_encoder_session_free(&session);
+        return 1;
+    }
+    prefill_us = prefill_us + (audio_real_clock_us() - append_start_us);
+
+    var total_user_n_pos: usize = 0;
+    var total_user_encode_us: u64 = 0;
+    var turn: u32 = 1;
+    while turn < test_count {
+        var user_path: [byte: 512] = [];
+        const written: i32 = snprintf(&user_path[0] as *byte, @len(user_path), "%s_%04u.wav\0" as *const byte, test_prefix, turn);
+        if written < 0 || (written as usize) >= @len(user_path) {
+            _ = printf("error: audio2audio-real test user path too long prefix=%s turn=%u\n", test_prefix, turn);
+            free(logits as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            audio_real_encoded_span_free(&ref_span);
+            audio_real_encoder_session_free(&session);
+            return 1;
+        }
+        var user_span: AudioRealEncodedSpan = audio_real_encoded_span_init();
+        if !audio_real_encode_with_session(&session, &user_path[0] as &const byte, "user\0" as &const byte, &user_span) {
+            free(logits as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            audio_real_encoded_span_free(&ref_span);
+            audio_real_encoder_session_free(&session);
+            return 1;
+        }
+        if user_span.hidden_size != config.hidden_size as usize {
+            _ = printf("error: audio2audio-real user chunk hidden mismatch turn=%u chunk_hidden=%zu qwen_hidden=%u\n", turn, user_span.hidden_size, config.hidden_size);
+            audio_real_encoded_span_free(&user_span);
+            free(logits as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            audio_real_encoded_span_free(&ref_span);
+            audio_real_encoder_session_free(&session);
+            return 1;
+        }
+        total_user_n_pos = total_user_n_pos + user_span.span_count;
+        total_user_encode_us = total_user_encode_us + user_span.encode_us;
+        _ = printf("audio2audio-real[text-only]: user_chunk=%u path=%s n_pos=%zu checksum=0x%x encode_ms=%.3f\n", turn, &user_path[0], user_span.span_count, user_span.checksum, (user_span.encode_us as f64) / 1000.0);
+        if dump_embeddings { audio2audio_real_dump_embedding(&user_path[0] as &const byte, &user_span); }
+        append_start_us = audio_real_clock_us();
+        if !audio2audio_real_append_user_span(&config, &weights, &tok, &runtime, audio_placeholder_id, &user_span, logits) {
+            audio_real_encoded_span_free(&user_span);
+            free(logits as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            audio_real_encoded_span_free(&ref_span);
+            audio_real_encoder_session_free(&session);
+            return 1;
+        }
+        prefill_us = prefill_us + (audio_real_clock_us() - append_start_us);
+        audio_real_encoded_span_free(&user_span);
+        turn = turn + 1;
+    }
+    audio_real_encoder_session_free(&session);
+
+    append_start_us = audio_real_clock_us();
+    if !qwen3_append_prompt_text(&config, &weights, &tok, &runtime, AUDIO2AUDIO_REAL_ASSISTANT_PROMPT, logits) {
+        free(logits as &void);
+        qwen3_close_runtime(&table, &tok, &runtime);
+        audio_real_encoded_span_free(&ref_span);
+        return 1;
+    }
+    prefill_us = prefill_us + (audio_real_clock_us() - append_start_us);
+    const prompt_tokens: usize = runtime.total_tokens;
+
+    _ = printf("audio2audio-real[text-only]: llm=%s ref_audio=%s user_prefix=%s user_chunks=%u prompt_tokens=%zu stop_token=%u\n", llm_path, ref_audio_path, test_prefix, test_count - 1, prompt_tokens, sampler.stop_token);
+    _ = printf("audio2audio-real[text-only]: ref_n_pos=%zu ref_checksum=0x%x ref_encode_ms=%.3f user_n_pos_total=%zu user_encode_ms=%.3f prefill_ms=%.3f audio_load_ms=%.3f llm_load_ms=%.3f\n", ref_span.span_count, ref_span.checksum, (ref_span.encode_us as f64) / 1000.0, total_user_n_pos, (total_user_encode_us as f64) / 1000.0, (prefill_us as f64) / 1000.0, (audio_load_us as f64) / 1000.0, (load_us as f64) / 1000.0);
+    if dump_embeddings { audio2audio_real_dump_embedding("ref\0" as &const byte, &ref_span); }
+
+    var answer: [byte: AUDIO2AUDIO_REAL_ANSWER_CAP] = [];
+    var answer_len: usize = 0;
+    const decode_start_us: u64 = audio_real_clock_us();
+    const rc: i32 = qwen3_generate_capture(&config, &weights, &runtime, &sampler, &tok, logits, "audio2audio-real answer\0" as &const byte, false, &answer[0], @len(answer), &answer_len);
+    const decode_us: u64 = audio_real_clock_us() - decode_start_us;
+    if rc == 0 {
+        _ = printf("audio2audio-real[text-only]: answer_chars=%zu decode_ms=%.3f total_ms=%.3f\n", answer_len, (decode_us as f64) / 1000.0, ((audio_load_us + load_us + ref_span.encode_us + total_user_encode_us + prefill_us + decode_us) as f64) / 1000.0);
+    }
+
+    free(logits as &void);
+    qwen3_close_runtime(&table, &tok, &runtime);
     audio_real_encoded_span_free(&ref_span);
     return rc;
 }

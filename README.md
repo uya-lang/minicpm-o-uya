@@ -54,6 +54,7 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `audio-real-mel-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real numeric mel probe | Supports `--dump-f32 out.uyml` for full-array alignment |
 | `audio-real-encode-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real audio encoder forward probe | Correctness-first `conv + transformer + projector + pool` path |
 | `audio2audio-real --text-only --llm <llm.gguf> --audio <audio.gguf> --ref-audio ref.wav --user-audio user.wav` | Real ref-audio + user-audio to text answer | Uses official non-duplex prompt order; prints embedding/timing diagnostics |
+| `audio2audio-real --text-only --llm <llm.gguf> --audio <audio.gguf> --test-prefix prefix --count N` | Real ref-audio + multi-chunk user audio to text answer | Treats `prefix_0000.wav` as ref and `prefix_0001..` as one simplex user query |
 | `token2wav-bind <token2wav-gguf-dir>` | Real token2wav/HiFiGAN bind-only validation | Validates official `encoder`/`flow_*`/`hifigan2`/`prompt_cache` layouts |
 | `token2wav-prompt-cache-probe <prompt_cache.gguf>` | Real prompt-cache probe | Reads prompt-cache metadata, tensor sizes, and cache checksums |
 | `token2wav-window-probe <prompt_cache.gguf> <audio_tokens_chunk.txt>` | Real token window planner | Prints `28/25` sliding-window calls for token2wav streaming |
@@ -78,6 +79,8 @@ For official split MiniCPM-o 4.5 bundles, `token2wav-bind <dir>` now validates t
 `token2wav-flow-probe` is the next incremental step after bind/prompt-cache/window validation: it already runs real `flow_matching` math on official weights, but today it still uses a lightweight surrogate `mu` path (`embed-mu` or `zero-mu`) instead of the full `encoder.gguf` conformer forward.
 
 `bench` now has two modes: the original `<model.gguf> <manifest.json>` smoke path stays deterministic for regression tests, while `bench <model.gguf> [bench args...]` runs a real text benchmark intended for apples-to-apples comparison with `llama-bench`.
+
+`audio2audio-real --text-only` now reuses a single audio-encoder session across ref/user inputs, so `--test-prefix prefix --count N` no longer remaps and rebinds the audio GGUF for every user chunk.
 
 ## Supported Models And Formats
 
@@ -151,6 +154,7 @@ build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
 build/minicpm-o-uya audio-real-preprocess-probe /path/to/user.wav
 build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya audio-real-encode-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
+build/minicpm-o-uya audio2audio-real --text-only --llm "$MINICPM_O_TEXT_GGUF" --audio "$MINICPM_O_AUDIO_GGUF" --test-prefix /path/to/case_prefix --count 4
 build/minicpm-o-uya tts-condition-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_token_ids.txt /path/to/llm_hidden_states.bin --dump-merged /tmp/minicpm-o-uya-merged.bin
 build/minicpm-o-uya tts-simplex-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_debug --count 4 --out-dir /tmp/minicpm-o-uya-ttsprobe
 build/minicpm-o-uya token2wav-bind /path/to/token2wav-gguf
