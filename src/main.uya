@@ -61,7 +61,8 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--dump-f32 out.uyml]\n");
     _ = printf("  minicpm-o-uya audio-real-encode-probe <audio.gguf> <audio.wav|audio.uyap.pcm>\n");
     _ = printf("  minicpm-o-uya audio2audio-smoke <model.gguf> [--audio-model audio.gguf] [--speech-model speech.gguf] [--vocoder-model vocoder.gguf] <audio.pcm|audio.raw> [out.wav]\n");
-    _ = printf("  minicpm-o-uya audio2audio-real [--audit-only] --llm <llm.gguf> --audio <audio.gguf> --tts <tts.gguf> --projector <projector.gguf> --token2wav-dir <dir>\n");
+    _ = printf("  minicpm-o-uya audio2audio-real [--audit-only] [--text-only|--no-tts] [--dump-hidden] [--dump-embeddings] [--max-new-tokens N] [--threads N] [--seed N] [--verbose]\n");
+    _ = printf("    --llm <llm.gguf> --audio <audio.gguf> [--tts <tts.gguf> --projector <projector.gguf> --token2wav-dir <dir>]\n");
     _ = printf("    [--ref-audio ref.wav] [--user-audio user.wav|--input-audio user.wav] [--input-prefix prefix] [--test-prefix prefix --count N] [--out out.wav]\n");
     _ = printf("  minicpm-o-uya speech-smoke <model.gguf> <prompt> [out.wav]\n");
     _ = printf("  minicpm-o-uya tts-bind <tts.gguf>\n");

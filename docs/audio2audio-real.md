@@ -87,7 +87,7 @@ A manual text alignment target is available for the same text GGUF: `MINICPM_O_T
 
 A manual audio preprocessing probe is available as `build/minicpm-o-uya audio-real-preprocess-probe <audio.wav|audio.uyap.pcm>`, and a numeric mel probe is available as `MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-mel-probe`. It validates 16 kHz mono PCM16/F32 WAV or UYAP input and prints the llama.cpp-omni MiniCPM-o preprocessing plan: `frame_size=400`, `filter_bins=201`, `hop_length=160`, `mel_bins=80`, 100ms sample alignment, 200-sample center padding on each side, conv2 downsampling, and pool(5,5) `encoder_positions`. The `audio2audio-real --audit-only` input path now prints this plan for both ref and user audio. The numeric mel probe runs periodic Hann, DFT/STFT power, the GGUF `filters` mel filterbank, and llama.cpp-omni style log10 clamp/normalization, then prints frames/elements/checksum/sample values.
 
-A correctness-first encoder forward probe is now available as `MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-encode-probe`. It runs the official `encoder.conv1/2`, 24-layer transformer, `encoder.ln_post`, `audio_projector.linear1/2`, and final pool(5,5), then prints `mel_frames`, `conv_tokens`, `pooled_tokens`, `n_pos`, `n_embd`, embedding checksum, and encode wall time. On the local 1-second sample `/tmp/minicpm-o-uya-real-probe.wav`, the current reference implementation reports `n_pos=10`, `n_embd=4096`, checksum `0xb95329ca`, and `encode_ms≈96870.831`, so this path is still intended for correctness/alignment work rather than speed.
+A correctness-first encoder forward probe is now available as `MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-encode-probe`. It runs the official `encoder.conv1/2`, 24-layer transformer, `encoder.ln_post`, `audio_projector.linear1/2`, and final pool(5,5), then prints `mel_frames`, `conv_tokens`, `pooled_tokens`, `n_pos`, `n_embd`, embedding checksum, and encode wall time. The real loader no longer keeps the previous `480000 samples` hard cap, so the probe can be used on longer real clips as long as the current reference implementation still fits memory and the encoder context. On the local 1-second sample `/tmp/minicpm-o-uya-real-probe.wav`, the current reference implementation reports `n_pos=10`, `n_embd=4096`, checksum `0xb95329ca`, and `encode_ms≈96870.831`, so this path is still intended for correctness/alignment work rather than speed.
 
 `audio-real-mel-probe` also accepts `--dump-f32 out.uyml`, which writes a compact binary dump for full-array comparison:
 
@@ -331,9 +331,23 @@ Current `flow` probe reports:
 
 ## Current Uya Status
 
-`audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, or `--test-prefix prefix --count N` for the llama.cpp-omni convention where `0000` is reference voice and `0001..` are user turns. The next implementation layer is to replace the current surrogate `mu` flow probe with real `encoder.gguf -> mu` and then wire HiFiGAN2:
+`audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, or `--test-prefix prefix --count N` for the llama.cpp-omni convention where `0000` is reference voice and `0001..` are user turns.
+
+There is now also a real text-only diagnostic path:
+
+```sh
+build/minicpm-o-uya audio2audio-real --text-only \
+  --llm models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+  --audio models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf \
+  --ref-audio outputs/complex_case2/complex2_0000.wav \
+  --user-audio outputs/complex_case2/complex2_0001.wav \
+  --dump-embeddings --dump-hidden --max-new-tokens 64
+```
+
+This path already follows the non-duplex `llama.cpp-omni` prompt order: system prompt prefix + reference audio embedding, then the user turn with `<|audio_start|>`/`<|audio_end|>`, then a plain assistant text prompt. It prints `ref/user n_pos`, embedding checksums, and load/prefill/decode timing, and it is intended as the last correctness gate before reconnecting TTS/token2wav. The next implementation layer is to replace the current surrogate `mu` flow probe with real `encoder.gguf -> mu` and then wire HiFiGAN2:
 
 - Audio encoder: bind complete, and `audio-real-encode-probe` now runs correctness-first `conv + transformer + projector + pool` forward for short real clips; it is still too slow for practical long-turn inference.
+- Real text-only answer path: `audio2audio-real --text-only/--no-tts` now runs ref-audio system prompt + user-audio turn + Qwen3 text decode, but it still does not emit answer WAV or TTS token dumps.
 - TTS model: bind-only complete for `emb_code.*`, `emb_text.*`, decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, and `head_code.*`; `tts-condition-probe` now aligns `emb_text + projector_semantic + normalize + merge` against `llama.cpp-omni`, while decode/cache forward still pending.
 - Projector: `linear1.*`, `linear2.*`
 - Token2wav encoder: bind-only complete for `after_norm.*`, `embed.*`, `encoders.*`, `pre_lookahead_layer.*`, `up_embed.*`, `up_encoders.*`, and `up_layer.*`

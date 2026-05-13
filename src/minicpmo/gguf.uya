@@ -5,6 +5,9 @@ use minicpmo.audio.audio_input_probe_file;
 use minicpmo.audio.audio_real_encode_probe_file;
 use minicpmo.audio.audio_real_preprocess_probe_file;
 use minicpmo.audio.audio_real_bind_file;
+use minicpmo.audio.audio2audio_real_text_cli;
+use minicpmo.qwen3.Qwen3SamplerConfig;
+use minicpmo.qwen3.qwen3_sampler_init;
 use minicpmo.speech.speech_tts_bind_file;
 use minicpmo.token2wav.token2wav_bind_dir_cli;
 use minicpmo.binary.BinaryReader;
@@ -1403,7 +1406,7 @@ fn audit_parse_u32_value(text: &const byte, out: &u32) bool {
 }
 
 fn audit_bundle_usage() void {
-    _ = printf("usage: minicpm-o-uya audio2audio-real [--audit-only] [--encode-probe] --llm <llm.gguf> --audio <audio.gguf> --tts <tts.gguf> --projector <projector.gguf> --token2wav-dir <dir>\n");
+    _ = printf("usage: minicpm-o-uya audio2audio-real [--audit-only] [--encode-probe] [--text-only|--no-tts] [--dump-hidden] [--dump-embeddings] [--max-new-tokens N] [--threads N] [--seed N] [--verbose] --llm <llm.gguf> --audio <audio.gguf> [--tts <tts.gguf> --projector <projector.gguf> --token2wav-dir <dir>]\n");
     _ = printf("       [--ref-audio ref.wav] [--user-audio user.wav|--input-audio user.wav] [--input-prefix prefix] [--test-prefix prefix --count N] [--out out.wav]\n");
 }
 
@@ -1424,6 +1427,10 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
     var prefix_user_path: [byte: 512] = [];
     var audit_only: bool = false;
     var encode_probe: bool = false;
+    var text_only: bool = false;
+    var no_tts: bool = false;
+    var dump_embeddings: bool = false;
+    var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
     var i: i32 = 2;
     while i < argc {
         if strcmp(argv[i] as *const byte, "--audit-only\0" as *const byte) == 0 {
@@ -1434,6 +1441,46 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
         if strcmp(argv[i] as *const byte, "--encode-probe\0" as *const byte) == 0 {
             encode_probe = true;
             i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--text-only\0" as *const byte) == 0 {
+            text_only = true;
+            i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--no-tts\0" as *const byte) == 0 {
+            no_tts = true;
+            i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--dump-hidden\0" as *const byte) == 0 {
+            sampler.dump_hidden = true;
+            i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--dump-embeddings\0" as *const byte) == 0 {
+            dump_embeddings = true;
+            i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--verbose\0" as *const byte) == 0 {
+            sampler.verbose = true;
+            i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--max-new-tokens\0" as *const byte) == 0 {
+            if i + 1 >= argc || !audit_parse_u32_value(argv[i + 1] as &const byte, &sampler.max_new_tokens) { audit_bundle_usage(); return 1; }
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--threads\0" as *const byte) == 0 {
+            if i + 1 >= argc || !audit_parse_u32_value(argv[i + 1] as &const byte, &sampler.threads) { audit_bundle_usage(); return 1; }
+            i = i + 2;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--seed\0" as *const byte) == 0 {
+            if i + 1 >= argc || !audit_parse_u32_value(argv[i + 1] as &const byte, &sampler.seed) { audit_bundle_usage(); return 1; }
+            i = i + 2;
             continue;
         }
         if strcmp(argv[i] as *const byte, "--llm\0" as *const byte) == 0 {
@@ -1505,7 +1552,12 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
         audit_bundle_usage();
         return 1;
     }
-    if llm_path == null || audio_path == null || tts_path == null || projector_path == null || token2wav_dir == null {
+    const text_path_only: bool = text_only || no_tts;
+    if llm_path == null || audio_path == null {
+        audit_bundle_usage();
+        return 1;
+    }
+    if !text_path_only && (tts_path == null || projector_path == null || token2wav_dir == null) {
         audit_bundle_usage();
         return 1;
     }
@@ -1538,35 +1590,43 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
         _ = printf("error: audio2audio-real requires both ref and user audio; use --ref-audio with --user-audio, --input-prefix, or --test-prefix with --count\n");
         return 1;
     }
+    if text_path_only && test_prefix != null {
+        _ = printf("error: audio2audio-real text-only path currently supports a single user turn; use --ref-audio with --user-audio or --input-prefix\n");
+        return 1;
+    }
 
     _ = printf("audio2audio-real: bundle validation\n");
     var ok: bool = true;
     if !audit_bundle_one("llm\0" as &const byte, llm_path) { ok = false; }
     if !audit_bundle_one("audio\0" as &const byte, audio_path) { ok = false; }
     else { if !audio_real_bind_file(audio_path) { ok = false; } }
-    if !audit_bundle_one("tts\0" as &const byte, tts_path) { ok = false; }
-    else { if !speech_tts_bind_file(tts_path) { ok = false; } }
-    if !audit_bundle_one("projector\0" as &const byte, projector_path) { ok = false; }
+    if !text_path_only {
+        if !audit_bundle_one("tts\0" as &const byte, tts_path) { ok = false; }
+        else { if !speech_tts_bind_file(tts_path) { ok = false; } }
+        if !audit_bundle_one("projector\0" as &const byte, projector_path) { ok = false; }
+    }
 
     var path: [byte: 512] = [];
-    if audit_join_path(token2wav_dir, "encoder.gguf\0" as &const byte, &path[0], @len(path)) {
-        if !audit_bundle_one("token2wav.encoder\0" as &const byte, &path[0] as &const byte) { ok = false; }
-    } else { ok = false; }
-    if audit_join_path(token2wav_dir, "flow_matching.gguf\0" as &const byte, &path[0], @len(path)) {
-        if !audit_bundle_one("token2wav.flow_matching\0" as &const byte, &path[0] as &const byte) { ok = false; }
-    } else { ok = false; }
-    if audit_join_path(token2wav_dir, "flow_extra.gguf\0" as &const byte, &path[0], @len(path)) {
-        if !audit_bundle_one("token2wav.flow_extra\0" as &const byte, &path[0] as &const byte) { ok = false; }
-    } else { ok = false; }
-    if audit_join_path(token2wav_dir, "hifigan2.gguf\0" as &const byte, &path[0], @len(path)) {
-        if !audit_bundle_one("token2wav.hifigan2\0" as &const byte, &path[0] as &const byte) { ok = false; }
-    } else { ok = false; }
-    if audit_join_path(token2wav_dir, "prompt_cache.gguf\0" as &const byte, &path[0], @len(path)) {
-        if !audit_bundle_one("token2wav.prompt_cache\0" as &const byte, &path[0] as &const byte) { ok = false; }
-    } else { ok = false; }
+    if !text_path_only {
+        if audit_join_path(token2wav_dir, "encoder.gguf\0" as &const byte, &path[0], @len(path)) {
+            if !audit_bundle_one("token2wav.encoder\0" as &const byte, &path[0] as &const byte) { ok = false; }
+        } else { ok = false; }
+        if audit_join_path(token2wav_dir, "flow_matching.gguf\0" as &const byte, &path[0], @len(path)) {
+            if !audit_bundle_one("token2wav.flow_matching\0" as &const byte, &path[0] as &const byte) { ok = false; }
+        } else { ok = false; }
+        if audit_join_path(token2wav_dir, "flow_extra.gguf\0" as &const byte, &path[0], @len(path)) {
+            if !audit_bundle_one("token2wav.flow_extra\0" as &const byte, &path[0] as &const byte) { ok = false; }
+        } else { ok = false; }
+        if audit_join_path(token2wav_dir, "hifigan2.gguf\0" as &const byte, &path[0], @len(path)) {
+            if !audit_bundle_one("token2wav.hifigan2\0" as &const byte, &path[0] as &const byte) { ok = false; }
+        } else { ok = false; }
+        if audit_join_path(token2wav_dir, "prompt_cache.gguf\0" as &const byte, &path[0], @len(path)) {
+            if !audit_bundle_one("token2wav.prompt_cache\0" as &const byte, &path[0] as &const byte) { ok = false; }
+        } else { ok = false; }
+    }
 
     if !ok { return 1; }
-    if token2wav_bind_dir_cli(token2wav_dir) != 0 { return 1; }
+    if !text_path_only && token2wav_bind_dir_cli(token2wav_dir) != 0 { return 1; }
     if test_prefix != null {
         _ = printf("audio2audio-real test protocol: prefix=%s count=%u ref_audio=%s user_turns=%u\n", test_prefix, test_count, ref_audio_path, test_count - 1);
         if out_path != null { _ = printf("audio2audio-real output target: %s\n", out_path); }
@@ -1600,7 +1660,13 @@ export fn audio2audio_real_args_cli(argc: i32, argv: & &byte) i32 {
         _ = printf("audio2audio-real: inference_supported=false next=token2wav-flow-forward-and-hifigan-forward\n");
         return 0;
     }
+    if text_path_only {
+        if out_path != null {
+            _ = printf("audio2audio-real: note: --out is ignored in text-only/no-tts mode until WAV synthesis is implemented\n");
+        }
+        return audio2audio_real_text_cli(llm_path, audio_path, ref_audio_path, user_audio_path, &sampler, dump_embeddings);
+    }
     _ = printf("error: audio2audio-real inference is not implemented yet; use --audit-only to validate bundle and input protocol\n");
-    _ = printf("audio2audio-real: inference_supported=false next=token2wav-flow-forward-and-hifigan-forward\n");
+    _ = printf("audio2audio-real: inference_supported=false next=run-with---no-tts-for-text-only-or-continue-token2wav-and-hifigan-forward\n");
     return 1;
 }

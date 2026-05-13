@@ -53,6 +53,7 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `audio-real-preprocess-probe <audio.wav\|audio.uyap.pcm>` | Real MiniCPM-o preprocessing plan | 100 ms align, center pad, conv/pool token planning |
 | `audio-real-mel-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real numeric mel probe | Supports `--dump-f32 out.uyml` for full-array alignment |
 | `audio-real-encode-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real audio encoder forward probe | Correctness-first `conv + transformer + projector + pool` path |
+| `audio2audio-real --text-only --llm <llm.gguf> --audio <audio.gguf> --ref-audio ref.wav --user-audio user.wav` | Real ref-audio + user-audio to text answer | Uses official non-duplex prompt order; prints embedding/timing diagnostics |
 | `token2wav-bind <token2wav-gguf-dir>` | Real token2wav/HiFiGAN bind-only validation | Validates official `encoder`/`flow_*`/`hifigan2`/`prompt_cache` layouts |
 | `token2wav-prompt-cache-probe <prompt_cache.gguf>` | Real prompt-cache probe | Reads prompt-cache metadata, tensor sizes, and cache checksums |
 | `token2wav-window-probe <prompt_cache.gguf> <audio_tokens_chunk.txt>` | Real token window planner | Prints `28/25` sliding-window calls for token2wav streaming |
