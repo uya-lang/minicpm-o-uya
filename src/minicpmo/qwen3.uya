@@ -1890,6 +1890,82 @@ export fn qwen3_generate_capture(config: &Qwen3Config, weights: &Qwen3Weights, r
     return 0;
 }
 
+export fn qwen3_generate_capture_hidden(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, sampler: &Qwen3SamplerConfig, tok: &Tokenizer, logits: &f32, text_label: &const byte, capture: &byte, capture_cap: usize, capture_len: &usize, out_ids: &u32, out_id_cap: usize, out_hidden: &f32, out_hidden_cap_tokens: usize, out_generated: &usize) i32 {
+    capture_len[0] = 0;
+    out_generated[0] = 0;
+    if capture_cap > 0 {
+        capture[0] = 0;
+    }
+    if sampler.dump_hidden && runtime.last_hidden_valid && runtime.total_tokens > 0 {
+        qwen3_print_hidden_summary("prompt hidden\0" as &const byte, runtime.total_tokens - (1 as usize), runtime.prompt_ids[runtime.total_tokens - (1 as usize)], runtime.last_hidden as &const f32, runtime.last_hidden_len);
+    }
+    var generated: usize = 0;
+    const hidden_n: usize = config.hidden_size as usize;
+    if sampler.verbose {
+        _ = printf("threads: %zu\n", qwen3_thread_count);
+    }
+    _ = printf("%s: ", text_label);
+    _ = fflush(stdout);
+    while sampler.max_new_tokens == 0 || generated < sampler.max_new_tokens as usize {
+        if runtime.total_tokens >= config.context_length as usize || runtime.total_tokens >= runtime.context_capacity {
+            _ = printf("\n");
+            _ = printf("stop: context_limit=%zu model_context=%u total_tokens=%zu\n", runtime.context_capacity, config.context_length, runtime.total_tokens);
+            out_generated[0] = generated;
+            return 0;
+        }
+        if generated >= out_id_cap || generated >= out_hidden_cap_tokens {
+            _ = printf("\n");
+            _ = printf("error: generated hidden capture exceeds cap ids=%zu hidden_tokens=%zu generated=%zu\n", out_id_cap, out_hidden_cap_tokens, generated);
+            return 1;
+        }
+        const next_id: u32 = qwen3_sample(logits, config.vocab_size as usize, runtime.prompt_ids, runtime.total_tokens, sampler, &runtime.seed);
+        if sampler.verbose {
+            _ = printf("sampled token[%zu]: %u piece=%s\n", generated, next_id, tokenizer_piece(tok, next_id));
+        }
+        if next_id == sampler.stop_token {
+            _ = printf("\n");
+            _ = printf("stop: token=%u\n", next_id);
+            out_generated[0] = generated;
+            return 0;
+        }
+        var piece_text: [byte: QWEN3_GENERATED_TEXT_CAP] = [];
+        var piece_text_pos: usize = 0;
+        if !tokenizer_append_piece_text(tok, next_id, &piece_text[0], QWEN3_GENERATED_TEXT_CAP, &piece_text_pos) {
+            _ = printf("error: generated text exceeds buffer cap=%zu\n", QWEN3_GENERATED_TEXT_CAP);
+            return 1;
+        }
+        if capture_cap > 0 && !qwen3_capture_append(capture, capture_cap, capture_len, &piece_text[0] as &const byte) {
+            _ = printf("error: generated capture exceeds buffer cap=%zu\n", capture_cap);
+            return 1;
+        }
+        _ = printf("%s", &piece_text[0]);
+        _ = fflush(stdout);
+        runtime.prompt_ids[runtime.total_tokens] = next_id;
+        runtime.total_tokens = runtime.total_tokens + 1;
+        const will_stop_after_token: bool = sampler.max_new_tokens != 0 && (generated + (1 as usize)) >= sampler.max_new_tokens as usize;
+        const compute_next_logits: bool = !will_stop_after_token;
+        if !qwen3_forward_token_with_rope(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, compute_next_logits, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity, runtime.last_hidden, runtime.last_hidden_len) { return 1; }
+        runtime.last_hidden_valid = true;
+        out_ids[generated] = next_id;
+        var hidden_i: usize = 0;
+        while hidden_i < hidden_n {
+            out_hidden[generated * hidden_n + hidden_i] = runtime.last_hidden[hidden_i];
+            hidden_i = hidden_i + 1;
+        }
+        if sampler.dump_hidden {
+            _ = printf("\n");
+            qwen3_print_hidden_summary("generated hidden\0" as &const byte, generated, next_id, runtime.last_hidden as &const f32, runtime.last_hidden_len);
+        }
+        generated = generated + 1;
+    }
+    _ = printf("\n");
+    if sampler.max_new_tokens != 0 {
+        _ = printf("stop: max_new_tokens=%u\n", sampler.max_new_tokens);
+    }
+    out_generated[0] = generated;
+    return 0;
+}
+
 fn qwen3_generate_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, sampler: &Qwen3SamplerConfig, tok: &Tokenizer, logits: &f32, text_label: &const byte, preserve_final_cache: bool) i32 {
     var ignored_capture: [byte: 1] = [];
     var ignored_len: usize = 0;

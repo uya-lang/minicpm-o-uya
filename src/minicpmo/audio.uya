@@ -9,6 +9,7 @@ use libc.log10f;
 use libc.printf;
 use libc.sinf;
 use libc.sqrtf;
+use libc.snprintf;
 use libc.strcmp;
 use libc.sys_close;
 use libc.sys_open;
@@ -41,6 +42,7 @@ use minicpmo.qwen3.qwen3_config_load_metadata;
 use minicpmo.qwen3.qwen3_forward_embedding;
 use minicpmo.qwen3.qwen3_forward_token;
 use minicpmo.qwen3.qwen3_generate_capture;
+use minicpmo.qwen3.qwen3_generate_capture_hidden;
 use minicpmo.qwen3.qwen3_open_runtime;
 use minicpmo.qwen3.qwen3_runtime_init;
 use minicpmo.qwen3.qwen3_set_thread_count;
@@ -58,6 +60,7 @@ use minicpmo.speech.speech_checksum_waveform;
 use minicpmo.speech.speech_default_wav_path;
 use minicpmo.speech.speech_config_init;
 use minicpmo.speech.speech_generate_tokens;
+use minicpmo.speech.speech_tts_simplex_run_chunks;
 use minicpmo.speech.speech_waveform_analyze;
 use minicpmo.speech.speech_waveform_init;
 use minicpmo.speech.speech_wav_write;
@@ -80,6 +83,7 @@ use minicpmo.tokenizer.tokenizer_chat_stop_token;
 use minicpmo.tokenizer.tokenizer_encode_to_ids;
 use minicpmo.tokenizer.tokenizer_init;
 use minicpmo.tokenizer.tokenizer_load;
+use minicpmo.tokenizer.tokenizer_piece;
 
 const AUDIO_GGUF_MAGIC: u32 = 0x46554747;
 const AUDIO_RAW_MAGIC: u32 = 0x4d415955;
@@ -134,7 +138,11 @@ const AUDIO_INFO_CONTAINER_UYAP: u32 = 2;
 const AUDIO_INFO_DTYPE_S16: u32 = 1;
 const AUDIO_INFO_DTYPE_F32: u32 = 2;
 const AUDIO2AUDIO_REAL_DEFAULT_MAX_NEW_TOKENS: u32 = 128;
+const AUDIO2AUDIO_REAL_DEFAULT_MAX_AUDIO_TOKENS: u32 = 500;
 const AUDIO2AUDIO_REAL_ANSWER_CAP: usize = 32768;
+const AUDIO2AUDIO_REAL_TIMING_CAP: usize = 2048;
+const AUDIO2AUDIO_REAL_MAX_TTS_CHUNKS: usize = 128;
+const AUDIO2AUDIO_REAL_TTS_CHUNK_TOKENS: usize = 48;
 const AUDIO2AUDIO_REAL_SYSTEM_PREFIX: &const byte = "<|im_start|>system\nClone the voice in the provided audio prompt.\n<|audio_start|>\0" as &const byte;
 const AUDIO2AUDIO_REAL_SYSTEM_SUFFIX: &const byte = "<|audio_end|>Please assist users while maintaining this voice style. Please answer the user's questions seriously and in a high quality. Please chat with the user in a highly human-like and oral style. You are a helpful assistant developed by ModelBest: MiniCPM-Omni.<|im_end|>\n<|im_start|>user\n\0" as &const byte;
 const AUDIO2AUDIO_REAL_USER_AUDIO_PREFIX: &const byte = "<|audio_start|>\0" as &const byte;
@@ -1083,6 +1091,161 @@ fn audio_real_mel_dump_write(path: &const byte, mel_values: &f32, mel_frames: u6
     };
     _ = printf("audio-real-mel dump: path=%s format=uyml-f32 frames=%llu mel_bins=%u bytes=%zu\n", path, mel_frames, mel_bins, data_bytes + (16 as usize));
     return true;
+}
+
+fn audio2audio_write_text_file(path: &const byte, text: &const byte) bool {
+    const fd_result: !i32 = sys_open(path as *const byte, (O_WRONLY | O_CREAT | O_TRUNC) as i32, 420);
+    const fd: i32 = fd_result catch {
+        _ = printf("error: audio2audio-real cannot open text path=%s\n", path);
+        return false;
+    };
+    var len: usize = 0;
+    while text[len] != 0 { len = len + 1; }
+    const ok: bool = audio_real_write_all(fd, text, len, path, "text\0" as &const byte);
+    const close_result: !i32 = sys_close(fd);
+    close_result catch {
+        _ = printf("error: audio2audio-real text close failed path=%s\n", path);
+        return false;
+    };
+    return ok;
+}
+
+fn audio2audio_write_token_ids_text(path: &const byte, token_ids: &const u32, token_count: usize) bool {
+    const fd_result: !i32 = sys_open(path as *const byte, (O_WRONLY | O_CREAT | O_TRUNC) as i32, 420);
+    const fd: i32 = fd_result catch {
+        _ = printf("error: audio2audio-real cannot open token ids path=%s\n", path);
+        return false;
+    };
+    var ok: bool = true;
+    var token_index: usize = 0;
+    while token_index < token_count {
+        var tmp: [byte: 32] = [];
+        const written: i32 = snprintf(&tmp[0] as *byte, @len(tmp), "%u\0" as *const byte, token_ids[token_index]);
+        if written < 0 || (written as usize) >= @len(tmp) {
+            _ = printf("error: audio2audio-real token format failed path=%s index=%zu\n", path, token_index);
+            ok = false;
+            break;
+        }
+        if !audio_real_write_all(fd, &tmp[0] as &const byte, written as usize, path, "token\0" as &const byte) { ok = false; break; }
+        if token_index + 1 < token_count {
+            const sep: [byte: 1] = [44 as byte];
+            if !audio_real_write_all(fd, &sep[0] as &const byte, 1, path, "token-sep\0" as &const byte) { ok = false; break; }
+        } else {
+            const nl: [byte: 1] = [10 as byte];
+            if !audio_real_write_all(fd, &nl[0] as &const byte, 1, path, "token-nl\0" as &const byte) { ok = false; break; }
+        }
+        token_index = token_index + 1;
+    }
+    const close_result: !i32 = sys_close(fd);
+    close_result catch {
+        _ = printf("error: audio2audio-real token ids close failed path=%s\n", path);
+        return false;
+    };
+    return ok;
+}
+
+fn audio2audio_write_hidden_bin(path: &const byte, hidden_states: &f32, token_count: usize, hidden_size: usize) bool {
+    if token_count > 0xffffffff as usize || hidden_size > 0xffffffff as usize {
+        _ = printf("error: audio2audio-real hidden dump exceeds u32 header token_count=%zu hidden_size=%zu\n", token_count, hidden_size);
+        return false;
+    }
+    const fd_result: !i32 = sys_open(path as *const byte, (O_WRONLY | O_CREAT | O_TRUNC) as i32, 420);
+    const fd: i32 = fd_result catch {
+        _ = printf("error: audio2audio-real cannot open hidden path=%s\n", path);
+        return false;
+    };
+    var header: [byte: 8] = [];
+    audio_real_write_u32_le(&header[0], 0, token_count as u32);
+    audio_real_write_u32_le(&header[0], 4, hidden_size as u32);
+    var ok: bool = audio_real_write_all(fd, &header[0] as &const byte, 8, path, "hidden-header\0" as &const byte);
+    const total_values: usize = token_count * hidden_size;
+    if ok && total_values > 0 {
+        ok = audio_real_write_all(fd, hidden_states as &const byte, total_values * (4 as usize), path, "hidden-payload\0" as &const byte);
+    }
+    const close_result: !i32 = sys_close(fd);
+    close_result catch {
+        _ = printf("error: audio2audio-real hidden close failed path=%s\n", path);
+        return false;
+    };
+    return ok;
+}
+
+fn audio2audio_find_parent_dir(path: &const byte, out: &byte, cap: usize) bool {
+    var len: usize = 0;
+    while path[len] != 0 { len = len + 1; }
+    if len + 1 > cap { return false; }
+    var slash: usize = len;
+    while slash > 0 {
+        if path[slash - 1] == 47 { break; }
+        slash = slash - 1;
+    }
+    if slash == 0 {
+        if cap < 2 { return false; }
+        out[0] = 46;
+        out[1] = 0;
+        return true;
+    }
+    var i: usize = 0;
+    while i + 1 < slash {
+        out[i] = path[i];
+        i = i + 1;
+    }
+    if slash == 1 {
+        out[0] = 47;
+        out[1] = 0;
+        return true;
+    }
+    out[slash - 1] = 0;
+    return true;
+}
+
+fn audio2audio_build_artifact_path(out: &byte, cap: usize, dir: &const byte, leaf: &const byte) bool {
+    const written: i32 = snprintf(out as *byte, cap, "%s/%s\0" as *const byte, dir, leaf);
+    return written >= 0 && (written as usize) < cap;
+}
+
+fn audio2audio_piece_is_chunk_boundary(piece: &const byte) bool {
+    if strcmp(piece as *const byte, ".\0" as *const byte) == 0 || strcmp(piece as *const byte, "!\0" as *const byte) == 0 || strcmp(piece as *const byte, "?\0" as *const byte) == 0 { return true; }
+    if strcmp(piece as *const byte, ",\0" as *const byte) == 0 || strcmp(piece as *const byte, ";\0" as *const byte) == 0 || strcmp(piece as *const byte, ":\0" as *const byte) == 0 { return true; }
+    if strcmp(piece as *const byte, "\n\0" as *const byte) == 0 { return true; }
+    if strcmp(piece as *const byte, "。\0" as *const byte) == 0 || strcmp(piece as *const byte, "！\0" as *const byte) == 0 || strcmp(piece as *const byte, "？\0" as *const byte) == 0 { return true; }
+    if strcmp(piece as *const byte, "，\0" as *const byte) == 0 || strcmp(piece as *const byte, "；\0" as *const byte) == 0 || strcmp(piece as *const byte, "：\0" as *const byte) == 0 { return true; }
+    return false;
+}
+
+fn audio2audio_plan_tts_chunks(tok: &Tokenizer, token_ids: &const u32, token_count: usize, chunk_offsets: &u32, chunk_lengths: &u32, chunk_count: &u32) bool {
+    *chunk_count = 0;
+    if token_count == 0 { return false; }
+    var start: usize = 0;
+    var i: usize = 0;
+    while i < token_count {
+        const piece: &const byte = tokenizer_piece(tok, token_ids[i]);
+        const span: usize = i - start + 1;
+        var flush: bool = false;
+        if span >= AUDIO2AUDIO_REAL_TTS_CHUNK_TOKENS { flush = true; }
+        else { if span >= 8 && audio2audio_piece_is_chunk_boundary(piece) { flush = true; } }
+        if flush {
+            if *chunk_count >= AUDIO2AUDIO_REAL_MAX_TTS_CHUNKS as u32 {
+                _ = printf("error: audio2audio-real chunk count exceeds cap=%zu\n", AUDIO2AUDIO_REAL_MAX_TTS_CHUNKS);
+                return false;
+            }
+            chunk_offsets[*chunk_count as usize] = start as u32;
+            chunk_lengths[*chunk_count as usize] = span as u32;
+            *chunk_count = *chunk_count + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < token_count {
+        if *chunk_count >= AUDIO2AUDIO_REAL_MAX_TTS_CHUNKS as u32 {
+            _ = printf("error: audio2audio-real chunk count exceeds cap=%zu\n", AUDIO2AUDIO_REAL_MAX_TTS_CHUNKS);
+            return false;
+        }
+        chunk_offsets[*chunk_count as usize] = start as u32;
+        chunk_lengths[*chunk_count as usize] = (token_count - start) as u32;
+        *chunk_count = *chunk_count + 1;
+    }
+    return *chunk_count > 0;
 }
 
 fn audio_real_mel_compute(pcm: &AudioRealPcmHeap, filters: &AudioRealFilterBank, mel_values: &f32, mel_frames: u64, aligned_samples: u64) bool {
@@ -2057,7 +2220,7 @@ export fn audio_real_encode_probe_cli(audio_model_path: &const byte, audio_path:
     return 0;
 }
 
-export fn audio2audio_real_text_cli(llm_path: &const byte, audio_model_path: &const byte, ref_audio_path: &const byte, user_audio_path: &const byte, sampler_in: &Qwen3SamplerConfig, dump_embeddings: bool) i32 {
+fn audio2audio_real_generate_cli(llm_path: &const byte, audio_model_path: &const byte, ref_audio_path: &const byte, user_audio_path: &const byte, sampler_in: &Qwen3SamplerConfig, dump_embeddings: bool, tts_path: &const byte, projector_path: &const byte, out_path: &const byte, enable_tts: bool) i32 {
     var ref_span: AudioRealEncodedSpan = audio_real_encoded_span_init();
     if !audio_real_encode_collect(audio_model_path, ref_audio_path, "ref\0" as &const byte, &ref_span) { return 1; }
     var user_span: AudioRealEncodedSpan = audio_real_encoded_span_init();
@@ -2129,8 +2292,10 @@ export fn audio2audio_real_text_cli(llm_path: &const byte, audio_model_path: &co
     const prefill_us: u64 = audio_real_clock_us() - prefill_start_us;
     const prompt_tokens: usize = runtime.total_tokens;
 
-    _ = printf("audio2audio-real[text-only]: llm=%s ref_audio=%s user_audio=%s prompt_tokens=%zu stop_token=%u\n", llm_path, ref_audio_path, user_audio_path, prompt_tokens, sampler.stop_token);
-    _ = printf("audio2audio-real[text-only]: ref_n_pos=%zu ref_checksum=0x%x ref_encode_ms=%.3f user_n_pos=%zu user_checksum=0x%x user_encode_ms=%.3f prefill_ms=%.3f load_ms=%.3f\n", ref_span.span_count, ref_span.checksum, (ref_span.encode_us as f64) / 1000.0, user_span.span_count, user_span.checksum, (user_span.encode_us as f64) / 1000.0, (prefill_us as f64) / 1000.0, (load_us as f64) / 1000.0);
+    var mode_label: &const byte = "text-only\0" as &const byte;
+    if enable_tts { mode_label = "tts-audio-tokens\0" as &const byte; }
+    _ = printf("audio2audio-real[%s]: llm=%s ref_audio=%s user_audio=%s prompt_tokens=%zu stop_token=%u\n", mode_label, llm_path, ref_audio_path, user_audio_path, prompt_tokens, sampler.stop_token);
+    _ = printf("audio2audio-real[%s]: ref_n_pos=%zu ref_checksum=0x%x ref_encode_ms=%.3f user_n_pos=%zu user_checksum=0x%x user_encode_ms=%.3f prefill_ms=%.3f load_ms=%.3f\n", mode_label, ref_span.span_count, ref_span.checksum, (ref_span.encode_us as f64) / 1000.0, user_span.span_count, user_span.checksum, (user_span.encode_us as f64) / 1000.0, (prefill_us as f64) / 1000.0, (load_us as f64) / 1000.0);
     if dump_embeddings {
         _ = printf("audio2audio-real embedding[ref] values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", ref_span.values[0] as f64, ref_span.values[1] as f64, ref_span.values[2] as f64, ref_span.values[3] as f64, ref_span.values[4] as f64, ref_span.values[5] as f64);
         _ = printf("audio2audio-real embedding[user] values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", user_span.values[0] as f64, user_span.values[1] as f64, user_span.values[2] as f64, user_span.values[3] as f64, user_span.values[4] as f64, user_span.values[5] as f64);
@@ -2138,18 +2303,181 @@ export fn audio2audio_real_text_cli(llm_path: &const byte, audio_model_path: &co
 
     var answer: [byte: AUDIO2AUDIO_REAL_ANSWER_CAP] = [];
     var answer_len: usize = 0;
+    const need_hidden_capture: bool = enable_tts || out_path != null;
+    const generated_cap: usize = sampler.max_new_tokens as usize;
+    var generated_ids: &u32 = null;
+    var generated_hidden: &f32 = null;
+    if need_hidden_capture {
+        generated_ids = calloc(generated_cap, 4) as &u32;
+        generated_hidden = calloc(generated_cap * (config.hidden_size as usize), 4) as &f32;
+        if generated_ids == null || generated_hidden == null {
+            _ = printf("error: audio2audio-real generated capture allocation failed tokens=%zu hidden=%u\n", generated_cap, config.hidden_size);
+            free(generated_ids as &void);
+            free(generated_hidden as &void);
+            free(logits as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            audio_real_encoded_span_free(&user_span);
+            audio_real_encoded_span_free(&ref_span);
+            return 1;
+        }
+    }
+    var generated_count: usize = 0;
     const decode_start_us: u64 = audio_real_clock_us();
-    const rc: i32 = qwen3_generate_capture(&config, &weights, &runtime, &sampler, &tok, logits, "audio2audio-real answer\0" as &const byte, false, &answer[0], @len(answer), &answer_len);
+    var rc: i32 = 0;
+    if need_hidden_capture {
+        rc = qwen3_generate_capture_hidden(&config, &weights, &runtime, &sampler, &tok, logits, "audio2audio-real answer\0" as &const byte, &answer[0], @len(answer), &answer_len, generated_ids, generated_cap, generated_hidden, generated_cap, &generated_count);
+    } else {
+        rc = qwen3_generate_capture(&config, &weights, &runtime, &sampler, &tok, logits, "audio2audio-real answer\0" as &const byte, false, &answer[0], @len(answer), &answer_len);
+    }
     const decode_us: u64 = audio_real_clock_us() - decode_start_us;
+    var tts_us: u64 = 0;
+    var tts_chunk_count: u32 = 0;
+    var tts_total_generated: usize = 0;
+    var tts_context_used: usize = 0;
     if rc == 0 {
-        _ = printf("audio2audio-real[text-only]: answer_chars=%zu decode_ms=%.3f total_ms=%.3f\n", answer_len, (decode_us as f64) / 1000.0, ((load_us + ref_span.encode_us + user_span.encode_us + prefill_us + decode_us) as f64) / 1000.0);
+        if enable_tts && generated_count > 0 {
+            var chunk_offsets: [u32: AUDIO2AUDIO_REAL_MAX_TTS_CHUNKS] = [];
+            var chunk_lengths: [u32: AUDIO2AUDIO_REAL_MAX_TTS_CHUNKS] = [];
+            if !audio2audio_plan_tts_chunks(&tok, generated_ids as &const u32, generated_count, &chunk_offsets[0], &chunk_lengths[0], &tts_chunk_count) {
+                free(generated_ids as &void);
+                free(generated_hidden as &void);
+                free(logits as &void);
+                qwen3_close_runtime(&table, &tok, &runtime);
+                audio_real_encoded_span_free(&user_span);
+                audio_real_encoded_span_free(&ref_span);
+                return 1;
+            }
+            var artifact_dir: [byte: 512] = [];
+            var artifact_dir_ptr: &const byte = null;
+            if out_path != null {
+                if !audio2audio_find_parent_dir(out_path, &artifact_dir[0], @len(artifact_dir)) {
+                    _ = printf("error: audio2audio-real failed to derive artifact dir from %s\n", out_path);
+                    free(generated_ids as &void);
+                    free(generated_hidden as &void);
+                    free(logits as &void);
+                    qwen3_close_runtime(&table, &tok, &runtime);
+                    audio_real_encoded_span_free(&user_span);
+                    audio_real_encoded_span_free(&ref_span);
+                    return 1;
+                }
+                artifact_dir_ptr = &artifact_dir[0] as &const byte;
+            }
+            const tts_start_us: u64 = audio_real_clock_us();
+            if !speech_tts_simplex_run_chunks(tts_path, projector_path, generated_ids as &const u32, generated_hidden as &const f32, config.hidden_size as usize, generated_count, &chunk_offsets[0] as &const u32, &chunk_lengths[0] as &const u32, tts_chunk_count, artifact_dir_ptr, AUDIO2AUDIO_REAL_DEFAULT_MAX_AUDIO_TOKENS, sampler.seed, false, &tts_total_generated, &tts_context_used) {
+                free(generated_ids as &void);
+                free(generated_hidden as &void);
+                free(logits as &void);
+                qwen3_close_runtime(&table, &tok, &runtime);
+                audio_real_encoded_span_free(&user_span);
+                audio_real_encoded_span_free(&ref_span);
+                return 1;
+            }
+            tts_us = audio_real_clock_us() - tts_start_us;
+        }
+        _ = printf("audio2audio-real[%s]: answer_chars=%zu generated_tokens=%zu decode_ms=%.3f tts_ms=%.3f total_ms=%.3f\n", mode_label, answer_len, generated_count, (decode_us as f64) / 1000.0, (tts_us as f64) / 1000.0, ((load_us + ref_span.encode_us + user_span.encode_us + prefill_us + decode_us + tts_us) as f64) / 1000.0);
+        if enable_tts {
+            _ = printf("audio2audio-real[tts-audio-tokens]: chunks=%u audio_tokens=%zu context_used=%zu answer_wav_written=0\n", tts_chunk_count, tts_total_generated, tts_context_used);
+        }
     }
 
+    if rc == 0 && out_path != null {
+        var artifact_dir2: [byte: 512] = [];
+        if !audio2audio_find_parent_dir(out_path, &artifact_dir2[0], @len(artifact_dir2)) {
+            _ = printf("error: audio2audio-real failed to derive output dir from %s\n", out_path);
+            free(generated_ids as &void);
+            free(generated_hidden as &void);
+            free(logits as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            audio_real_encoded_span_free(&user_span);
+            audio_real_encoded_span_free(&ref_span);
+            return 1;
+        }
+        var answer_txt_path: [byte: 512] = [];
+        var timing_path: [byte: 512] = [];
+        if !audio2audio_build_artifact_path(&answer_txt_path[0], @len(answer_txt_path), &artifact_dir2[0] as &const byte, "answer.txt\0" as &const byte) ||
+           !audio2audio_build_artifact_path(&timing_path[0], @len(timing_path), &artifact_dir2[0] as &const byte, "timing.log\0" as &const byte) {
+            _ = printf("error: audio2audio-real artifact path too long dir=%s\n", &artifact_dir2[0]);
+            free(generated_ids as &void);
+            free(generated_hidden as &void);
+            free(logits as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            audio_real_encoded_span_free(&user_span);
+            audio_real_encoded_span_free(&ref_span);
+            return 1;
+        }
+        if !audio2audio_write_text_file(&answer_txt_path[0] as &const byte, &answer[0] as &const byte) {
+            free(generated_ids as &void);
+            free(generated_hidden as &void);
+            free(logits as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            audio_real_encoded_span_free(&user_span);
+            audio_real_encoded_span_free(&ref_span);
+            return 1;
+        }
+        var chunk_offsets2: [u32: AUDIO2AUDIO_REAL_MAX_TTS_CHUNKS] = [];
+        var chunk_lengths2: [u32: AUDIO2AUDIO_REAL_MAX_TTS_CHUNKS] = [];
+        var chunk_count2: u32 = 0;
+        if generated_count > 0 && audio2audio_plan_tts_chunks(&tok, generated_ids as &const u32, generated_count, &chunk_offsets2[0], &chunk_lengths2[0], &chunk_count2) {
+            var chunk_index: u32 = 0;
+            while chunk_index < chunk_count2 {
+                var token_path: [byte: 512] = [];
+                var hidden_path: [byte: 512] = [];
+                const written_tok: i32 = snprintf(&token_path[0] as *byte, @len(token_path), "%s/llm_token_ids_chunk_%u.txt\0" as *const byte, &artifact_dir2[0], chunk_index);
+                const written_hidden: i32 = snprintf(&hidden_path[0] as *byte, @len(hidden_path), "%s/llm_hidden_states_chunk_%u.bin\0" as *const byte, &artifact_dir2[0], chunk_index);
+                if written_tok < 0 || (written_tok as usize) >= @len(token_path) || written_hidden < 0 || (written_hidden as usize) >= @len(hidden_path) {
+                    _ = printf("error: audio2audio-real debug dump path too long dir=%s chunk=%u\n", &artifact_dir2[0], chunk_index);
+                    free(generated_ids as &void);
+                    free(generated_hidden as &void);
+                    free(logits as &void);
+                    qwen3_close_runtime(&table, &tok, &runtime);
+                    audio_real_encoded_span_free(&user_span);
+                    audio_real_encoded_span_free(&ref_span);
+                    return 1;
+                }
+                const offset: usize = chunk_offsets2[chunk_index as usize] as usize;
+                const chunk_len: usize = chunk_lengths2[chunk_index as usize] as usize;
+                if !audio2audio_write_token_ids_text(&token_path[0] as &const byte, &generated_ids[offset] as &const u32, chunk_len) ||
+                   !audio2audio_write_hidden_bin(&hidden_path[0] as &const byte, &generated_hidden[offset * (config.hidden_size as usize)], chunk_len, config.hidden_size as usize) {
+                    free(generated_ids as &void);
+                    free(generated_hidden as &void);
+                    free(logits as &void);
+                    qwen3_close_runtime(&table, &tok, &runtime);
+                    audio_real_encoded_span_free(&user_span);
+                    audio_real_encoded_span_free(&ref_span);
+                    return 1;
+                }
+                chunk_index = chunk_index + 1;
+            }
+        }
+        var timing_text: [byte: AUDIO2AUDIO_REAL_TIMING_CAP] = [];
+        const timing_written: i32 = snprintf(&timing_text[0] as *byte, @len(timing_text), "mode=%s\nllm=%s\nref_audio=%s\nuser_audio=%s\nprompt_tokens=%zu\ngenerated_tokens=%zu\nanswer_chars=%zu\nref_encode_ms=%.3f\nuser_encode_ms=%.3f\nllm_load_ms=%.3f\nllm_prefill_ms=%.3f\nllm_decode_ms=%.3f\ntts_ms=%.3f\ntts_chunks=%u\ntts_audio_tokens=%zu\ntts_context_used=%zu\nanswer_wav_written=0\ntotal_ms=%.3f\n\0" as *const byte, mode_label, llm_path, ref_audio_path, user_audio_path, prompt_tokens, generated_count, answer_len, (ref_span.encode_us as f64) / 1000.0, (user_span.encode_us as f64) / 1000.0, (load_us as f64) / 1000.0, (prefill_us as f64) / 1000.0, (decode_us as f64) / 1000.0, (tts_us as f64) / 1000.0, tts_chunk_count, tts_total_generated, tts_context_used, ((load_us + ref_span.encode_us + user_span.encode_us + prefill_us + decode_us + tts_us) as f64) / 1000.0);
+        if timing_written < 0 || (timing_written as usize) >= @len(timing_text) || !audio2audio_write_text_file(&timing_path[0] as &const byte, &timing_text[0] as &const byte) {
+            _ = printf("error: audio2audio-real failed to write timing log path=%s\n", &timing_path[0]);
+            free(generated_ids as &void);
+            free(generated_hidden as &void);
+            free(logits as &void);
+            qwen3_close_runtime(&table, &tok, &runtime);
+            audio_real_encoded_span_free(&user_span);
+            audio_real_encoded_span_free(&ref_span);
+            return 1;
+        }
+    }
+
+    free(generated_ids as &void);
+    free(generated_hidden as &void);
     free(logits as &void);
     qwen3_close_runtime(&table, &tok, &runtime);
     audio_real_encoded_span_free(&user_span);
     audio_real_encoded_span_free(&ref_span);
     return rc;
+}
+
+export fn audio2audio_real_text_cli(llm_path: &const byte, audio_model_path: &const byte, ref_audio_path: &const byte, user_audio_path: &const byte, sampler_in: &Qwen3SamplerConfig, dump_embeddings: bool) i32 {
+    return audio2audio_real_generate_cli(llm_path, audio_model_path, ref_audio_path, user_audio_path, sampler_in, dump_embeddings, null as &const byte, null as &const byte, null as &const byte, false);
+}
+
+export fn audio2audio_real_tts_tokens_cli(llm_path: &const byte, audio_model_path: &const byte, tts_path: &const byte, projector_path: &const byte, ref_audio_path: &const byte, user_audio_path: &const byte, out_path: &const byte, sampler_in: &Qwen3SamplerConfig, dump_embeddings: bool) i32 {
+    return audio2audio_real_generate_cli(llm_path, audio_model_path, ref_audio_path, user_audio_path, sampler_in, dump_embeddings, tts_path, projector_path, out_path, true);
 }
 
 fn audio_count_layers_from_tensors(table: &TensorWeightTable) u32 {

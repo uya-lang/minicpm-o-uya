@@ -1801,6 +1801,78 @@ fn tts_condition_build_merged_from_files(config: &TtsConditionConfig, weights: &
     return true;
 }
 
+fn tts_condition_build_merged_from_arrays(config: &TtsConditionConfig, weights: &TtsConditionWeights, token_ids: &const u32, token_count: usize, hidden_states: &const f32, hidden_size: usize, chunk: &TtsMergedChunk) bool {
+    chunk[0] = tts_merged_chunk_init();
+    if token_count == 0 || hidden_size == 0 {
+        _ = printf("error: merged chunk got empty token_count=%zu hidden_size=%zu\n", token_count, hidden_size);
+        return false;
+    }
+    if hidden_size != config.llm_hidden_size as usize {
+        _ = printf("error: llm hidden size=%zu does not match projector input=%u\n", hidden_size, config.llm_hidden_size);
+        return false;
+    }
+    var filtered_ids: &u32 = calloc(token_count, 4) as &u32;
+    var filtered_hidden: &f32 = calloc(token_count * hidden_size, 4) as &f32;
+    if filtered_ids == null || filtered_hidden == null {
+        _ = printf("error: merged chunk filter allocation failed tokens=%zu hidden=%zu\n", token_count, hidden_size);
+        free(filtered_ids as &void); free(filtered_hidden as &void);
+        return false;
+    }
+    var filtered_count: usize = 0;
+    if !speech_filter_tts_hidden(token_ids, token_count, hidden_states, hidden_size, filtered_ids, filtered_hidden, &filtered_count) {
+        free(filtered_ids as &void); free(filtered_hidden as &void);
+        return false;
+    }
+    const tts_hidden: usize = config.tts_hidden_size as usize;
+    const total_values: usize = filtered_count * tts_hidden;
+    var llm_embeds: &f32 = calloc(total_values, 4) as &f32;
+    var projected: &f32 = calloc(total_values, 4) as &f32;
+    var stage: &f32 = calloc(tts_hidden, 4) as &f32;
+    chunk.merged = calloc(total_values, 4) as &f32;
+    if llm_embeds == null || projected == null || stage == null || chunk.merged == null {
+        _ = printf("error: merged chunk allocation failed tokens=%zu hidden=%zu\n", filtered_count, tts_hidden);
+        free(llm_embeds as &void); free(projected as &void); free(stage as &void); free(chunk.merged as &void);
+        free(filtered_ids as &void); free(filtered_hidden as &void);
+        return false;
+    }
+    var token_index: usize = 0;
+    while token_index < filtered_count {
+        if !speech_copy_embedding_row(&llm_embeds[token_index * tts_hidden], weights.emb_text, filtered_ids[token_index], tts_hidden, config.text_vocab_size as usize) {
+            free(llm_embeds as &void); free(projected as &void); free(stage as &void); free(chunk.merged as &void);
+            free(filtered_ids as &void); free(filtered_hidden as &void);
+            return false;
+        }
+        speech_matvec_view(stage, weights.projector_linear1_weight, &filtered_hidden[token_index * hidden_size] as &const f32, hidden_size, tts_hidden);
+        var hidden_index: usize = 0;
+        while hidden_index < tts_hidden {
+            stage[hidden_index] = stage[hidden_index] + speech_load_value(weights.projector_linear1_bias, hidden_index);
+            hidden_index = hidden_index + 1;
+        }
+        speech_relu_inplace(stage, tts_hidden);
+        speech_matvec_view(&projected[token_index * tts_hidden], weights.projector_linear2_weight, stage as &const f32, tts_hidden, tts_hidden);
+        hidden_index = 0;
+        while hidden_index < tts_hidden {
+            projected[token_index * tts_hidden + hidden_index] = projected[token_index * tts_hidden + hidden_index] + speech_load_value(weights.projector_linear2_bias, hidden_index);
+            hidden_index = hidden_index + 1;
+        }
+        token_index = token_index + 1;
+    }
+    speech_l2_normalize_per_token(projected, filtered_count, tts_hidden);
+    token_index = 0;
+    while token_index < filtered_count {
+        var hidden_index2: usize = 0;
+        while hidden_index2 < tts_hidden {
+            chunk.merged[token_index * tts_hidden + hidden_index2] = llm_embeds[token_index * tts_hidden + hidden_index2] + projected[token_index * tts_hidden + hidden_index2];
+            hidden_index2 = hidden_index2 + 1;
+        }
+        token_index = token_index + 1;
+    }
+    chunk.token_count = filtered_count;
+    free(llm_embeds as &void); free(projected as &void); free(stage as &void);
+    free(filtered_ids as &void); free(filtered_hidden as &void);
+    return true;
+}
+
 fn tts_simplex_generate_chunk(config: &TtsDecoderConfig, weights: &TtsDecoderWeights, runtime: &TtsDecoderRuntime, merged: &const f32, merged_tokens: usize, chunk_index: u32, is_final_chunk: bool, simplex: &TtsSimplexConfig, all_generated: &u32, all_generated_count: &usize, out_tokens: &u32, out_count: &usize) bool {
     const hidden_n: usize = config.hidden_size as usize;
     var bos_embed: [f32: 1024] = [];
@@ -1868,6 +1940,167 @@ fn tts_simplex_generate_chunk(config: &TtsDecoderConfig, weights: &TtsDecoderWei
         _ = printf("tts-simplex chunk=%u first=%u last=%u\n", chunk_index, out_tokens[0], out_tokens[out_count[0] - 1]);
     }
     return out_count[0] > 0;
+}
+
+export fn speech_tts_simplex_run_chunks(tts_path: &const byte, projector_path: &const byte, token_ids: &const u32, hidden_states: &const f32, hidden_size: usize, total_tokens: usize, chunk_offsets: &const u32, chunk_lengths: &const u32, chunk_count: u32, out_dir: &const byte, max_audio_tokens: u32, seed: u32, greedy: bool, total_generated: &usize, context_used: &usize) bool {
+    total_generated[0] = 0;
+    context_used[0] = 0;
+    if chunk_count == 0 {
+        _ = printf("error: tts simplex run got no chunks\n");
+        return false;
+    }
+    var simplex: TtsSimplexConfig = tts_simplex_config_init();
+    simplex.max_audio_tokens = max_audio_tokens;
+    simplex.seed = seed;
+    simplex.greedy = greedy;
+
+    var tts_table: TensorWeightTable = tensor_table_init();
+    var projector_table: TensorWeightTable = tensor_table_init();
+    if !tensor_weight_table_load(tts_path, &tts_table) { return false; }
+    if !tensor_weight_table_load(projector_path, &projector_table) { return false; }
+    if !tensor_weight_table_attach_mmap(tts_path, &tts_table) { return false; }
+    if !tensor_weight_table_attach_mmap(projector_path, &projector_table) {
+        tensor_weight_table_detach_mmap(&tts_table);
+        return false;
+    }
+    var cond_config: TtsConditionConfig = tts_condition_config_init();
+    var cond_weights: TtsConditionWeights = tts_condition_weights_init();
+    if !speech_condition_bind(&tts_table, &projector_table, &cond_config, &cond_weights) {
+        tensor_weight_table_detach_mmap(&tts_table);
+        tensor_weight_table_detach_mmap(&projector_table);
+        return false;
+    }
+    var decoder_config: TtsDecoderConfig = tts_decoder_config_init();
+    if !tts_decoder_config_load_metadata(tts_path, &decoder_config) {
+        tensor_weight_table_detach_mmap(&tts_table);
+        tensor_weight_table_detach_mmap(&projector_table);
+        return false;
+    }
+    var decoder_weights: TtsDecoderWeights = tts_decoder_weights_init();
+    if !tts_decoder_bind_weights(&tts_table, &decoder_config, &decoder_weights) {
+        tensor_weight_table_detach_mmap(&tts_table);
+        tensor_weight_table_detach_mmap(&projector_table);
+        return false;
+    }
+    var context_capacity: usize = chunk_count as usize * ((simplex.max_audio_tokens as usize) + (64 as usize));
+    if context_capacity > decoder_config.context_length as usize { context_capacity = decoder_config.context_length as usize; }
+    if context_capacity < 128 { context_capacity = 128; }
+    var runtime: TtsDecoderRuntime = tts_decoder_runtime_init();
+    if !tts_decoder_runtime_alloc(&decoder_config, &runtime, context_capacity, simplex.seed) {
+        tensor_weight_table_detach_mmap(&tts_table);
+        tensor_weight_table_detach_mmap(&projector_table);
+        return false;
+    }
+    var tok: Tokenizer = tokenizer_init();
+    if !tokenizer_load(tts_path, &tok) {
+        tts_decoder_runtime_free(&runtime);
+        tensor_weight_table_detach_mmap(&tts_table);
+        tensor_weight_table_detach_mmap(&projector_table);
+        return false;
+    }
+    var prompt_ids: [u32: 256] = [];
+    var prompt_count: usize = 0;
+    var prompt_text: [byte: 512] = [];
+    var prompt_source: &const byte = TTS_SIMPLEX_ASSISTANT_PROMPT;
+    if tokenizer_format_assistant_prompt(&tok, true, false, true, &prompt_text[0], @len(prompt_text)) {
+        prompt_source = &prompt_text[0] as &const byte;
+    }
+    if !tokenizer_encode_to_ids(&tok, prompt_source, &prompt_ids[0], @len(prompt_ids), &prompt_count) {
+        tokenizer_free(&tok);
+        tts_decoder_runtime_free(&runtime);
+        tensor_weight_table_detach_mmap(&tts_table);
+        tensor_weight_table_detach_mmap(&projector_table);
+        return false;
+    }
+    const prompt_start_us: u64 = speech_clock_micros();
+    var prompt_index: usize = 0;
+    while prompt_index < prompt_count {
+        if !tts_decoder_forward_token_id(&decoder_config, &decoder_weights, &runtime, prompt_ids[prompt_index]) {
+            tokenizer_free(&tok);
+            tts_decoder_runtime_free(&runtime);
+            tensor_weight_table_detach_mmap(&tts_table);
+            tensor_weight_table_detach_mmap(&projector_table);
+            return false;
+        }
+        prompt_index = prompt_index + 1;
+    }
+    const prompt_elapsed_us: u64 = speech_elapsed_micros(prompt_start_us, speech_clock_micros());
+    _ = printf("tts-simplex prompt: tokens=%zu context_after_prompt=%zu prefill_ms=%llu.%03llu\n", prompt_count, runtime.total_tokens, prompt_elapsed_us / (1000 as u64), prompt_elapsed_us % (1000 as u64));
+
+    var all_generated: [u32: 32768] = [];
+    var all_generated_count: usize = 0;
+    var chunk_index: u32 = 0;
+    while chunk_index < chunk_count {
+        const offset: usize = chunk_offsets[chunk_index as usize] as usize;
+        const chunk_len: usize = chunk_lengths[chunk_index as usize] as usize;
+        if offset + chunk_len > total_tokens {
+            _ = printf("error: tts simplex chunk=%u offset=%zu len=%zu exceeds total_tokens=%zu\n", chunk_index, offset, chunk_len, total_tokens);
+            tokenizer_free(&tok);
+            tts_decoder_runtime_free(&runtime);
+            tensor_weight_table_detach_mmap(&tts_table);
+            tensor_weight_table_detach_mmap(&projector_table);
+            return false;
+        }
+        var merged_chunk: TtsMergedChunk = tts_merged_chunk_init();
+        const merge_start_us: u64 = speech_clock_micros();
+        if !tts_condition_build_merged_from_arrays(&cond_config, &cond_weights, &token_ids[offset] as &const u32, chunk_len, &hidden_states[offset * hidden_size] as &const f32, hidden_size, &merged_chunk) {
+            tokenizer_free(&tok);
+            tts_decoder_runtime_free(&runtime);
+            tensor_weight_table_detach_mmap(&tts_table);
+            tensor_weight_table_detach_mmap(&projector_table);
+            return false;
+        }
+        const merge_elapsed_us: u64 = speech_elapsed_micros(merge_start_us, speech_clock_micros());
+        var chunk_tokens: [u32: 1024] = [];
+        var chunk_token_count: usize = 0;
+        const decode_start_us: u64 = speech_clock_micros();
+        if !tts_simplex_generate_chunk(&decoder_config, &decoder_weights, &runtime, merged_chunk.merged as &const f32, merged_chunk.token_count, chunk_index, chunk_index + 1 == chunk_count, &simplex, &all_generated[0], &all_generated_count, &chunk_tokens[0], &chunk_token_count) {
+            free(merged_chunk.merged as &void);
+            tokenizer_free(&tok);
+            tts_decoder_runtime_free(&runtime);
+            tensor_weight_table_detach_mmap(&tts_table);
+            tensor_weight_table_detach_mmap(&projector_table);
+            return false;
+        }
+        const decode_elapsed_us: u64 = speech_elapsed_micros(decode_start_us, speech_clock_micros());
+        _ = printf("tts-simplex timing: chunk=%u merge_ms=%llu.%03llu decode_ms=%llu.%03llu cache_tokens=%zu generated=%zu\n", chunk_index, merge_elapsed_us / (1000 as u64), merge_elapsed_us % (1000 as u64), decode_elapsed_us / (1000 as u64), decode_elapsed_us % (1000 as u64), runtime.total_tokens, chunk_token_count);
+        if out_dir != null {
+            var out_txt: [byte: 512] = [];
+            var out_bin: [byte: 512] = [];
+            if tts_simplex_build_out_path(&out_txt[0], @len(out_txt), out_dir, chunk_index, "txt\0" as &const byte) {
+                if !tts_dump_tokens_csv(&out_txt[0] as &const byte, &chunk_tokens[0] as &const u32, chunk_token_count) {
+                    free(merged_chunk.merged as &void);
+                    tokenizer_free(&tok);
+                    tts_decoder_runtime_free(&runtime);
+                    tensor_weight_table_detach_mmap(&tts_table);
+                    tensor_weight_table_detach_mmap(&projector_table);
+                    return false;
+                }
+            }
+            if tts_simplex_build_out_path(&out_bin[0], @len(out_bin), out_dir, chunk_index, "bin\0" as &const byte) {
+                if !tts_dump_tokens_bin(&out_bin[0] as &const byte, &chunk_tokens[0] as &const u32, chunk_token_count) {
+                    free(merged_chunk.merged as &void);
+                    tokenizer_free(&tok);
+                    tts_decoder_runtime_free(&runtime);
+                    tensor_weight_table_detach_mmap(&tts_table);
+                    tensor_weight_table_detach_mmap(&projector_table);
+                    return false;
+                }
+            }
+        }
+        free(merged_chunk.merged as &void);
+        chunk_index = chunk_index + 1;
+    }
+    var greedy_flag: u32 = 0;
+    if simplex.greedy { greedy_flag = 1; }
+    _ = printf("tts-simplex-probe: chunks=%u total_generated=%zu context_used=%zu greedy=%u seed=%u\n", chunk_count, all_generated_count, runtime.total_tokens, greedy_flag, simplex.seed);
+    total_generated[0] = all_generated_count;
+    context_used[0] = runtime.total_tokens;
+    tokenizer_free(&tok);
+    tts_decoder_runtime_free(&runtime);
+    tensor_weight_table_detach_mmap(&tts_table);
+    tensor_weight_table_detach_mmap(&projector_table);
+    return true;
 }
 
 fn tts_simplex_compare_chunk(reference_path: &const byte, tokens: &const u32, token_count: usize, result: &TtsTokenCompareResult) bool {

@@ -6,13 +6,14 @@ This repository does **not** wrap Python, PyTorch, llama.cpp, or the official Mi
 
 ## Status
 
-Phase 20 documentation is current for the implementation through Phase 19:
+Phase 21 work is in progress and the implementation is current through the latest real-path bring-up:
 
 - GGUF `inspect`/`audit`, tokenizer commands, tensor table/mmap inspection, scalar kernels, and selected quant kernels are implemented.
 - Tiny Qwen3-like text binding, text generation, sampler controls, text `chat`, blocking `omni-chat`, `stream-chat` prototype, and `bench` smoke are implemented.
 - Vision/audio/speech/omni paths are deterministic smoke/reference paths over tiny fixtures, raw inputs, and manifests.
-- Real MiniCPM-o 4.5 audio preprocessing, audio encoder probe, and TTS conditioning merge probe are aligned against local `llama.cpp-omni` debug outputs.
-- Full production MiniCPM-o omni inference is **not** claimed; unsupported model layouts, media codecs, and modality gaps should fail with diagnostics.
+- Real MiniCPM-o 4.5 audio preprocessing, audio encoder probe, TTS conditioning merge probe, and TTS audio-token generation are wired against the local split-GGUF path.
+- `audio2audio-real` can now produce `answer.txt`, LLM token/hidden dumps, `audio_tokens_chunk_*.txt/bin`, and `timing.log` for the real path; final token2wav/HiFiGAN WAV synthesis is still an explicit gap.
+- Full production MiniCPM-o omni inference is **not** claimed; unsupported model layouts, media codecs, and remaining modality gaps should fail with diagnostics.
 
 ## Quick Start
 
@@ -54,6 +55,7 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `audio-real-mel-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real numeric mel probe | Supports `--dump-f32 out.uyml` for full-array alignment |
 | `audio-real-encode-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real audio encoder forward probe | Correctness-first `conv + transformer + projector + pool` path |
 | `audio2audio-real --text-only --llm <llm.gguf> --audio <audio.gguf> --ref-audio ref.wav --user-audio user.wav` | Real ref-audio + user-audio to text answer | Uses official non-duplex prompt order; prints embedding/timing diagnostics |
+| `audio2audio-real --llm ... --audio ... --tts ... --projector ... --token2wav-dir ... --ref-audio ref.wav --user-audio user.wav --out out.wav` | Real path through TTS audio tokens | Writes `answer.txt`, LLM hidden/token dumps, `audio_tokens_chunk_*.txt/bin`, and `timing.log`; final WAV synthesis is not wired yet |
 | `token2wav-bind <token2wav-gguf-dir>` | Real token2wav/HiFiGAN bind-only validation | Validates official `encoder`/`flow_*`/`hifigan2`/`prompt_cache` layouts |
 | `token2wav-prompt-cache-probe <prompt_cache.gguf>` | Real prompt-cache probe | Reads prompt-cache metadata, tensor sizes, and cache checksums |
 | `token2wav-window-probe <prompt_cache.gguf> <audio_tokens_chunk.txt>` | Real token window planner | Prints `28/25` sliding-window calls for token2wav streaming |
@@ -76,6 +78,8 @@ Sampler arguments accepted by `generate` are validated by the tiny sampler path;
 For official split MiniCPM-o 4.5 bundles, `token2wav-bind <dir>` now validates the five `token2wav-gguf` files as a real bind-only step, not just an audit inventory.
 
 `token2wav-flow-probe` is the next incremental step after bind/prompt-cache/window validation: it already runs real `flow_matching` math on official weights, but today it still uses a lightweight surrogate `mu` path (`embed-mu` or `zero-mu`) instead of the full `encoder.gguf` conformer forward.
+
+`audio2audio-real` now bridges the real audio encoder, real Qwen3 answer generation, and the real TTS decoder/audio-token path in one command. The command currently stops after audio-token artifacts rather than claiming a finished vocoder WAV.
 
 `bench` now has two modes: the original `<model.gguf> <manifest.json>` smoke path stays deterministic for regression tests, while `bench <model.gguf> [bench args...]` runs a real text benchmark intended for apples-to-apples comparison with `llama-bench`.
 
@@ -153,6 +157,8 @@ build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.w
 build/minicpm-o-uya audio-real-encode-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya tts-condition-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_token_ids.txt /path/to/llm_hidden_states.bin --dump-merged /tmp/minicpm-o-uya-merged.bin
 build/minicpm-o-uya tts-simplex-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_debug --count 4 --out-dir /tmp/minicpm-o-uya-ttsprobe
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_REF_AUDIO=ref.wav MINICPM_O_REAL_USER_AUDIO=user.wav make audio2audio-real-text
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_REF_AUDIO=ref.wav MINICPM_O_REAL_USER_AUDIO=user.wav MINICPM_O_REAL_OUT=/tmp/minicpm-o-uya-answer.wav make audio2audio-real-tokens
 build/minicpm-o-uya token2wav-bind /path/to/token2wav-gguf
 build/minicpm-o-uya token2wav-prompt-cache-probe /path/to/token2wav-gguf/prompt_cache.gguf
 build/minicpm-o-uya token2wav-window-probe /path/to/token2wav-gguf/prompt_cache.gguf /path/to/audio_tokens_chunk_0.txt
