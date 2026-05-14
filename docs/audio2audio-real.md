@@ -24,7 +24,7 @@ OMNI_VOC_DEVICE=cpu ./build/bin/llama-omni-cli \
 
 ## Uya Bundle Audit
 
-The first real Uya CLI is an audit-only loader for the official split bundle. It verifies that every required GGUF file can be opened and inventoried before real forward kernels are connected.
+The real Uya entry point is `audio2audio-real`. Start with `--audit-only` to verify that every required GGUF file can be opened and inventoried before real forward kernels are connected; the same CLI now also supports real `--text-only` and full `--out` execution for both explicit `--ref-audio` / `--user-audio` inputs and the llama.cpp-omni `--test-prefix PREFIX --count N` protocol.
 
 ```sh
 build/minicpm-o-uya audio2audio-real --audit-only \
@@ -46,9 +46,30 @@ build/minicpm-o-uya audio2audio-real --audit-only \
   --input-audio outputs/complex_case2/complex2_0001.wav \
   --out outputs/uya_audio2audio_answer.wav
 
-# llama.cpp-omni style multi-file protocol also works in audit mode:
+# llama.cpp-omni style multi-file protocol also works here:
 # prefix_0000.wav is the reference voice, prefix_0001.wav.. are user turns.
 build/minicpm-o-uya audio2audio-real --audit-only \
+  --llm models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+  --audio models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf \
+  --tts models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf \
+  --projector models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-projector-F16.gguf \
+  --token2wav-dir models/MiniCPM-o-4_5-gguf/token2wav-gguf \
+  --test-prefix outputs/complex_case2/complex2 \
+  --count 2 \
+  --out outputs/uya_audio2audio_answer.wav
+
+# `--text-only --test-prefix` keeps the earlier multi-chunk text semantics:
+# `prefix_0000.wav` is the reference voice and `prefix_0001..` are treated
+# as consecutive chunks of one user query, not separate conversation turns.
+build/minicpm-o-uya audio2audio-real --text-only \
+  --llm models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+  --audio models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf \
+  --test-prefix outputs/complex_case2/complex2 \
+  --count 2 \
+  --max-new-tokens 64
+
+# And in the full answer-WAV path.
+build/minicpm-o-uya audio2audio-real \
   --llm models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
   --audio models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf \
   --tts models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf \
@@ -63,7 +84,7 @@ Expected success marker:
 
 ```text
 audio2audio-real: audit-only PASS files=9
-audio2audio-real: inference_supported=false next=token2wav-flow-forward-and-hifigan-forward
+audio2audio-real: runtime_supported=cpu-reference-tts2wav next=run-with--out-for-answer-wav
 ```
 
 When audio inputs are supplied, the audit additionally prints `audio2audio-real input protocol`, per-file `audio input[ref]` / `audio input[user]` summaries, sample checksum, duration, peak, and RMS. Non-16 kHz mono files fail fast with an explicit transcode/downmix diagnostic. The same check can be run with:
@@ -84,6 +105,30 @@ Audit diagnostics include candidate next actions for unknown dtype, unclassified
 The Qwen3 text path now accepts the MiniCPM-o 4.5 text dimensions used by `MiniCPM-o-4_5-Q4_K_M.gguf`: `hidden=4096`, `layers=36`, `ffn=12288`, `ctx>=4096`, and `vocab=151748`. Large forward workspaces and logits buffers are heap-backed rather than fixed stack arrays.
 Runtime text generation has real GGML-layout fused matvec support for Q4_K, Q5_K, and Q6_K, plus Q4_K/Q5_K/Q6_K embedding-row dequantization. The official Q4_K_M LLM now passes a text-only one-token generate smoke, and its audited dtype distribution is only `F32/Q4_K/Q6_K`; Q8_K/IQ runtime matvec remains guarded for other bundles. Use `generate ... --dump-hidden` to emit prompt/generated token hidden-state summaries; on the official MiniCPM-o 4.5 LLM this reports `n=4096`, which is the handoff shape needed by the later TTS projector path.
 A manual text alignment target is available for the same text GGUF: `MINICPM_O_TEXT_GGUF=/path/to/MiniCPM-o-4_5-Q4_K_M.gguf LLAMA_COMPLETION_BIN=/path/to/llama-completion make text-real-align`. It compares Uya and llama.cpp greedy one-token text output for the same prompt before moving deeper into audio/TTS alignment.
+
+`audio2audio-real` now reuses that same real Qwen3 path to capture generated token IDs and per-token hidden states while answering. When `--out` is provided, the command writes `answer.txt`, `llm_token_ids_chunk_*.txt`, `llm_hidden_states_chunk_*.bin`, `audio_tokens_chunk_*.txt/bin`, `answer_chunk_*.wav`, `answer.wav`, `turn.wav`, and `timing.log` beside the requested output path. The requested `--out` path itself is also written as the answer WAV target when its basename differs from the canonical `answer.wav`.
+
+In multi-turn `--test-prefix` mode, every user turn gets its own artifact prefix:
+
+- `turn_0001_answer.txt`
+- `turn_0001_timing.log`
+- `turn_0001_llm_token_ids_chunk_0.txt`
+- `turn_0001_llm_hidden_states_chunk_0.bin`
+- `turn_0001_audio_tokens_chunk_0.txt`
+- `turn_0001_audio_tokens_chunk_0.bin`
+- `turn_0001_answer_chunk_0.wav`
+- `turn_0001_answer.wav`
+- `turn_0001_turn.wav`
+
+Later turns use `turn_0002_*`, `turn_0003_*`, and so on. The final turn still writes the explicit `--out` alias, so a downstream script can consume a stable final-answer path while keeping every intermediate turn.
+
+The full `audio2audio-real --out ... --test-prefix` multi-turn path now reuses session state across the whole conversation instead of reloading per turn:
+
+- audio encoder GGUF, mel filterbank, and preprocessing tables load once
+- reference audio embedding is computed once
+- Qwen3 runtime and KV cache stay live across turns
+- TTS weights, tokenizer, and decoder runtime stay resident and are only reset between turns
+- token2wav prompt-cache / flow / HiFiGAN tables stay resident and are reused across turns
 
 A manual audio preprocessing probe is available as `build/minicpm-o-uya audio-real-preprocess-probe <audio.wav|audio.uyap.pcm>`, and a numeric mel probe is available as `MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-mel-probe`. It validates 16 kHz mono PCM16/F32 WAV or UYAP input and prints the llama.cpp-omni MiniCPM-o preprocessing plan: `frame_size=400`, `filter_bins=201`, `hop_length=160`, `mel_bins=80`, 100ms sample alignment, 200-sample center padding on each side, conv2 downsampling, and pool(5,5) `encoder_positions`. The `audio2audio-real --audit-only` input path now prints this plan for both ref and user audio. The numeric mel probe runs periodic Hann, DFT/STFT power, the GGUF `filters` mel filterbank, and llama.cpp-omni style log10 clamp/normalization, then prints frames/elements/checksum/sample values.
 
@@ -186,6 +231,8 @@ Current Uya probe behavior:
 - keeps TTS KV cache and generated audio-token history across chunks
 - writes relative audio token IDs, one file per chunk
 
+The same real TTS decoder/audio-token path is now reachable from `audio2audio-real` itself. In full mode the command chunks its generated answer tokens, reuses the TTS KV cache across chunks, and writes `audio_tokens_chunk_*.txt/bin` beside the requested `--out` path before the later token2wav/HiFiGAN stage. In multi-turn `--test-prefix` mode, the same TTS tables/tokenizer/runtime are kept open across turns and only the per-turn cache/token state is reset.
+
 This is the first real Uya implementation of:
 
 - TTS prefill/decode cache
@@ -266,7 +313,7 @@ The official `token2wav-gguf` directory currently audits as:
 - `hifigan2.gguf`: `conv_pre.*`, `ups.*`, `resblocks.*`, `source_resblocks.*`, `source_downs.*`, `m_source.*`, `f0_predictor.*`, and `conv_post.*`.
 - `prompt_cache.gguf`: `prompt_cache.spk_cb`, `prompt_cache.estimator_*`, and `prompt_cache.conformer_*`.
 
-After alias classification, these token2wav files should have zero unknown tensors in audit output. Kernel support is still pending; this table only establishes names and shapes for binding.
+After alias classification, these token2wav files should have zero unknown tensors in audit output. Exact `encoder.gguf -> mu` parity is still pending; this table first establishes names and shapes for binding.
 
 Uya now also has a bind-only bundle command:
 
@@ -284,7 +331,7 @@ Current bind coverage:
 - `hifigan2.gguf`: `conv_pre.*`, `conv_post.*`, `ups.*`, `source_downs.*`, `m_source.*`, `f0_predictor.*`
 - `prompt_cache.gguf`: all 5 official cache tensors
 
-This is still not a waveform generator yet, but it is no longer only bind-side inventory. `token2wav-flow-probe` now runs a lightweight reference `flow_matching` forward on official `flow_matching.gguf` and `flow_extra.gguf`, using prompt-cache `spk_cb`, cosine timestep schedule, and a truncated token window. The current probe still uses surrogate `mu` (`embed-mu` or `zero-mu`) instead of the real `encoder.gguf` conformer output.
+This is no longer only bind-side inventory. The real `audio2audio-real --out ...` path already uses these official token2wav / HiFiGAN tensors to emit playable 24 kHz mono WAV output, and `token2wav-flow-probe` separately runs a lightweight reference `flow_matching` forward on official `flow_matching.gguf` and `flow_extra.gguf`, using prompt-cache `spk_cb`, cosine timestep schedule, and a truncated token window. The current probe still uses surrogate `mu` (`embed-mu` or `zero-mu`) instead of the real `encoder.gguf` conformer output.
 
 Uya now also has two prompt-cache-side probes that prepare the next forward step:
 
@@ -331,7 +378,7 @@ Current `flow` probe reports:
 
 ## Current Uya Status
 
-`audio2audio-real --audit-only` is not a waveform generator yet. It is the model-package and input-protocol gate for the full implementation. It now accepts either explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, or `--test-prefix prefix --count N` for the llama.cpp-omni convention where `0000` is reference voice and `0001..` are user turns.
+`audio2audio-real --audit-only` remains the model-package and input-protocol gate. The full `audio2audio-real --out ...` path is now a correctness-first waveform generator: it runs the real LLM + TTS audio-token path, then a CPU reference `tts2wav` backend that consumes official `flow_matching.gguf`, `flow_extra.gguf`, `prompt_cache.gguf`, and core `hifigan2.gguf` tensors to emit `answer.wav` / `turn.wav`. It accepts explicit `--ref-audio` plus `--user-audio`/`--input-audio`, `--input-prefix prefix` for one user turn, and real multi-turn `--test-prefix prefix --count N` sessions where `0000` is reference voice and `0001..` are user turns.
 
 There is now also a real text-only diagnostic path:
 
@@ -344,17 +391,37 @@ build/minicpm-o-uya audio2audio-real --text-only \
   --dump-embeddings --dump-hidden --max-new-tokens 64
 ```
 
-This path already follows the non-duplex `llama.cpp-omni` prompt order: system prompt prefix + reference audio embedding, then the user turn with `<|audio_start|>`/`<|audio_end|>`, then a plain assistant text prompt. It prints `ref/user n_pos`, embedding checksums, and load/prefill/decode timing, and it is intended as the last correctness gate before reconnecting TTS/token2wav. The next implementation layer is to replace the current surrogate `mu` flow probe with real `encoder.gguf -> mu` and then wire HiFiGAN2:
+This path already follows the non-duplex `llama.cpp-omni` prompt order: system prompt prefix + reference audio embedding, then the user turn with `<|audio_start|>`/`<|audio_end|>`, then a plain assistant text prompt. In full mode it now also writes wave artifacts and timing metrics including `token2wav_ms`, `first_audio_ms`, `peak_rss_kb`, `answer_duration_ms`, and `rtf`. The current reference `tts2wav` backend is intentionally honest about its remaining gaps: it still uses surrogate `mu` instead of `encoder.gguf -> mu`, and its waveform stage is a simplified CPU reference path rather than a numerically matched full HiFiGAN2 source/resblock forward.
 
-- Audio encoder: bind complete, and `audio-real-encode-probe` now runs correctness-first `conv + transformer + projector + pool` forward for short real clips; it is still too slow for practical long-turn inference.
-- Real text-only answer path: `audio2audio-real --text-only/--no-tts` now runs ref-audio system prompt + user-audio turn + Qwen3 text decode, but it still does not emit answer WAV or TTS token dumps.
-- TTS model: bind-only complete for `emb_code.*`, `emb_text.*`, decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, and `head_code.*`; `tts-condition-probe` now aligns `emb_text + projector_semantic + normalize + merge` against `llama.cpp-omni`, while decode/cache forward still pending.
+- Audio encoder: bind complete, and `audio-real-encode-probe` now runs correctness-first `conv + transformer + projector + pool` forward for short real clips; it is still too slow for practical long-turn inference, but multi-turn `audio2audio-real` no longer reloads the encoder GGUF or recomputes the reference embedding per turn.
+- Real answer path: `audio2audio-real --text-only/--no-tts` runs ref-audio system prompt + user-audio turn + Qwen3 text decode; full `audio2audio-real --out ...` additionally emits answer WAV, turn WAV, per-chunk WAV, token dumps, and timing logs. The llama.cpp-omni `--test-prefix PREFIX --count N` protocol now works in audit, text-only, and full WAV modes.
+- TTS model: bind complete for `emb_code.*`, `emb_text.*`, decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, and `head_code.*`; `tts-condition-probe` aligns `emb_text + projector_semantic + normalize + merge` against `llama.cpp-omni`, and `tts-simplex-probe` / `audio2audio-real` now run real decode/cache forward with chunked hidden-state consumption.
 - Projector: `linear1.*`, `linear2.*`
 - Token2wav encoder: bind-only complete for `after_norm.*`, `embed.*`, `encoders.*`, `pre_lookahead_layer.*`, `up_embed.*`, `up_encoders.*`, and `up_layer.*`
 - Flow matching: bind complete for `estimator.in_proj.*`, `estimator.t_embedder.*`, `estimator.blocks.*`, and `estimator.final_layer.*`; `token2wav-flow-probe` now runs reference `speaker affine + timestep embed + DiT/CFM` math on official weights, but still with surrogate `mu`
 - Flow extra: bind-only complete for `input_embedding.*`, `encoder_proj.*`, and `spk_embed_affine_layer.*`
-- HiFiGAN2: bind-only complete for `conv_pre.*`, `conv_post.*`, `ups.*`, `source_downs.*`, `m_source.*`, and `f0_predictor.*`
+- HiFiGAN2: bind complete for `conv_pre.*`, `conv_post.*`, `ups.*`, `source_downs.*`, `m_source.*`, and `f0_predictor.*`; the current CPU reference backend emits playable 24 kHz mono PCM and now keeps those tables resident across multi-turn sessions, but it does not yet claim exact source-resblock parity with `llama.cpp-omni`
 - Prompt cache: bind-only complete for all 5 official `prompt_cache.*` tensors
+
+For repeated manual runs, the Makefile now includes:
+
+```sh
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf \
+MINICPM_O_REAL_PREFIX=/path/to/case_prefix \
+MINICPM_O_REAL_COUNT=3 \
+make audio2audio-real-prefix-audit
+
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf \
+MINICPM_O_REAL_PREFIX=/path/to/case_prefix \
+MINICPM_O_REAL_COUNT=3 \
+MINICPM_O_REAL_OUT=/tmp/minicpm-o-uya-answer.wav \
+make audio2audio-real-prefix-wav
+
+MINICPM_O_REAL_OUT=/tmp/minicpm-o-uya-answer.wav \
+make audio2audio-real-report
+```
+
+`make audio2audio-real-report` wraps `tests/audio2audio_real_manifest.py` and converts the generated `timing.log` files plus related artifacts into one JSON report for later CPU-only baseline comparison.
 
 ## Acceptance
 
@@ -371,9 +438,9 @@ build/minicpm-o-uya audio2audio-real \
   --input-audio outputs/complex_case2/complex2_0001.wav \
   --out outputs/uya_audio2audio_answer.wav
 
-# llama.cpp-omni style multi-file protocol also works in audit mode:
+# llama.cpp-omni style multi-file protocol works in audit, text-only, and full WAV modes:
 # prefix_0000.wav is the reference voice, prefix_0001.wav.. are user turns.
-build/minicpm-o-uya audio2audio-real --audit-only \
+build/minicpm-o-uya audio2audio-real \
   --llm models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
   --audio models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf \
   --tts models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf \
@@ -391,3 +458,4 @@ Required metrics for comparison with `llama.cpp-omni`:
 - Peak RSS or allocator high-watermark.
 - Audio duration, sample rate, and generated text if available.
 - Whether reference voice and user turn were interpreted with the same `_0000=ref`, `_0001=user` protocol.
+- Per-turn artifact inventory (`turn_0001_*`, `turn_0002_*`, ...) and the final JSON report from `make audio2audio-real-report`.
