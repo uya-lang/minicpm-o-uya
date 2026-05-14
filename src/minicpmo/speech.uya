@@ -186,6 +186,7 @@ struct TtsSimplexConfig {
     max_audio_tokens: u32,
     seed: u32,
     greedy: bool,
+    allow_max_audio_tokens_stop: bool,
 }
 
 export struct TtsSimplexSession {
@@ -300,7 +301,7 @@ fn tts_decoder_runtime_init() TtsDecoderRuntime {
 }
 
 fn tts_simplex_config_init() TtsSimplexConfig {
-    return TtsSimplexConfig{ max_audio_tokens: TTS_SIMPLEX_DEFAULT_MAX_AUDIO_TOKENS, seed: TTS_SIMPLEX_DEFAULT_SEED, greedy: false };
+    return TtsSimplexConfig{ max_audio_tokens: TTS_SIMPLEX_DEFAULT_MAX_AUDIO_TOKENS, seed: TTS_SIMPLEX_DEFAULT_SEED, greedy: false, allow_max_audio_tokens_stop: false };
 }
 
 export fn tts_simplex_session_init() TtsSimplexSession {
@@ -1592,12 +1593,15 @@ fn tts_decoder_forward_token_id(config: &TtsDecoderConfig, weights: &TtsDecoderW
 fn tts_decoder_head_code_logits(config: &TtsDecoderConfig, weights: &TtsDecoderWeights, hidden: &const f32, logits: &f32) void {
     const hidden_n: usize = config.hidden_size as usize;
     const vocab_n: usize = config.audio_token_vocab_size as usize;
+    const token_major: bool = weights.head_code.shape[0] == vocab_n as u64 && weights.head_code.shape[1] == hidden_n as u64;
     var token: usize = 0;
     while token < vocab_n {
         var sum: f32 = 0.0 as f32;
         var dim: usize = 0;
         while dim < hidden_n {
-            sum = sum + hidden[dim] * speech_load_value(weights.head_code, dim * vocab_n + token);
+            var index: usize = dim * vocab_n + token;
+            if token_major { index = token * hidden_n + dim; }
+            sum = sum + hidden[dim] * speech_load_value(weights.head_code, index);
             dim = dim + 1;
         }
         logits[token] = sum;
@@ -1933,6 +1937,15 @@ fn tts_simplex_generate_chunk(config: &TtsDecoderConfig, weights: &TtsDecoderWei
         token_index = token_index + 1;
     }
     if !tts_decoder_forward_embedding(config, weights, runtime, &bos_embed[0] as &const f32) { return false; }
+    if *all_generated_count == 0 {
+        tts_simplex_runtime_reset(runtime, simplex.seed);
+        token_index = 0;
+        while token_index < merged_tokens {
+            if !tts_decoder_forward_embedding(config, weights, runtime, &merged[token_index * hidden_n] as &const f32) { return false; }
+            token_index = token_index + 1;
+        }
+        if !tts_decoder_forward_embedding(config, weights, runtime, &bos_embed[0] as &const f32) { return false; }
+    }
     var logits: &f32 = calloc(config.audio_token_vocab_size as usize, 4) as &f32;
     if logits == null {
         _ = printf("error: tts simplex logits allocation failed vocab=%u\n", config.audio_token_vocab_size);
@@ -1968,6 +1981,17 @@ fn tts_simplex_generate_chunk(config: &TtsDecoderConfig, weights: &TtsDecoderWei
         step = step + 1;
     }
     if !need_phase2 && step == phase1_cap {
+        if simplex.allow_max_audio_tokens_stop {
+            _ = printf("tts-simplex chunk=%u stopped_at_max_audio_tokens=%u before audio EOS allow_truncation=1\n", chunk_index, simplex.max_audio_tokens);
+            free(logits as &void);
+            var final_flag2: u32 = 0;
+            if is_final_chunk { final_flag2 = 1; }
+            _ = printf("tts-simplex chunk=%u merged_tokens=%zu generated=%zu total_generated=%zu total_tts_tokens=%zu final=%u\n", chunk_index, merged_tokens, out_count[0], *all_generated_count, runtime.total_tokens, final_flag2);
+            if out_count[0] > 0 {
+                _ = printf("tts-simplex chunk=%u first=%u last=%u\n", chunk_index, out_tokens[0], out_tokens[out_count[0] - 1]);
+            }
+            return out_count[0] > 0;
+        }
         _ = printf("error: tts simplex chunk=%u reached max_audio_tokens=%u before audio EOS\n", chunk_index, simplex.max_audio_tokens);
         free(logits as &void);
         return false;
@@ -2004,6 +2028,17 @@ fn tts_simplex_generate_chunk(config: &TtsDecoderConfig, weights: &TtsDecoderWei
             step = step + 1;
         }
         if !phase2_ended {
+            if simplex.allow_max_audio_tokens_stop {
+                _ = printf("tts-simplex final chunk=%u stopped_at_phase2_max_audio_tokens=%u before audio EOS allow_truncation=1\n", chunk_index, simplex.max_audio_tokens);
+                free(logits as &void);
+                var final_flag3: u32 = 0;
+                if is_final_chunk { final_flag3 = 1; }
+                _ = printf("tts-simplex chunk=%u merged_tokens=%zu generated=%zu total_generated=%zu total_tts_tokens=%zu final=%u\n", chunk_index, merged_tokens, out_count[0], *all_generated_count, runtime.total_tokens, final_flag3);
+                if out_count[0] > 0 {
+                    _ = printf("tts-simplex chunk=%u first=%u last=%u\n", chunk_index, out_tokens[0], out_tokens[out_count[0] - 1]);
+                }
+                return out_count[0] > 0;
+            }
             _ = printf("error: tts simplex final chunk=%u reached phase2 max_audio_tokens=%u before audio EOS\n", chunk_index, simplex.max_audio_tokens);
             free(logits as &void);
             return false;
@@ -2240,7 +2275,7 @@ fn tts_simplex_compare_chunk(reference_path: &const byte, tokens: &const u32, to
 
 fn tts_simplex_probe_usage() void {
     _ = printf("usage: minicpm-o-uya tts-simplex-probe <tts.gguf> <projector.gguf> <llm_debug_dir>\n");
-    _ = printf("       [--count N] [--out-dir dir] [--compare-dir dir] [--require-exact] [--max-audio-tokens N] [--seed S] [--greedy]\n");
+    _ = printf("       [--count N] [--out-dir dir] [--compare-dir dir] [--require-exact] [--max-audio-tokens N] [--seed S] [--greedy] [--allow-max-audio-tokens-stop]\n");
 }
 
 export fn speech_tts_simplex_probe_cli(argc: i32, argv: & &byte) i32 {
@@ -2297,6 +2332,11 @@ export fn speech_tts_simplex_probe_cli(argc: i32, argv: & &byte) i32 {
         }
         if strcmp(argv[i] as *const byte, "--greedy\0" as *const byte) == 0 {
             simplex.greedy = true;
+            i = i + 1;
+            continue;
+        }
+        if strcmp(argv[i] as *const byte, "--allow-max-audio-tokens-stop\0" as *const byte) == 0 {
+            simplex.allow_max_audio_tokens_stop = true;
             i = i + 1;
             continue;
         }

@@ -509,7 +509,7 @@
 - [x] 增加 TTS token 级对照：相同 hidden/text chunk 下，audio token 前 N 个与 baseline 对比。
   - [x] `tts-simplex-probe --compare-dir DIR` 已支持逐 chunk exact compare。
   - [x] `make tts-token-align` / `tests/compare_tts_token_alignment.py` 已支持逐 chunk `count/prefix_match/exact` 汇总。
-  - [ ] 当前本地 `round_000/tts_wav` baseline 未固定 sampler seed，暂不作为严格 deterministic token oracle。
+  - [x] 已补本地 seeded baseline manifest：`outputs/baselines/tts_token_baselines.json`；当前可用严格前缀 oracle 为 `complex_case2_seed1_greedy_chunk4_tok64`，并支持 manifest-driven `tts-token-align`。
   - [x] `audio2audio-real --test-prefix` 真实路径现会在多 turn 间复用同一套 TTS 权重、tokenizer 与 decoder runtime，仅按 turn 重置 cache/token 状态。
 
 验收标准：

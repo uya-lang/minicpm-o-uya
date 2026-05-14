@@ -241,15 +241,15 @@ This is the first real Uya implementation of:
 - chunked text/hidden-state queue consumption
 - real audio token dump emission
 
-Current limitation: the local saved `llama.cpp-omni` `audio_tokens_chunk_*.txt` files were generated from an unpinned sampler seed, so exact token-by-token replay is not yet expected to match. The Uya probe already supports `--compare-dir` for future seeded baselines, but today's `round_000/tts_wav` artifacts should be treated as a structural/debug reference rather than a strict deterministic oracle.
+The local TTS token baseline is now recorded separately from the older ad-hoc `round_000/tts_wav` dump. Use `outputs/baselines/tts_token_baselines.json` to register a fixed-seed reference `llm_debug` + `tts_wav` pair, then point `make tts-token-align` at that named entry. This supports both full strict oracles and shorter prefix oracles that intentionally stop at a configured `--max-audio-tokens` cap.
 
-Even without a pinned baseline seed, the probe is now observability-friendly:
+The probe is observability-friendly:
 
 - `tts-simplex prompt: ... prefill_ms=...`
 - `tts-simplex timing: chunk=N merge_ms=... decode_ms=... cache_tokens=... generated=...`
 - `tts-simplex compare-summary: chunk=N ref=... uya=... prefix_match=... exact=...`
 
-For repeated manual comparison runs, use:
+For repeated manual comparison runs, use either the direct directory form:
 
 ```sh
 MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf \
@@ -258,7 +258,27 @@ MINICPM_O_TTS_COMPARE_DIR=/path/to/tts_wav \
 make tts-token-align
 ```
 
-If you have a future seeded baseline and want strict pass/fail, add `MINICPM_O_TTS_REQUIRE_EXACT=1`.
+Or the manifest-driven seeded-baseline form:
+
+```sh
+MINICPM_O_TTS_BASELINE_NAME=complex_case2_seed1_greedy_chunk4_tok64 \
+MINICPM_O_TTS_LLM_DEBUG_DIR=/path/to/llm_debug \
+MINICPM_O_TTS_COMPARE_DIR=/path/to/tts_wav \
+MINICPM_O_TTS_BASELINE_MANIFEST=outputs/baselines/tts_token_baselines.json \
+MINICPM_O_TTS_SEED=1 \
+MINICPM_O_TTS_TEMPERATURE=0 \
+MINICPM_O_TTS_GREEDY=1 \
+MINICPM_O_TTS_ALLOW_TOKEN_CAP_STOP=1 \
+make tts-seeded-baseline-record
+
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf \
+MINICPM_O_TTS_BASELINE_MANIFEST=outputs/baselines/tts_token_baselines.json \
+MINICPM_O_TTS_BASELINE_NAME=complex_case2_seed1_greedy_chunk4_tok64 \
+MINICPM_O_TTS_MAX_AUDIO_TOKENS=64 \
+make tts-token-align
+```
+
+`tts-token-align` now auto-loads `seed`, `greedy`, `chunk_count`, and strictness from the manifest entry. Prefix oracles can opt into `--allow-max-audio-tokens-stop`, which keeps truncation explicit instead of silently swallowing a real decoder failure.
 
 ## Required GGUF Files
 
@@ -442,7 +462,7 @@ make audio2audio-real-report
 - Chinese-English mixed speech
 - complex multi-requirement regression audio
 
-`make audio2audio-real-baseline-compare` compares one generated Uya report JSON against a named entry in the local `outputs/baselines/audio2audio_baselines.json` manifest.
+`make audio2audio-real-baseline-compare` compares one generated Uya report JSON against a named entry in the local `outputs/baselines/audio2audio_baselines.json` manifest. Add `MINICPM_O_BASELINE_COMPARE_OUTPUT=/tmp/uya_vs_llama.json` to persist the comparison record for local CPU-only baseline tracking.
 
 ## Acceptance
 

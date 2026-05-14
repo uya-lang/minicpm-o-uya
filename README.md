@@ -64,11 +64,11 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `token2wav-flow-probe <flow_matching.gguf> <flow_extra.gguf> <prompt_cache.gguf> <audio_tokens_chunk.txt>` | Real flow-matching math probe | Runs reference `speaker affine + encoder-mu/embed-mu + timestep embed + DiT/CFM`; `--session` replays the full `28/25` sliding-window schedule and `--dump-f32` writes mel output |
 | `tts-condition-probe <tts.gguf> <projector.gguf> <llm_token_ids.txt> <llm_hidden_states.bin>` | Real TTS conditioning merge probe | `emb_text + projector_semantic + L2 normalize + merge`; optional merged/condition dump |
 | `tts-simplex-probe <tts.gguf> <projector.gguf> <llm_debug_dir>` | Real TTS decoder/audio-token probe | Official TTS decoder KV cache + assistant prompt prefill + chunked audio token dump |
-| `make tts-token-align` | Real TTS token compare helper | Runs simplex probe and reports per-chunk count/prefix/exact match vs `audio_tokens_chunk_*.txt` |
+| `make tts-token-align` | Real TTS token compare helper | Runs simplex probe and reports per-chunk count/prefix/exact match vs `audio_tokens_chunk_*.txt`, including manifest-driven seeded strict oracles |
 | `make token2wav-real-mu-align` | Real token2wav mu compare helper | Compares surrogate `embed-mu` vs official `encoder-mu` flow-probe output |
 | `make audio-real-stream-align` | Real mel streaming compare helper | Confirms streamed chunk mel matches one-shot mel exactly on the same audio |
 | `make audio2audio-case-matrix` | Local real-case inventory helper | Generates reusable short/long/silence/English/mixed/complex WAV inputs and a JSON manifest |
-| `make audio2audio-real-baseline-compare` | Local baseline compare helper | Compares one Uya report JSON against a local `llama.cpp-omni` baseline manifest entry |
+| `make audio2audio-real-baseline-compare` | Local baseline compare helper | Compares one Uya report JSON against a local `llama.cpp-omni` baseline manifest entry and can write a persisted compare JSON |
 | `audio2audio-smoke <model.gguf> [--audio-model audio.gguf] [--speech-model speech.gguf] [--vocoder-model vocoder.gguf] <audio.pcm\|audio.raw> [out.wav]` | Audio input to WAV smoke | PCM/mel -> audio encoder -> speech/vocoder WAV; optional split GGUF tables |
 | `speech-smoke <model.gguf> <prompt> [out.wav]` | Speech/vocoder smoke | Deterministic tiny WAV output only |
 | `omni-smoke <model.gguf> <manifest.json>` | Compile mixed text/image/audio/speech manifest | Fixed test JSON schema |
@@ -179,6 +179,9 @@ build/minicpm-o-uya token2wav-flow-probe /path/to/token2wav-gguf/flow_matching.g
 build/minicpm-o-uya token2wav-flow-probe /path/to/token2wav-gguf/flow_matching.gguf /path/to/token2wav-gguf/flow_extra.gguf /path/to/token2wav-gguf/prompt_cache.gguf /path/to/audio_tokens_chunk_0.txt --session --embed-mu
 build/minicpm-o-uya token2wav-flow-probe /path/to/token2wav-gguf/flow_matching.gguf /path/to/token2wav-gguf/flow_extra.gguf /path/to/token2wav-gguf/prompt_cache.gguf /path/to/audio_tokens_chunk_0.txt --session --encoder /path/to/token2wav-gguf/encoder.gguf --dump-f32 /tmp/token2wav_flow_session.uyml
 MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_TTS_LLM_DEBUG_DIR=/path/to/llm_debug MINICPM_O_TTS_COMPARE_DIR=/path/to/tts_wav make tts-token-align
+MINICPM_O_TTS_BASELINE_NAME=complex_case2_seed1_greedy_chunk4_tok64 MINICPM_O_TTS_LLM_DEBUG_DIR=/path/to/llm_debug MINICPM_O_TTS_COMPARE_DIR=/path/to/tts_wav MINICPM_O_TTS_BASELINE_MANIFEST=outputs/baselines/tts_token_baselines.json MINICPM_O_TTS_SEED=1 MINICPM_O_TTS_TEMPERATURE=0 MINICPM_O_TTS_GREEDY=1 MINICPM_O_TTS_ALLOW_TOKEN_CAP_STOP=1 make tts-seeded-baseline-record
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_TTS_BASELINE_MANIFEST=outputs/baselines/tts_token_baselines.json MINICPM_O_TTS_BASELINE_NAME=complex_case2_seed1_greedy_chunk4_tok64 MINICPM_O_TTS_MAX_AUDIO_TOKENS=64 make tts-token-align
+MINICPM_O_REAL_REPORT_JSON=/path/to/uya_report.json MINICPM_O_BASELINE_CASE=complex_case2 MINICPM_O_BASELINE_COMPARE_OUTPUT=/tmp/uya_vs_llama.json make audio2audio-real-baseline-compare
 MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_AUDIO_TOKENS_TXT=/path/to/audio_tokens_chunk_0.txt make token2wav-real-mu-align
 MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-stream-align
 make audio2audio-case-matrix
