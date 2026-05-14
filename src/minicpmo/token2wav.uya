@@ -144,14 +144,17 @@ export struct Token2WavReferenceRun {
 export struct Token2WavReferenceSession {
     prompt_config: T2WPromptCacheConfig,
     prompt_table: TensorWeightTable,
+    encoder_table: TensorWeightTable,
     flow_extra_table: TensorWeightTable,
     flow_matching_table: TensorWeightTable,
     hifigan_table: TensorWeightTable,
+    encoder: T2WEncoderWeights,
     extra: T2WFlowExtraWeights,
     matching: T2WFlowMatchingWeights,
     hifigan: T2WHifiganLiteWeights,
     spk_proj: &f32,
     up_rate: u32,
+    use_real_encoder_mu: bool,
 }
 
 struct T2WHifiganLiteWeights {
@@ -228,6 +231,7 @@ struct T2WFlowProbeConfig {
     zero_mu: bool,
     session: bool,
     dump_path: &const byte,
+    encoder_path: &const byte,
 }
 
 fn t2w_dtype_supported(dtype: TensorDType) bool {
@@ -373,6 +377,7 @@ fn t2w_flow_probe_config_init() T2WFlowProbeConfig {
         zero_mu: false,
         session: false,
         dump_path: null,
+        encoder_path: null,
     };
 }
 
@@ -398,14 +403,17 @@ export fn token2wav_reference_session_init() Token2WavReferenceSession {
     return Token2WavReferenceSession{
         prompt_config: t2w_prompt_cache_config_init(),
         prompt_table: tensor_table_init(),
+        encoder_table: tensor_table_init(),
         flow_extra_table: tensor_table_init(),
         flow_matching_table: tensor_table_init(),
         hifigan_table: tensor_table_init(),
+        encoder: t2w_encoder_weights_init(),
         extra: t2w_flow_extra_weights_init(),
         matching: t2w_flow_matching_weights_init(),
         hifigan: t2w_hifigan_lite_weights_init(),
         spk_proj: null,
         up_rate: 0,
+        use_real_encoder_mu: false,
     };
 }
 
@@ -1501,6 +1509,378 @@ fn t2w_flow_final_forward(dst: &f32, states: &const f32, token_count: usize, c_e
     return true;
 }
 
+fn t2w_fill_zeros_f32(dst: &f32, count: usize) void {
+    var i: usize = 0;
+    while i < count {
+        dst[i] = 0.0;
+        i = i + 1;
+    }
+}
+
+fn t2w_add_inplace(dst: &f32, src: &const f32, count: usize) void {
+    var i: usize = 0;
+    while i < count {
+        dst[i] = dst[i] + src[i];
+        i = i + 1;
+    }
+}
+
+fn t2w_scale_inplace(values: &f32, count: usize, scale: f32) void {
+    var i: usize = 0;
+    while i < count {
+        values[i] = values[i] * scale;
+        i = i + 1;
+    }
+}
+
+fn t2w_leaky_relu_inplace(values: &f32, count: usize, slope: f32) void {
+    var i: usize = 0;
+    while i < count {
+        if values[i] < 0.0 {
+            values[i] = values[i] * slope;
+        }
+        i = i + 1;
+    }
+}
+
+fn t2w_conv1d_valid_seq(dst: &f32, src: &const f32, src_tokens: usize, in_dim: usize, out_dim: usize, kernel_size: usize, weight: &TensorView, bias: &TensorView) bool {
+    if src_tokens < kernel_size {
+        _ = printf("error: token2wav conv1d src_tokens=%zu smaller than kernel=%zu\n", src_tokens, kernel_size);
+        return false;
+    }
+    const out_tokens: usize = src_tokens - kernel_size + 1;
+    var token: usize = 0;
+    while token < out_tokens {
+        var out_index: usize = 0;
+        while out_index < out_dim {
+            var sum: f32 = 0.0;
+            if bias != null {
+                sum = qwen3_tensor_get(bias, out_index);
+            }
+            var kernel: usize = 0;
+            while kernel < kernel_size {
+                const src_token: usize = token + kernel;
+                var in_index: usize = 0;
+                while in_index < in_dim {
+                    const weight_index: usize = ((kernel * in_dim + in_index) * out_dim) + out_index;
+                    sum = sum + src[src_token * in_dim + in_index] * qwen3_tensor_get(weight, weight_index);
+                    in_index = in_index + 1;
+                }
+                kernel = kernel + 1;
+            }
+            dst[token * out_dim + out_index] = sum;
+            out_index = out_index + 1;
+        }
+        token = token + 1;
+    }
+    return true;
+}
+
+fn t2w_repeat_upsample_seq(dst: &f32, src: &const f32, token_count: usize, dim: usize, up_factor: usize) void {
+    var token: usize = 0;
+    while token < token_count {
+        var rep: usize = 0;
+        while rep < up_factor {
+            var i: usize = 0;
+            while i < dim {
+                dst[(token * up_factor + rep) * dim + i] = src[token * dim + i];
+                i = i + 1;
+            }
+            rep = rep + 1;
+        }
+        token = token + 1;
+    }
+}
+
+fn t2w_build_relpos_encoding(dst: &f32, token_count: usize, dim: usize) void {
+    const pos_count: usize = token_count * 2 - 1;
+    const half: usize = (dim + 1) / (2 as usize);
+    const log_10000: f32 = logf(10000.0 as f32);
+    t2w_fill_zeros_f32(dst, pos_count * dim);
+    var pos_index: usize = 0;
+    while pos_index < pos_count {
+        var pos_value: f32 = 0.0;
+        var negative: bool = false;
+        if pos_index < token_count {
+            pos_value = (token_count - 1 - pos_index) as f32;
+        } else {
+            pos_value = (pos_index - token_count + 1) as f32;
+            negative = true;
+        }
+        var pair_index: usize = 0;
+        while pair_index < half {
+            const dim_index: usize = pair_index * 2;
+            const freq: f32 = expf((0.0 as f32) - (log_10000 / (dim as f32)) * (dim_index as f32));
+            const angle: f32 = pos_value * freq;
+            var sin_value: f32 = sinf(angle);
+            if negative { sin_value = 0.0 - sin_value; }
+            dst[pos_index * dim + dim_index] = sin_value;
+            if dim_index + 1 < dim {
+                dst[pos_index * dim + dim_index + 1] = cosf(angle);
+            }
+            pair_index = pair_index + 1;
+        }
+        pos_index = pos_index + 1;
+    }
+}
+
+fn t2w_relpos_attention_seq(dst: &f32, src: &const f32, token_count: usize, pos_emb: &const f32, pos_count: usize, layer: &T2WEncoderLayerWeights) bool {
+    const hidden: usize = T2W_FLOW_HIDDEN;
+    const head_count: usize = T2W_FLOW_HEAD_COUNT;
+    const head_dim: usize = T2W_FLOW_HEAD_DIM;
+    const q_values: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-q\0" as &const byte);
+    const k_values: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-k\0" as &const byte);
+    const v_values: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-v\0" as &const byte);
+    const p_values: &f32 = t2w_alloc_f32(pos_count * hidden, "encoder-p\0" as &const byte);
+    const ctx_values: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-ctx\0" as &const byte);
+    const scores: &f32 = t2w_alloc_f32(token_count, "encoder-scores\0" as &const byte);
+    const probs: &f32 = t2w_alloc_f32(token_count, "encoder-probs\0" as &const byte);
+    if q_values == null || k_values == null || v_values == null || p_values == null || ctx_values == null || scores == null || probs == null {
+        if q_values != null { free(q_values as &void); }
+        if k_values != null { free(k_values as &void); }
+        if v_values != null { free(v_values as &void); }
+        if p_values != null { free(p_values as &void); }
+        if ctx_values != null { free(ctx_values as &void); }
+        if scores != null { free(scores as &void); }
+        if probs != null { free(probs as &void); }
+        return false;
+    }
+    t2w_linear_seq(q_values, src, token_count, hidden, hidden, layer.q_weight, layer.q_bias);
+    t2w_linear_seq(k_values, src, token_count, hidden, hidden, layer.k_weight, layer.k_bias);
+    t2w_linear_seq(v_values, src, token_count, hidden, hidden, layer.v_weight, layer.v_bias);
+    t2w_linear_seq(p_values, pos_emb, pos_count, hidden, hidden, layer.pos_weight, null as &TensorView);
+    const scale: f32 = 1.0 / sqrtf(head_dim as f32);
+    var query: usize = 0;
+    while query < token_count {
+        var head: usize = 0;
+        while head < head_count {
+            var key: usize = 0;
+            while key < token_count {
+                const rel_index: usize = token_count - 1 - key + query;
+                var ac: f32 = 0.0;
+                var bd: f32 = 0.0;
+                var dim_index: usize = 0;
+                while dim_index < head_dim {
+                    const hidden_index: usize = head * head_dim + dim_index;
+                    const bias_index: usize = dim_index * head_count + head;
+                    const q_base: usize = query * hidden + hidden_index;
+                    const q_u: f32 = q_values[q_base] + qwen3_tensor_get(layer.pos_bias_u, bias_index);
+                    const q_v: f32 = q_values[q_base] + qwen3_tensor_get(layer.pos_bias_v, bias_index);
+                    ac = ac + k_values[key * hidden + hidden_index] * q_u;
+                    bd = bd + p_values[rel_index * hidden + hidden_index] * q_v;
+                    dim_index = dim_index + 1;
+                }
+                scores[key] = (ac + bd) * scale;
+                key = key + 1;
+            }
+            softmax(probs, scores as &const f32, token_count);
+            var out_dim: usize = 0;
+            while out_dim < head_dim {
+                var sum: f32 = 0.0;
+                var value_token: usize = 0;
+                while value_token < token_count {
+                    const hidden_index2: usize = head * head_dim + out_dim;
+                    sum = sum + probs[value_token] * v_values[value_token * hidden + hidden_index2];
+                    value_token = value_token + 1;
+                }
+                ctx_values[query * hidden + head * head_dim + out_dim] = sum;
+                out_dim = out_dim + 1;
+            }
+            head = head + 1;
+        }
+        query = query + 1;
+    }
+    t2w_linear_seq(dst, ctx_values as &const f32, token_count, hidden, hidden, layer.out_weight, layer.out_bias);
+    free(q_values as &void);
+    free(k_values as &void);
+    free(v_values as &void);
+    free(p_values as &void);
+    free(ctx_values as &void);
+    free(scores as &void);
+    free(probs as &void);
+    return true;
+}
+
+fn t2w_encoder_layer_forward_seq(states: &f32, token_count: usize, pos_emb: &const f32, pos_count: usize, layer: &T2WEncoderLayerWeights) bool {
+    const hidden: usize = T2W_FLOW_HIDDEN;
+    const ff_hidden: usize = 2048;
+    const normed: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-normed\0" as &const byte);
+    const att_out: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-att\0" as &const byte);
+    const ff_mid: &f32 = t2w_alloc_f32(token_count * ff_hidden, "encoder-ff-mid\0" as &const byte);
+    const ff_out: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-ff-out\0" as &const byte);
+    if normed == null || att_out == null || ff_mid == null || ff_out == null {
+        if normed != null { free(normed as &void); }
+        if att_out != null { free(att_out as &void); }
+        if ff_mid != null { free(ff_mid as &void); }
+        if ff_out != null { free(ff_out as &void); }
+        return false;
+    }
+    t2w_layer_norm_seq_affine(normed, states as &const f32, token_count, hidden, layer.norm_mha_weight, layer.norm_mha_bias, 0.000000000001 as f32);
+    if !t2w_relpos_attention_seq(att_out, normed as &const f32, token_count, pos_emb, pos_count, layer) {
+        free(normed as &void);
+        free(att_out as &void);
+        free(ff_mid as &void);
+        free(ff_out as &void);
+        return false;
+    }
+    t2w_add_inplace(states, att_out as &const f32, token_count * hidden);
+    t2w_layer_norm_seq_affine(normed, states as &const f32, token_count, hidden, layer.norm_ff_weight, layer.norm_ff_bias, 0.000000000001 as f32);
+    t2w_linear_seq(ff_mid, normed as &const f32, token_count, hidden, ff_hidden, layer.ff1_weight, layer.ff1_bias);
+    var i: usize = 0;
+    while i < token_count * ff_hidden {
+        ff_mid[i] = silu(ff_mid[i]);
+        i = i + 1;
+    }
+    t2w_linear_seq(ff_out, ff_mid as &const f32, token_count, ff_hidden, hidden, layer.ff2_weight, layer.ff2_bias);
+    t2w_add_inplace(states, ff_out as &const f32, token_count * hidden);
+    free(normed as &void);
+    free(att_out as &void);
+    free(ff_mid as &void);
+    free(ff_out as &void);
+    return true;
+}
+
+fn t2w_build_real_mu(mu: &f32, tokens: &const u32, token_count: usize, extra: &T2WFlowExtraWeights, encoder: &T2WEncoderWeights, up_rate: usize) bool {
+    if up_rate != 2 {
+        _ = printf("error: token2wav real encoder-mu only supports up_rate=2 got=%zu\n", up_rate);
+        return false;
+    }
+    if token_count == 0 {
+        return true;
+    }
+    const hidden: usize = T2W_FLOW_HIDDEN;
+    const embed_scale: f32 = sqrtf(hidden as f32);
+    const token_embeddings: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-token-emb\0" as &const byte);
+    const work0: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-work0\0" as &const byte);
+    const work1: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-work1\0" as &const byte);
+    const prelook_cat: &f32 = t2w_alloc_f32((token_count + (encoder.pre_conv1_weight.shape[0] as usize) - 1) * hidden, "encoder-prelook-cat\0" as &const byte);
+    const prelook_conv1: &f32 = t2w_alloc_f32(token_count * hidden, "encoder-prelook-conv1\0" as &const byte);
+    const prelook_cat2: &f32 = t2w_alloc_f32((token_count + (encoder.pre_conv2_weight.shape[0] as usize) - 1) * hidden, "encoder-prelook-cat2\0" as &const byte);
+    const pos0: &f32 = t2w_alloc_f32((token_count * 2 - 1) * hidden, "encoder-pos0\0" as &const byte);
+    if token_embeddings == null || work0 == null || work1 == null || prelook_cat == null || prelook_conv1 == null || prelook_cat2 == null || pos0 == null {
+        if token_embeddings != null { free(token_embeddings as &void); }
+        if work0 != null { free(work0 as &void); }
+        if work1 != null { free(work1 as &void); }
+        if prelook_cat != null { free(prelook_cat as &void); }
+        if prelook_conv1 != null { free(prelook_conv1 as &void); }
+        if prelook_cat2 != null { free(prelook_cat2 as &void); }
+        if pos0 != null { free(pos0 as &void); }
+        return false;
+    }
+    var token_index: usize = 0;
+    while token_index < token_count {
+        if !t2w_copy_embedding_row(&token_embeddings[token_index * hidden], extra.input_embedding, tokens[token_index], hidden, extra.input_embedding.shape[1] as usize) {
+            free(token_embeddings as &void); free(work0 as &void); free(work1 as &void); free(prelook_cat as &void); free(prelook_conv1 as &void); free(prelook_cat2 as &void); free(pos0 as &void);
+            return false;
+        }
+        token_index = token_index + 1;
+    }
+    t2w_linear_seq(work0, token_embeddings as &const f32, token_count, hidden, hidden, encoder.embed0_weight, encoder.embed0_bias);
+    t2w_layer_norm_seq_affine(work1, work0 as &const f32, token_count, hidden, encoder.embed1_weight, encoder.embed1_bias, 0.00001);
+    t2w_scale_inplace(work1, token_count * hidden, embed_scale);
+    const prelook_right: usize = (encoder.pre_conv1_weight.shape[0] as usize) - 1;
+    t2w_fill_zeros_f32(prelook_cat, (token_count + prelook_right) * hidden);
+    var copy_token: usize = 0;
+    while copy_token < token_count {
+        var copy_dim: usize = 0;
+        while copy_dim < hidden {
+            prelook_cat[copy_token * hidden + copy_dim] = work1[copy_token * hidden + copy_dim];
+            copy_dim = copy_dim + 1;
+        }
+        copy_token = copy_token + 1;
+    }
+    if !t2w_conv1d_valid_seq(prelook_conv1, prelook_cat as &const f32, token_count + prelook_right, hidden, hidden, encoder.pre_conv1_weight.shape[0] as usize, encoder.pre_conv1_weight, encoder.pre_conv1_bias) {
+        free(token_embeddings as &void); free(work0 as &void); free(work1 as &void); free(prelook_cat as &void); free(prelook_conv1 as &void); free(prelook_cat2 as &void); free(pos0 as &void);
+        return false;
+    }
+    t2w_leaky_relu_inplace(prelook_conv1, token_count * hidden, 0.01);
+    const prelook_left: usize = (encoder.pre_conv2_weight.shape[0] as usize) - 1;
+    t2w_fill_zeros_f32(prelook_cat2, (token_count + prelook_left) * hidden);
+    copy_token = 0;
+    while copy_token < token_count {
+        var copy_dim2: usize = 0;
+        while copy_dim2 < hidden {
+            prelook_cat2[(copy_token + prelook_left) * hidden + copy_dim2] = prelook_conv1[copy_token * hidden + copy_dim2];
+            copy_dim2 = copy_dim2 + 1;
+        }
+        copy_token = copy_token + 1;
+    }
+    if !t2w_conv1d_valid_seq(work0, prelook_cat2 as &const f32, token_count + prelook_left, hidden, hidden, encoder.pre_conv2_weight.shape[0] as usize, encoder.pre_conv2_weight, encoder.pre_conv2_bias) {
+        free(token_embeddings as &void); free(work0 as &void); free(work1 as &void); free(prelook_cat as &void); free(prelook_conv1 as &void); free(prelook_cat2 as &void); free(pos0 as &void);
+        return false;
+    }
+    t2w_add_inplace(work0, work1 as &const f32, token_count * hidden);
+    t2w_build_relpos_encoding(pos0, token_count, hidden);
+    var layer_index: usize = 0;
+    while layer_index < encoder.encoder_count as usize {
+        if !t2w_encoder_layer_forward_seq(work0, token_count, pos0 as &const f32, token_count * 2 - 1, &encoder.encoders[layer_index]) {
+            free(token_embeddings as &void); free(work0 as &void); free(work1 as &void); free(prelook_cat as &void); free(prelook_conv1 as &void); free(prelook_cat2 as &void); free(pos0 as &void);
+            return false;
+        }
+        layer_index = layer_index + 1;
+    }
+    const up_tokens: usize = token_count * up_rate;
+    const upsampled: &f32 = t2w_alloc_f32(up_tokens * hidden, "encoder-upsampled\0" as &const byte);
+    const up_cat: &f32 = t2w_alloc_f32((up_tokens + (encoder.up_layer_weight.shape[0] as usize) - 1) * hidden, "encoder-up-cat\0" as &const byte);
+    const up_pos: &f32 = t2w_alloc_f32((up_tokens * 2 - 1) * hidden, "encoder-up-pos\0" as &const byte);
+    const up_work0: &f32 = t2w_alloc_f32(up_tokens * hidden, "encoder-up-work0\0" as &const byte);
+    const up_work1: &f32 = t2w_alloc_f32(up_tokens * hidden, "encoder-up-work1\0" as &const byte);
+    if upsampled == null || up_cat == null || up_pos == null || up_work0 == null || up_work1 == null {
+        if upsampled != null { free(upsampled as &void); }
+        if up_cat != null { free(up_cat as &void); }
+        if up_pos != null { free(up_pos as &void); }
+        if up_work0 != null { free(up_work0 as &void); }
+        if up_work1 != null { free(up_work1 as &void); }
+        free(token_embeddings as &void); free(work0 as &void); free(work1 as &void); free(prelook_cat as &void); free(prelook_conv1 as &void); free(prelook_cat2 as &void); free(pos0 as &void);
+        return false;
+    }
+    t2w_repeat_upsample_seq(upsampled, work0 as &const f32, token_count, hidden, up_rate);
+    const up_left: usize = (encoder.up_layer_weight.shape[0] as usize) - 1;
+    t2w_fill_zeros_f32(up_cat, (up_tokens + up_left) * hidden);
+    copy_token = 0;
+    while copy_token < up_tokens {
+        var copy_dim3: usize = 0;
+        while copy_dim3 < hidden {
+            up_cat[(copy_token + up_left) * hidden + copy_dim3] = upsampled[copy_token * hidden + copy_dim3];
+            copy_dim3 = copy_dim3 + 1;
+        }
+        copy_token = copy_token + 1;
+    }
+    if !t2w_conv1d_valid_seq(up_work0, up_cat as &const f32, up_tokens + up_left, hidden, hidden, encoder.up_layer_weight.shape[0] as usize, encoder.up_layer_weight, encoder.up_layer_bias) {
+        free(upsampled as &void); free(up_cat as &void); free(up_pos as &void); free(up_work0 as &void); free(up_work1 as &void);
+        free(token_embeddings as &void); free(work0 as &void); free(work1 as &void); free(prelook_cat as &void); free(prelook_conv1 as &void); free(prelook_cat2 as &void); free(pos0 as &void);
+        return false;
+    }
+    t2w_linear_seq(up_work1, up_work0 as &const f32, up_tokens, hidden, hidden, encoder.up_embed0_weight, encoder.up_embed0_bias);
+    t2w_layer_norm_seq_affine(up_work0, up_work1 as &const f32, up_tokens, hidden, encoder.up_embed1_weight, encoder.up_embed1_bias, 0.00001);
+    t2w_scale_inplace(up_work0, up_tokens * hidden, embed_scale);
+    t2w_build_relpos_encoding(up_pos, up_tokens, hidden);
+    layer_index = 0;
+    while layer_index < encoder.up_encoder_count as usize {
+        if !t2w_encoder_layer_forward_seq(up_work0, up_tokens, up_pos as &const f32, up_tokens * 2 - 1, &encoder.up_encoders[layer_index]) {
+            free(upsampled as &void); free(up_cat as &void); free(up_pos as &void); free(up_work0 as &void); free(up_work1 as &void);
+            free(token_embeddings as &void); free(work0 as &void); free(work1 as &void); free(prelook_cat as &void); free(prelook_conv1 as &void); free(prelook_cat2 as &void); free(pos0 as &void);
+            return false;
+        }
+        layer_index = layer_index + 1;
+    }
+    t2w_layer_norm_seq_affine(up_work0, up_work0 as &const f32, up_tokens, hidden, encoder.after_norm_weight, encoder.after_norm_bias, 0.00001);
+    t2w_linear_seq(mu, up_work0 as &const f32, up_tokens, hidden, T2W_FLOW_MEL, extra.encoder_proj_weight, extra.encoder_proj_bias);
+    free(upsampled as &void);
+    free(up_cat as &void);
+    free(up_pos as &void);
+    free(up_work0 as &void);
+    free(up_work1 as &void);
+    free(token_embeddings as &void);
+    free(work0 as &void);
+    free(work1 as &void);
+    free(prelook_cat as &void);
+    free(prelook_conv1 as &void);
+    free(prelook_cat2 as &void);
+    free(pos0 as &void);
+    return true;
+}
+
 fn t2w_build_surrogate_mu(mu: &f32, tokens: &const u32, token_count: usize, extra: &T2WFlowExtraWeights, up_rate: usize) bool {
     const hidden: usize = T2W_FLOW_HIDDEN;
     const emb: &f32 = t2w_alloc_f32(hidden, "flow-emb\0" as &const byte);
@@ -1609,7 +1989,7 @@ fn t2w_append_mel_time_major(dst: &f32, dst_frames: &usize, src: &const f32, src
     dst_frames[0] = dst_frames[0] + src_frames;
 }
 
-fn t2w_run_flow_window(out: &f32, out_frames: &usize, spk_proj: &const f32, tokens: &const u32, token_count: usize, blocks_used: usize, n_timesteps: usize, up_rate: usize, temperature: f32, zero_mu: bool, extra: &T2WFlowExtraWeights, matching: &T2WFlowMatchingWeights) bool {
+fn t2w_run_flow_window(out: &f32, out_frames: &usize, spk_proj: &const f32, tokens: &const u32, token_count: usize, blocks_used: usize, n_timesteps: usize, up_rate: usize, temperature: f32, zero_mu: bool, extra: &T2WFlowExtraWeights, encoder: &T2WEncoderWeights, use_real_encoder_mu: bool, matching: &T2WFlowMatchingWeights) bool {
     const mel_frames: usize = token_count * up_rate;
     out_frames[0] = 0;
     if mel_frames == 0 { return true; }
@@ -1645,7 +2025,13 @@ fn t2w_run_flow_window(out: &f32, out_frames: &usize, spk_proj: &const f32, toke
         zero_i = zero_i + 1;
     }
     if !zero_mu {
-        if !t2w_build_surrogate_mu(mu, tokens, token_count, extra, up_rate) {
+        var mu_ok: bool = false;
+        if use_real_encoder_mu {
+            mu_ok = t2w_build_real_mu(mu, tokens, token_count, extra, encoder, up_rate);
+        } else {
+            mu_ok = t2w_build_surrogate_mu(mu, tokens, token_count, extra, up_rate);
+        }
+        if !mu_ok {
             free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
             return false;
         }
@@ -1706,7 +2092,7 @@ fn t2w_run_flow_window(out: &f32, out_frames: &usize, spk_proj: &const f32, toke
 
 fn t2w_flow_probe_usage() void {
     _ = printf("usage: minicpm-o-uya token2wav-flow-probe <flow_matching.gguf> <flow_extra.gguf> <prompt_cache.gguf> <audio_tokens_chunk.txt>\n");
-    _ = printf("  [--token-limit N] [--block-limit N] [--n-timesteps N] [--zero-mu|--embed-mu] [--session] [--dump-f32 out.uyml]\n");
+    _ = printf("  [--token-limit N] [--block-limit N] [--n-timesteps N] [--zero-mu|--embed-mu|--encoder encoder.gguf] [--session] [--dump-f32 out.uyml]\n");
 }
 
 export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
@@ -1751,6 +2137,12 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
             i = i + 1;
             continue;
         }
+        if strcmp(argv[i] as *const byte, "--encoder\0" as *const byte) == 0 {
+            if i + 1 >= argc { t2w_flow_probe_usage(); return 1; }
+            probe.encoder_path = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
+        }
         if strcmp(argv[i] as *const byte, "--dump-f32\0" as *const byte) == 0 {
             if i + 1 >= argc { t2w_flow_probe_usage(); return 1; }
             probe.dump_path = argv[i + 1] as &const byte;
@@ -1763,22 +2155,33 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
     var prompt_config: T2WPromptCacheConfig = t2w_prompt_cache_config_init();
     if !t2w_load_prompt_cache_metadata(prompt_cache_path, &prompt_config) { return 1; }
     var prompt_table: TensorWeightTable = tensor_table_init();
+    var encoder_table: TensorWeightTable = tensor_table_init();
     var flow_extra_table: TensorWeightTable = tensor_table_init();
     var flow_matching_table: TensorWeightTable = tensor_table_init();
     if !t2w_open_table(prompt_cache_path, &prompt_table) { return 1; }
+    if probe.encoder_path != null {
+        if !t2w_open_table(probe.encoder_path, &encoder_table) {
+            t2w_close_table(&prompt_table);
+            return 1;
+        }
+    }
     if !t2w_open_table(flow_extra_path, &flow_extra_table) {
         t2w_close_table(&prompt_table);
+        t2w_close_table(&encoder_table);
         return 1;
     }
     if !t2w_open_table(flow_matching_path, &flow_matching_table) {
         t2w_close_table(&prompt_table);
+        t2w_close_table(&encoder_table);
         t2w_close_table(&flow_extra_table);
         return 1;
     }
+    var encoder: T2WEncoderWeights = t2w_encoder_weights_init();
     var extra: T2WFlowExtraWeights = t2w_flow_extra_weights_init();
     var matching: T2WFlowMatchingWeights = t2w_flow_matching_weights_init();
-    if !t2w_flow_bind_extra_weights(&flow_extra_table, &extra) || !t2w_flow_bind_matching_weights(&flow_matching_table, &matching) {
+    if (probe.encoder_path != null && !t2w_bind_encoder_weights(&encoder_table, &encoder)) || !t2w_flow_bind_extra_weights(&flow_extra_table, &extra) || !t2w_flow_bind_matching_weights(&flow_matching_table, &matching) {
         t2w_close_table(&prompt_table);
+        t2w_close_table(&encoder_table);
         t2w_close_table(&flow_extra_table);
         t2w_close_table(&flow_matching_table);
         return 1;
@@ -1786,6 +2189,7 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
     const spk_cb: &TensorView = t2w_require(&prompt_table, "prompt_cache.spk_cb\0" as &const byte, "flow probe spk_cb\0" as &const byte);
     if spk_cb == null {
         t2w_close_table(&prompt_table);
+        t2w_close_table(&encoder_table);
         t2w_close_table(&flow_extra_table);
         t2w_close_table(&flow_matching_table);
         return 1;
@@ -1794,6 +2198,7 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
     var token_count: usize = 0;
     if !t2w_parse_tokens_csv(tokens_path, &tokens[0], &token_count) {
         t2w_close_table(&prompt_table);
+        t2w_close_table(&encoder_table);
         t2w_close_table(&flow_extra_table);
         t2w_close_table(&flow_matching_table);
         return 1;
@@ -1801,6 +2206,7 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
     if token_count == 0 {
         _ = printf("error: token2wav flow probe got empty token file %s\n", tokens_path);
         t2w_close_table(&prompt_table);
+        t2w_close_table(&encoder_table);
         t2w_close_table(&flow_extra_table);
         t2w_close_table(&flow_matching_table);
         return 1;
@@ -1821,6 +2227,7 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
         if spk_norm != null { free(spk_norm as &void); }
         if spk_proj != null { free(spk_proj as &void); }
         t2w_close_table(&prompt_table);
+        t2w_close_table(&encoder_table);
         t2w_close_table(&flow_extra_table);
         t2w_close_table(&flow_matching_table);
         return 1;
@@ -1829,11 +2236,13 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
     t2w_linear_vec(spk_proj, spk_norm as &const f32, T2W_FLOW_SPK, T2W_FLOW_MEL, extra.spk_affine_weight, extra.spk_affine_bias);
     var mode: &const byte = "embed-mu\0" as &const byte;
     if probe.zero_mu { mode = "zero-mu\0" as &const byte; }
+    const use_real_encoder_mu: bool = probe.encoder_path != null && !probe.zero_mu;
+    if use_real_encoder_mu { mode = "encoder-mu\0" as &const byte; }
     if probe.session {
         if prompt_config.chunk_total == 0 || prompt_config.chunk_main == 0 || prompt_config.chunk_total < prompt_config.chunk_main {
             _ = printf("error: token2wav flow session invalid window config chunk_total=%u chunk_main=%u\n", prompt_config.chunk_total, prompt_config.chunk_main);
             free(spk_norm as &void); free(spk_proj as &void);
-            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+            t2w_close_table(&prompt_table); t2w_close_table(&encoder_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
             return 1;
         }
         const window_tokens_cap: usize = prompt_config.chunk_total as usize;
@@ -1847,7 +2256,7 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
             if window_out != null { free(window_out as &void); }
             if tail_tokens != null { free(tail_tokens as &void); }
             free(spk_norm as &void); free(spk_proj as &void);
-            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+            t2w_close_table(&prompt_table); t2w_close_table(&encoder_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
             return 1;
         }
         var emitted_frames: usize = 0;
@@ -1855,9 +2264,9 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
         var call_index: u32 = 0;
         while tokens_used - consumed >= window_tokens_cap {
             var full_frames: usize = 0;
-            if !t2w_run_flow_window(window_out, &full_frames, spk_proj as &const f32, &tokens[consumed] as &const u32, window_tokens_cap, blocks_used, n_timesteps, up_rate, temperature, probe.zero_mu, &extra, &matching) {
+            if !t2w_run_flow_window(window_out, &full_frames, spk_proj as &const f32, &tokens[consumed] as &const u32, window_tokens_cap, blocks_used, n_timesteps, up_rate, temperature, probe.zero_mu, &extra, &encoder, use_real_encoder_mu, &matching) {
                 free(stream_out as &void); free(window_out as &void); free(tail_tokens as &void); free(spk_norm as &void); free(spk_proj as &void);
-                t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+                t2w_close_table(&prompt_table); t2w_close_table(&encoder_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
                 return 1;
             }
             var emit_frames: usize = prompt_config.chunk_main as usize * up_rate;
@@ -1880,9 +2289,9 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
                 fill_i = fill_i + 1;
             }
             var tail_frames_full: usize = 0;
-            if !t2w_run_flow_window(window_out, &tail_frames_full, spk_proj as &const f32, tail_tokens as &const u32, window_tokens_cap, blocks_used, n_timesteps, up_rate, temperature, probe.zero_mu, &extra, &matching) {
+            if !t2w_run_flow_window(window_out, &tail_frames_full, spk_proj as &const f32, tail_tokens as &const u32, window_tokens_cap, blocks_used, n_timesteps, up_rate, temperature, probe.zero_mu, &extra, &encoder, use_real_encoder_mu, &matching) {
                 free(stream_out as &void); free(window_out as &void); free(tail_tokens as &void); free(spk_norm as &void); free(spk_proj as &void);
-                t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+                t2w_close_table(&prompt_table); t2w_close_table(&encoder_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
                 return 1;
             }
             var emit_tail_frames: usize = tail_count * up_rate;
@@ -1896,22 +2305,22 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
         if probe.dump_path != null {
             if !t2w_mel_dump_write(probe.dump_path, stream_out, emitted_frames) {
                 free(stream_out as &void); free(window_out as &void); free(tail_tokens as &void); free(spk_norm as &void); free(spk_proj as &void);
-                t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+                t2w_close_table(&prompt_table); t2w_close_table(&encoder_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
                 return 1;
             }
         }
         _ = printf("token2wav flow probe: PASS\n");
         free(stream_out as &void); free(window_out as &void); free(tail_tokens as &void); free(spk_norm as &void); free(spk_proj as &void);
-        t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+        t2w_close_table(&prompt_table); t2w_close_table(&encoder_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
         return 0;
     }
     const mel_frames: usize = tokens_used * up_rate;
     const single_out: &f32 = t2w_alloc_f32(mel_frames * T2W_FLOW_MEL, "flow-single-out\0" as &const byte);
     var single_frames: usize = 0;
-    if single_out == null || !t2w_run_flow_window(single_out, &single_frames, spk_proj as &const f32, &tokens[0] as &const u32, tokens_used, blocks_used, n_timesteps, up_rate, temperature, probe.zero_mu, &extra, &matching) {
+    if single_out == null || !t2w_run_flow_window(single_out, &single_frames, spk_proj as &const f32, &tokens[0] as &const u32, tokens_used, blocks_used, n_timesteps, up_rate, temperature, probe.zero_mu, &extra, &encoder, use_real_encoder_mu, &matching) {
         if single_out != null { free(single_out as &void); }
         free(spk_norm as &void); free(spk_proj as &void);
-        t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+        t2w_close_table(&prompt_table); t2w_close_table(&encoder_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
         return 1;
     }
     var out1: f32 = 0.0;
@@ -1925,7 +2334,7 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
         if !t2w_mel_dump_write(probe.dump_path, single_out, single_frames) {
             free(single_out as &void);
             free(spk_norm as &void); free(spk_proj as &void);
-            t2w_close_table(&prompt_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
+            t2w_close_table(&prompt_table); t2w_close_table(&encoder_table); t2w_close_table(&flow_extra_table); t2w_close_table(&flow_matching_table);
             return 1;
         }
     }
@@ -1934,6 +2343,7 @@ export fn token2wav_flow_probe_cli(argc: i32, argv: & &byte) i32 {
     free(spk_norm as &void);
     free(spk_proj as &void);
     t2w_close_table(&prompt_table);
+    t2w_close_table(&encoder_table);
     t2w_close_table(&flow_extra_table);
     t2w_close_table(&flow_matching_table);
     return 0;
@@ -2039,7 +2449,7 @@ fn t2w_silu_inplace(values: &f32, count: usize) void {
     }
 }
 
-fn t2w_flow_run_window(prompt_config: &T2WPromptCacheConfig, extra: &T2WFlowExtraWeights, matching: &T2WFlowMatchingWeights, spk_proj: &const f32, tokens: &const u32, token_count: usize, out_mel: &f32) bool {
+fn t2w_flow_run_window(prompt_config: &T2WPromptCacheConfig, extra: &T2WFlowExtraWeights, encoder: &T2WEncoderWeights, use_real_encoder_mu: bool, matching: &T2WFlowMatchingWeights, spk_proj: &const f32, tokens: &const u32, token_count: usize, out_mel: &f32) bool {
     var up_rate: usize = 2;
     if prompt_config.up_rate != 0 { up_rate = prompt_config.up_rate as usize; }
     const mel_frames: usize = token_count * up_rate;
@@ -2077,7 +2487,13 @@ fn t2w_flow_run_window(prompt_config: &T2WPromptCacheConfig, extra: &T2WFlowExtr
         cond[zero_i] = 0.0;
         zero_i = zero_i + 1;
     }
-    if !t2w_build_surrogate_mu(mu, tokens, token_count, extra, up_rate) {
+    var mu_ok2: bool = false;
+    if use_real_encoder_mu {
+        mu_ok2 = t2w_build_real_mu(mu, tokens, token_count, extra, encoder, up_rate);
+    } else {
+        mu_ok2 = t2w_build_surrogate_mu(mu, tokens, token_count, extra, up_rate);
+    }
+    if !mu_ok2 {
         free(mu as &void); free(cond as &void); free(x_noise as &void); free(x_cur as &void); free(x_cat as &void); free(hidden as &void); free(t_freq as &void); free(t_embed1 as &void); free(t_embed2 as &void); free(mel_out as &void); free(t_span as &void);
         return false;
     }
@@ -2150,12 +2566,12 @@ fn t2w_flow_run_window(prompt_config: &T2WPromptCacheConfig, extra: &T2WFlowExtr
     return true;
 }
 
-fn t2w_render_chunk_mel(prompt_config: &T2WPromptCacheConfig, extra: &T2WFlowExtraWeights, matching: &T2WFlowMatchingWeights, spk_proj: &const f32, tokens: &const u32, token_count: usize, out_mel: &f32, out_window_count: &u32) bool {
+fn t2w_render_chunk_mel(prompt_config: &T2WPromptCacheConfig, extra: &T2WFlowExtraWeights, encoder: &T2WEncoderWeights, use_real_encoder_mu: bool, matching: &T2WFlowMatchingWeights, spk_proj: &const f32, tokens: &const u32, token_count: usize, out_mel: &f32, out_window_count: &u32) bool {
     out_window_count[0] = 0;
     var up_rate: usize = 2;
     if prompt_config.up_rate != 0 { up_rate = prompt_config.up_rate as usize; }
     if prompt_config.chunk_total == 0 || prompt_config.chunk_main == 0 || prompt_config.chunk_total < prompt_config.chunk_main {
-        if !t2w_flow_run_window(prompt_config, extra, matching, spk_proj, tokens, token_count, out_mel) { return false; }
+        if !t2w_flow_run_window(prompt_config, extra, encoder, use_real_encoder_mu, matching, spk_proj, tokens, token_count, out_mel) { return false; }
         out_window_count[0] = 1;
         return true;
     }
@@ -2168,7 +2584,7 @@ fn t2w_render_chunk_mel(prompt_config: &T2WPromptCacheConfig, extra: &T2WFlowExt
         const keep_frames: usize = keep_tokens * up_rate;
         const window_mel: &f32 = t2w_alloc_f32(window_frames * T2W_FLOW_MEL, "reference-window-mel\0" as &const byte);
         if window_mel == null { return false; }
-        if !t2w_flow_run_window(prompt_config, extra, matching, spk_proj, &tokens[consumed] as &const u32, full_window_tokens, window_mel) {
+        if !t2w_flow_run_window(prompt_config, extra, encoder, use_real_encoder_mu, matching, spk_proj, &tokens[consumed] as &const u32, full_window_tokens, window_mel) {
             free(window_mel as &void);
             return false;
         }
@@ -2187,7 +2603,7 @@ fn t2w_render_chunk_mel(prompt_config: &T2WPromptCacheConfig, extra: &T2WFlowExt
         const tail_frames: usize = tail_tokens * up_rate;
         const tail_mel: &f32 = t2w_alloc_f32(tail_frames * T2W_FLOW_MEL, "reference-tail-mel\0" as &const byte);
         if tail_mel == null { return false; }
-        if !t2w_flow_run_window(prompt_config, extra, matching, spk_proj, &tokens[consumed] as &const u32, tail_tokens, tail_mel) {
+        if !t2w_flow_run_window(prompt_config, extra, encoder, use_real_encoder_mu, matching, spk_proj, &tokens[consumed] as &const u32, tail_tokens, tail_mel) {
             free(tail_mel as &void);
             return false;
         }
@@ -2300,6 +2716,7 @@ export fn token2wav_reference_run_dir_prefixed(token2wav_dir: &const byte, artif
 export fn token2wav_reference_session_close(session: &Token2WavReferenceSession) void {
     if session.spk_proj != null { free(session.spk_proj as &void); }
     t2w_close_table(&session.prompt_table);
+    t2w_close_table(&session.encoder_table);
     t2w_close_table(&session.flow_extra_table);
     t2w_close_table(&session.flow_matching_table);
     t2w_close_table(&session.hifigan_table);
@@ -2309,10 +2726,12 @@ export fn token2wav_reference_session_close(session: &Token2WavReferenceSession)
 export fn token2wav_reference_session_open(token2wav_dir: &const byte, session: &Token2WavReferenceSession) bool {
     session[0] = token2wav_reference_session_init();
     var prompt_cache_path: [byte: 512] = [];
+    var encoder_path: [byte: 512] = [];
     var flow_extra_path: [byte: 512] = [];
     var flow_matching_path: [byte: 512] = [];
     var hifigan_path: [byte: 512] = [];
     if !t2w_join_path(&prompt_cache_path[0], @len(prompt_cache_path), token2wav_dir, "prompt_cache.gguf\0" as &const byte) ||
+       !t2w_join_path(&encoder_path[0], @len(encoder_path), token2wav_dir, "encoder.gguf\0" as &const byte) ||
        !t2w_join_path(&flow_extra_path[0], @len(flow_extra_path), token2wav_dir, "flow_extra.gguf\0" as &const byte) ||
        !t2w_join_path(&flow_matching_path[0], @len(flow_matching_path), token2wav_dir, "flow_matching.gguf\0" as &const byte) ||
        !t2w_join_path(&hifigan_path[0], @len(hifigan_path), token2wav_dir, "hifigan2.gguf\0" as &const byte) {
@@ -2322,13 +2741,15 @@ export fn token2wav_reference_session_open(token2wav_dir: &const byte, session: 
     if session.prompt_config.up_rate != 0 { session.up_rate = session.prompt_config.up_rate; }
     else { session.up_rate = 2; }
     if !t2w_open_table(&prompt_cache_path[0] as &const byte, &session.prompt_table) ||
+       !t2w_open_table(&encoder_path[0] as &const byte, &session.encoder_table) ||
        !t2w_open_table(&flow_extra_path[0] as &const byte, &session.flow_extra_table) ||
        !t2w_open_table(&flow_matching_path[0] as &const byte, &session.flow_matching_table) ||
        !t2w_open_table(&hifigan_path[0] as &const byte, &session.hifigan_table) {
         token2wav_reference_session_close(session);
         return false;
     }
-    if !t2w_flow_bind_extra_weights(&session.flow_extra_table, &session.extra) ||
+    if !t2w_bind_encoder_weights(&session.encoder_table, &session.encoder) ||
+       !t2w_flow_bind_extra_weights(&session.flow_extra_table, &session.extra) ||
        !t2w_flow_bind_matching_weights(&session.flow_matching_table, &session.matching) ||
        !t2w_bind_hifigan_lite_weights(&session.hifigan_table, &session.hifigan) {
         token2wav_reference_session_close(session);
@@ -2349,6 +2770,7 @@ export fn token2wav_reference_session_open(token2wav_dir: &const byte, session: 
     t2w_l2_normalize(spk_norm, spk_cb.data as &const f32, T2W_FLOW_SPK, 0.000000000001 as f32);
     t2w_linear_vec(session.spk_proj, spk_norm as &const f32, T2W_FLOW_SPK, T2W_FLOW_MEL, session.extra.spk_affine_weight, session.extra.spk_affine_bias);
     free(spk_norm as &void);
+    session.use_real_encoder_mu = true;
     return true;
 }
 
@@ -2413,7 +2835,7 @@ export fn token2wav_reference_session_run_dir_prefixed(session: &Token2WavRefere
         }
         var chunk_windows: u32 = 0;
         const chunk_start_us: u64 = t2w_clock_us();
-        if !t2w_render_chunk_mel(&session.prompt_config, &session.extra, &session.matching, session.spk_proj as &const f32, &tokens[0] as &const u32, token_count2, mel_values, &chunk_windows) {
+        if !t2w_render_chunk_mel(&session.prompt_config, &session.extra, &session.encoder, session.use_real_encoder_mu, &session.matching, session.spk_proj as &const f32, &tokens[0] as &const u32, token_count2, mel_values, &chunk_windows) {
             free(mel_values as &void);
             token2wav_reference_run_free(run);
             return false;

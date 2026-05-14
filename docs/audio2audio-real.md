@@ -132,6 +132,8 @@ The full `audio2audio-real --out ... --test-prefix` multi-turn path now reuses s
 
 A manual audio preprocessing probe is available as `build/minicpm-o-uya audio-real-preprocess-probe <audio.wav|audio.uyap.pcm>`, and a numeric mel probe is available as `MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-mel-probe`. It validates 16 kHz mono PCM16/F32 WAV or UYAP input and prints the llama.cpp-omni MiniCPM-o preprocessing plan: `frame_size=400`, `filter_bins=201`, `hop_length=160`, `mel_bins=80`, 100ms sample alignment, 200-sample center padding on each side, conv2 downsampling, and pool(5,5) `encoder_positions`. The `audio2audio-real --audit-only` input path now prints this plan for both ref and user audio. The numeric mel probe runs periodic Hann, DFT/STFT power, the GGUF `filters` mel filterbank, and llama.cpp-omni style log10 clamp/normalization, then prints frames/elements/checksum/sample values.
 
+`audio-real-mel-probe` now also accepts `--stream-chunk-samples N`, which replays the same padded waveform through a chunked overlap/cache path before applying the same final clamp/normalization. `make audio-real-stream-align` compares one-shot and streamed dumps directly; on the local `outputs/complex_case2/complex2_0001.wav` baseline, the streamed path matches one-shot exactly with `L1=0`, `mean_abs=0`, and `max_abs=0` at `chunk_samples=1600`.
+
 A correctness-first encoder forward probe is now available as `MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-encode-probe`. It runs the official `encoder.conv1/2`, 24-layer transformer, `encoder.ln_post`, `audio_projector.linear1/2`, and final pool(5,5), then prints `mel_frames`, `conv_tokens`, `pooled_tokens`, `n_pos`, `n_embd`, embedding checksum, and encode wall time. The real loader no longer keeps the previous `480000 samples` hard cap, so the probe can be used on longer real clips as long as the current reference implementation still fits memory and the encoder context. On the local 1-second sample `/tmp/minicpm-o-uya-real-probe.wav`, the current reference implementation reports `n_pos=10`, `n_embd=4096`, checksum `0xb95329ca`, and `encode_ms≈96870.831`, so this path is still intended for correctness/alignment work rather than speed.
 
 `audio-real-mel-probe` also accepts `--dump-f32 out.uyml`, which writes a compact binary dump for full-array comparison:
@@ -331,7 +333,7 @@ Current bind coverage:
 - `hifigan2.gguf`: `conv_pre.*`, `conv_post.*`, `ups.*`, `source_downs.*`, `m_source.*`, `f0_predictor.*`
 - `prompt_cache.gguf`: all 5 official cache tensors
 
-This is no longer only bind-side inventory. The real `audio2audio-real --out ...` path already uses these official token2wav / HiFiGAN tensors to emit playable 24 kHz mono WAV output, and `token2wav-flow-probe` separately runs a lightweight reference `flow_matching` forward on official `flow_matching.gguf` and `flow_extra.gguf`, using prompt-cache `spk_cb`, cosine timestep schedule, and a truncated token window. The current probe still uses surrogate `mu` (`embed-mu` or `zero-mu`) instead of the real `encoder.gguf` conformer output.
+This is no longer only bind-side inventory. The real `audio2audio-real --out ...` path already uses these official token2wav / HiFiGAN tensors to emit playable 24 kHz mono WAV output, and `token2wav-flow-probe` separately runs a correctness-first `flow_matching` forward on official `flow_matching.gguf` and `flow_extra.gguf`, using prompt-cache `spk_cb`, cosine timestep schedule, and either surrogate `mu` (`embed-mu` / `zero-mu`) or the real `encoder.gguf` conformer/upsample forward via `--encoder`.
 
 Uya now also has two prompt-cache-side probes that prepare the next forward step:
 
@@ -349,6 +351,14 @@ build/minicpm-o-uya token2wav-flow-probe \
   models/MiniCPM-o-4_5-gguf/token2wav-gguf/prompt_cache.gguf \
   llama.cpp-omni/tools/omni/output/round_000/tts_wav/audio_tokens_chunk_0.txt \
   --token-limit 2 --block-limit 2 --n-timesteps 3 --embed-mu
+
+build/minicpm-o-uya token2wav-flow-probe \
+  models/MiniCPM-o-4_5-gguf/token2wav-gguf/flow_matching.gguf \
+  models/MiniCPM-o-4_5-gguf/token2wav-gguf/flow_extra.gguf \
+  models/MiniCPM-o-4_5-gguf/token2wav-gguf/prompt_cache.gguf \
+  llama.cpp-omni/tools/omni/output/round_000/tts_wav/audio_tokens_chunk_0.txt \
+  --encoder models/MiniCPM-o-4_5-gguf/token2wav-gguf/encoder.gguf \
+  --token-limit 2 --block-limit 2 --n-timesteps 3
 ```
 
 Current `prompt_cache` probe reports:
@@ -373,7 +383,7 @@ Current `flow` probe reports:
 - truncated token/window size used for the probe
 - truncated block count used for the probe
 - prompt-cache-derived `temperature_bits`, `up_rate`, and `pre_lookahead`
-- checksums for projected speaker vector, surrogate `mu`, initial noise, and final output
+- checksums for projected speaker vector, chosen `mu` path (`embed-mu`, `zero-mu`, or `encoder-mu`), initial noise, and final output
 - `t_span[0]` and `t_span[last]` for the cosine schedule
 
 ## Current Uya Status
@@ -391,14 +401,14 @@ build/minicpm-o-uya audio2audio-real --text-only \
   --dump-embeddings --dump-hidden --max-new-tokens 64
 ```
 
-This path already follows the non-duplex `llama.cpp-omni` prompt order: system prompt prefix + reference audio embedding, then the user turn with `<|audio_start|>`/`<|audio_end|>`, then a plain assistant text prompt. In full mode it now also writes wave artifacts and timing metrics including `token2wav_ms`, `first_audio_ms`, `peak_rss_kb`, `answer_duration_ms`, and `rtf`. The current reference `tts2wav` backend is intentionally honest about its remaining gaps: it still uses surrogate `mu` instead of `encoder.gguf -> mu`, and its waveform stage is a simplified CPU reference path rather than a numerically matched full HiFiGAN2 source/resblock forward.
+This path already follows the non-duplex `llama.cpp-omni` prompt order: system prompt prefix + reference audio embedding, then the user turn with `<|audio_start|>`/`<|audio_end|>`, then a plain assistant text prompt. In full mode it now also writes wave artifacts and timing metrics including `token2wav_ms`, `first_audio_ms`, `peak_rss_kb`, `answer_duration_ms`, and `rtf`. The current reference `tts2wav` backend now uses the official `encoder.gguf -> mu` path as part of token2wav, while still being honest about the remaining waveform-side gaps: its HiFiGAN2 stage is a simplified CPU reference path rather than a numerically matched full source-resblock implementation.
 
 - Audio encoder: bind complete, and `audio-real-encode-probe` now runs correctness-first `conv + transformer + projector + pool` forward for short real clips; it is still too slow for practical long-turn inference, but multi-turn `audio2audio-real` no longer reloads the encoder GGUF or recomputes the reference embedding per turn.
 - Real answer path: `audio2audio-real --text-only/--no-tts` runs ref-audio system prompt + user-audio turn + Qwen3 text decode; full `audio2audio-real --out ...` additionally emits answer WAV, turn WAV, per-chunk WAV, token dumps, and timing logs. The llama.cpp-omni `--test-prefix PREFIX --count N` protocol now works in audit, text-only, and full WAV modes.
 - TTS model: bind complete for `emb_code.*`, `emb_text.*`, decoder `blk.*`, `projector_semantic.*`, `projector_spk.*`, and `head_code.*`; `tts-condition-probe` aligns `emb_text + projector_semantic + normalize + merge` against `llama.cpp-omni`, and `tts-simplex-probe` / `audio2audio-real` now run real decode/cache forward with chunked hidden-state consumption.
 - Projector: `linear1.*`, `linear2.*`
 - Token2wav encoder: bind-only complete for `after_norm.*`, `embed.*`, `encoders.*`, `pre_lookahead_layer.*`, `up_embed.*`, `up_encoders.*`, and `up_layer.*`
-- Flow matching: bind complete for `estimator.in_proj.*`, `estimator.t_embedder.*`, `estimator.blocks.*`, and `estimator.final_layer.*`; `token2wav-flow-probe` now runs reference `speaker affine + timestep embed + DiT/CFM` math on official weights, but still with surrogate `mu`
+- Flow matching: bind complete for `estimator.in_proj.*`, `estimator.t_embedder.*`, `estimator.blocks.*`, and `estimator.final_layer.*`; `token2wav-flow-probe` now runs reference `speaker affine + timestep embed + DiT/CFM` math on official weights with either surrogate `mu` or real `encoder.gguf -> mu`
 - Flow extra: bind-only complete for `input_embedding.*`, `encoder_proj.*`, and `spk_embed_affine_layer.*`
 - HiFiGAN2: bind complete for `conv_pre.*`, `conv_post.*`, `ups.*`, `source_downs.*`, `m_source.*`, and `f0_predictor.*`; the current CPU reference backend emits playable 24 kHz mono PCM and now keeps those tables resident across multi-turn sessions, but it does not yet claim exact source-resblock parity with `llama.cpp-omni`
 - Prompt cache: bind-only complete for all 5 official `prompt_cache.*` tensors
@@ -422,6 +432,17 @@ make audio2audio-real-report
 ```
 
 `make audio2audio-real-report` wraps `tests/audio2audio_real_manifest.py` and converts the generated `timing.log` files plus related artifacts into one JSON report for later CPU-only baseline comparison.
+
+`make audio2audio-case-matrix` now generates a reusable local JSON inventory plus derived WAV inputs for:
+
+- short audio
+- long audio
+- silence
+- English
+- Chinese-English mixed speech
+- complex multi-requirement regression audio
+
+`make audio2audio-real-baseline-compare` compares one generated Uya report JSON against a named entry in the local `outputs/baselines/audio2audio_baselines.json` manifest.
 
 ## Acceptance
 

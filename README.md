@@ -12,7 +12,8 @@ Phase 21 work is in progress and the implementation is current through the lates
 - Tiny Qwen3-like text binding, text generation, sampler controls, text `chat`, blocking `omni-chat`, `stream-chat` prototype, and `bench` smoke are implemented.
 - Vision/audio/speech/omni paths are deterministic smoke/reference paths over tiny fixtures, raw inputs, and manifests.
 - Real MiniCPM-o 4.5 audio preprocessing, audio encoder probe, TTS conditioning merge probe, and TTS audio-token generation are wired against the local split-GGUF path.
-- `audio2audio-real` can now produce `answer.txt`, LLM token/hidden dumps, `audio_tokens_chunk_*.txt/bin`, and `timing.log` for the real path; final token2wav/HiFiGAN WAV synthesis is still an explicit gap.
+- `audio2audio-real` now produces `answer.txt`, LLM token/hidden dumps, `audio_tokens_chunk_*.txt/bin`, `answer_chunk_*.wav`, `answer.wav`, `turn.wav`, and `timing.log` on the real path.
+- `token2wav-flow-probe --encoder <encoder.gguf>` and the real `audio2audio-real` / reference token2wav session now use the official `encoder.gguf` conformer/upsample forward to build `mu`, not only the earlier surrogate `embed-mu` path.
 - Full production MiniCPM-o omni inference is **not** claimed; unsupported model layouts, media codecs, and remaining modality gaps should fail with diagnostics.
 
 ## Quick Start
@@ -52,7 +53,7 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `audio-preprocess-smoke <audio.pcm>` | PCM to tiny log-mel preprocessing smoke | `UYAP` PCM fixture input |
 | `audio-input-probe <audio.wav\|audio.uyap.pcm>` | Real audio input validation | 16 kHz mono WAV/UYAP protocol gate |
 | `audio-real-preprocess-probe <audio.wav\|audio.uyap.pcm>` | Real MiniCPM-o preprocessing plan | 100 ms align, center pad, conv/pool token planning |
-| `audio-real-mel-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real numeric mel probe | Supports `--dump-f32 out.uyml` for full-array alignment |
+| `audio-real-mel-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real numeric mel probe | Supports `--stream-chunk-samples N` and `--dump-f32 out.uyml` for one-shot vs streamed alignment |
 | `audio-real-encode-probe <audio.gguf> <audio.wav\|audio.uyap.pcm>` | Real audio encoder forward probe | Correctness-first `conv + transformer + projector + pool` path |
 | `audio2audio-real --text-only --llm <llm.gguf> --audio <audio.gguf> --ref-audio ref.wav --user-audio user.wav` | Real ref-audio + user-audio to text answer | Uses official non-duplex prompt order; prints embedding/timing diagnostics |
 | `audio2audio-real --text-only --llm <llm.gguf> --audio <audio.gguf> --test-prefix prefix --count N` | Real ref-audio + multi-chunk user audio to text answer | Treats `prefix_0000.wav` as ref and `prefix_0001..` as one simplex user query |
@@ -60,10 +61,14 @@ build/minicpm-o-uya bench tests/fixtures/tiny.gguf tests/fixtures/tiny_omni.json
 | `token2wav-bind <token2wav-gguf-dir>` | Real token2wav/HiFiGAN bind-only validation | Validates official `encoder`/`flow_*`/`hifigan2`/`prompt_cache` layouts |
 | `token2wav-prompt-cache-probe <prompt_cache.gguf>` | Real prompt-cache probe | Reads prompt-cache metadata, tensor sizes, and cache checksums |
 | `token2wav-window-probe <prompt_cache.gguf> <audio_tokens_chunk.txt>` | Real token window planner | Prints `28/25` sliding-window calls for token2wav streaming |
-| `token2wav-flow-probe <flow_matching.gguf> <flow_extra.gguf> <prompt_cache.gguf> <audio_tokens_chunk.txt>` | Real flow-matching math probe | Runs reference `speaker affine + surrogate mu + timestep embed + DiT/CFM`; `--session` replays the full `28/25` sliding-window schedule and `--dump-f32` writes mel output |
+| `token2wav-flow-probe <flow_matching.gguf> <flow_extra.gguf> <prompt_cache.gguf> <audio_tokens_chunk.txt>` | Real flow-matching math probe | Runs reference `speaker affine + encoder-mu/embed-mu + timestep embed + DiT/CFM`; `--session` replays the full `28/25` sliding-window schedule and `--dump-f32` writes mel output |
 | `tts-condition-probe <tts.gguf> <projector.gguf> <llm_token_ids.txt> <llm_hidden_states.bin>` | Real TTS conditioning merge probe | `emb_text + projector_semantic + L2 normalize + merge`; optional merged/condition dump |
 | `tts-simplex-probe <tts.gguf> <projector.gguf> <llm_debug_dir>` | Real TTS decoder/audio-token probe | Official TTS decoder KV cache + assistant prompt prefill + chunked audio token dump |
 | `make tts-token-align` | Real TTS token compare helper | Runs simplex probe and reports per-chunk count/prefix/exact match vs `audio_tokens_chunk_*.txt` |
+| `make token2wav-real-mu-align` | Real token2wav mu compare helper | Compares surrogate `embed-mu` vs official `encoder-mu` flow-probe output |
+| `make audio-real-stream-align` | Real mel streaming compare helper | Confirms streamed chunk mel matches one-shot mel exactly on the same audio |
+| `make audio2audio-case-matrix` | Local real-case inventory helper | Generates reusable short/long/silence/English/mixed/complex WAV inputs and a JSON manifest |
+| `make audio2audio-real-baseline-compare` | Local baseline compare helper | Compares one Uya report JSON against a local `llama.cpp-omni` baseline manifest entry |
 | `audio2audio-smoke <model.gguf> [--audio-model audio.gguf] [--speech-model speech.gguf] [--vocoder-model vocoder.gguf] <audio.pcm\|audio.raw> [out.wav]` | Audio input to WAV smoke | PCM/mel -> audio encoder -> speech/vocoder WAV; optional split GGUF tables |
 | `speech-smoke <model.gguf> <prompt> [out.wav]` | Speech/vocoder smoke | Deterministic tiny WAV output only |
 | `omni-smoke <model.gguf> <manifest.json>` | Compile mixed text/image/audio/speech manifest | Fixed test JSON schema |
@@ -78,7 +83,7 @@ Sampler arguments accepted by `generate` are validated by the tiny sampler path;
 
 For official split MiniCPM-o 4.5 bundles, `token2wav-bind <dir>` now validates the five `token2wav-gguf` files as a real bind-only step, not just an audit inventory.
 
-`token2wav-flow-probe` is the next incremental step after bind/prompt-cache/window validation: it already runs real `flow_matching` math on official weights, but today it still uses a lightweight surrogate `mu` path (`embed-mu` or `zero-mu`) instead of the full `encoder.gguf` conformer forward.
+`token2wav-flow-probe` is now the quickest way to compare token2wav `mu` modes on official weights: `--embed-mu` keeps the earlier lightweight surrogate path, `--zero-mu` is a control path, and `--encoder <encoder.gguf>` runs the official conformer/upsample encoder forward before `encoder_proj`.
 
 `audio2audio-real` now bridges the real audio encoder, real Qwen3 answer generation, the real TTS decoder/audio-token path, and the CPU reference token2wav/HiFiGAN path in one command.
 
@@ -159,6 +164,7 @@ build/minicpm-o-uya vision-smoke "$MINICPM_O_GGUF" "$MINICPM_O_IMAGE_RAW"
 build/minicpm-o-uya audio-smoke "$MINICPM_O_GGUF" "$MINICPM_O_AUDIO_RAW"
 build/minicpm-o-uya audio-real-preprocess-probe /path/to/user.wav
 build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
+build/minicpm-o-uya audio-real-mel-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav --stream-chunk-samples 1600 --dump-f32 /tmp/audio_real_stream.uyml
 build/minicpm-o-uya audio-real-encode-probe "$MINICPM_O_AUDIO_GGUF" /path/to/user.wav
 build/minicpm-o-uya audio2audio-real --text-only --llm "$MINICPM_O_TEXT_GGUF" --audio "$MINICPM_O_AUDIO_GGUF" --test-prefix /path/to/case_prefix --count 4
 build/minicpm-o-uya tts-condition-probe /path/to/MiniCPM-o-4_5-tts-F16.gguf /path/to/MiniCPM-o-4_5-projector-F16.gguf /path/to/llm_token_ids.txt /path/to/llm_hidden_states.bin --dump-merged /tmp/minicpm-o-uya-merged.bin
@@ -169,9 +175,13 @@ build/minicpm-o-uya token2wav-bind /path/to/token2wav-gguf
 build/minicpm-o-uya token2wav-prompt-cache-probe /path/to/token2wav-gguf/prompt_cache.gguf
 build/minicpm-o-uya token2wav-window-probe /path/to/token2wav-gguf/prompt_cache.gguf /path/to/audio_tokens_chunk_0.txt
 build/minicpm-o-uya token2wav-flow-probe /path/to/token2wav-gguf/flow_matching.gguf /path/to/token2wav-gguf/flow_extra.gguf /path/to/token2wav-gguf/prompt_cache.gguf /path/to/audio_tokens_chunk_0.txt --token-limit 2 --block-limit 2 --n-timesteps 3 --embed-mu
+build/minicpm-o-uya token2wav-flow-probe /path/to/token2wav-gguf/flow_matching.gguf /path/to/token2wav-gguf/flow_extra.gguf /path/to/token2wav-gguf/prompt_cache.gguf /path/to/audio_tokens_chunk_0.txt --encoder /path/to/token2wav-gguf/encoder.gguf --token-limit 2 --block-limit 2 --n-timesteps 3
 build/minicpm-o-uya token2wav-flow-probe /path/to/token2wav-gguf/flow_matching.gguf /path/to/token2wav-gguf/flow_extra.gguf /path/to/token2wav-gguf/prompt_cache.gguf /path/to/audio_tokens_chunk_0.txt --session --embed-mu
-build/minicpm-o-uya token2wav-flow-probe /path/to/token2wav-gguf/flow_matching.gguf /path/to/token2wav-gguf/flow_extra.gguf /path/to/token2wav-gguf/prompt_cache.gguf /path/to/audio_tokens_chunk_0.txt --session --embed-mu --dump-f32 /tmp/token2wav_flow_session.uyml
+build/minicpm-o-uya token2wav-flow-probe /path/to/token2wav-gguf/flow_matching.gguf /path/to/token2wav-gguf/flow_extra.gguf /path/to/token2wav-gguf/prompt_cache.gguf /path/to/audio_tokens_chunk_0.txt --session --encoder /path/to/token2wav-gguf/encoder.gguf --dump-f32 /tmp/token2wav_flow_session.uyml
 MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_TTS_LLM_DEBUG_DIR=/path/to/llm_debug MINICPM_O_TTS_COMPARE_DIR=/path/to/tts_wav make tts-token-align
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_AUDIO_TOKENS_TXT=/path/to/audio_tokens_chunk_0.txt make token2wav-real-mu-align
+MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav make audio-real-stream-align
+make audio2audio-case-matrix
 build/minicpm-o-uya audio2audio-smoke "$MINICPM_O_TEXT_GGUF" --audio-model "$MINICPM_O_AUDIO_GGUF" --speech-model "$MINICPM_O_SPEECH_GGUF" --vocoder-model "$MINICPM_O_VOCODER_GGUF" "$MINICPM_O_AUDIO_RAW" /tmp/minicpm-o-uya-audio2audio.wav
 build/minicpm-o-uya omni-smoke "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"
 build/minicpm-o-uya bench "$MINICPM_O_GGUF" "$MINICPM_O_MANIFEST"

@@ -58,7 +58,7 @@ fn print_help() void {
     _ = printf("  minicpm-o-uya audio-preprocess-smoke <audio.pcm>\n");
     _ = printf("  minicpm-o-uya audio-input-probe <audio.wav|audio.uyap.pcm>\n");
     _ = printf("  minicpm-o-uya audio-real-preprocess-probe <audio.wav|audio.uyap.pcm>\n");
-    _ = printf("  minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--dump-f32 out.uyml]\n");
+    _ = printf("  minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--stream-chunk-samples N] [--dump-f32 out.uyml]\n");
     _ = printf("  minicpm-o-uya audio-real-encode-probe <audio.gguf> <audio.wav|audio.uyap.pcm>\n");
     _ = printf("  minicpm-o-uya audio2audio-smoke <model.gguf> [--audio-model audio.gguf] [--speech-model speech.gguf] [--vocoder-model vocoder.gguf] <audio.pcm|audio.raw> [out.wav]\n");
     _ = printf("  minicpm-o-uya audio2audio-real [--audit-only] [--text-only|--no-tts] [--dump-hidden] [--dump-embeddings] [--max-new-tokens N] [--threads N] [--seed N] [--verbose]\n");

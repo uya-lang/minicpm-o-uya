@@ -55,7 +55,7 @@ Generated files:
 - `text-real-align` is manual and compares an external official text GGUF against llama.cpp `llama-completion`; it is not part of default CI.
 - `vision-fixture` for raw image tensor smoke, RGB preprocessing, image/video manifest handling, tile counts, and checksum stability.
 - `audio-real-preprocess-probe` is manual and checks real WAV/UYAP input shape, 100ms alignment, center padding, and encoder-position planning.
-- `audio-real-mel-probe` is manual and computes numeric MiniCPM-o mel features from a real audio GGUF plus WAV/UYAP input; it also supports `--dump-f32 out.uyml` for full-array comparison and is not part of default CI because it needs the external official bundle.
+- `audio-real-mel-probe` is manual and computes numeric MiniCPM-o mel features from a real audio GGUF plus WAV/UYAP input; it also supports `--stream-chunk-samples N` and `--dump-f32 out.uyml` for one-shot vs streamed full-array comparison and is not part of default CI because it needs the external official bundle.
 - `audio-real-encode-probe` is manual and runs the official audio encoder `conv + transformer + projector + pool` path for a real audio GGUF plus WAV/UYAP input. It is correctness-first and currently much slower than llama.cpp-omni.
 - `audio-real-mel-align` is manual and compares a Uya `--dump-f32` mel dump against a `llama.cpp-omni` `log_mel_spectrogram.json` dump from the same audio input. The current default acceptance bound is `max_abs <= 2e-3` and `mean_abs <= 2e-5`.
 - `tts-condition-probe` is manual and runs the real `emb_text + projector_semantic + L2 normalize + merge` path from `llama.cpp-omni` `llm_debug/chunk_*` token-id and hidden-state dumps. `tts-merge-align` compares the resulting Uya `merged` dump against `llama.cpp-omni` `merged_embeddings.bin` with default bounds `max_abs <= 1e-5` and `mean_abs <= 1e-6`.
@@ -63,10 +63,12 @@ Generated files:
 - `tts-token-align` is manual and wraps the simplex probe with per-chunk `count`, `prefix_match`, and `exact` summaries against a reference `tts_wav` directory. It supports non-strict exploratory comparison and strict exact mode for future seeded baselines.
 - `token2wav-prompt-cache-probe` is manual and validates prompt-cache metadata plus cache tensor checksums from the official `prompt_cache.gguf`.
 - `token2wav-window-probe` is manual and prints the `chunk_total=28`, `chunk_main=25`, `pre_lookahead=3` feed schedule for a real `audio_tokens_chunk.txt`.
-- `token2wav-flow-probe` is manual and runs a lightweight reference `flow_matching` forward on official `flow_matching.gguf` and `flow_extra.gguf`, using prompt-cache speaker embedding plus a truncated token window. It is intentionally a probe, not yet the full conformer-token2mel path.
+- `token2wav-flow-probe` is manual and runs a correctness-first reference `flow_matching` forward on official `flow_matching.gguf` and `flow_extra.gguf`, using prompt-cache speaker embedding plus a truncated token window. `--encoder <encoder.gguf>` switches the probe from surrogate `embed-mu` to the real conformer/upsample `encoder.gguf -> mu` path.
 - `audio2audio-real-prefix-audit` and `audio2audio-real-prefix-wav` are manual multi-turn `--test-prefix PREFIX --count N` entry points.
 - `audio2audio-real-prefix-text` keeps the older text-only behavior where `PREFIX_0001..` are treated as consecutive chunks of one user query under the same reference voice.
 - `audio2audio-real-report` wraps `tests/audio2audio_real_manifest.py` to summarize per-turn `timing.log` artifacts into one JSON report for later CPU-only baseline comparison.
+- `audio2audio-case-matrix` is manual and generates reusable short/long/silence/English/mixed/complex WAV inputs plus a JSON manifest for real-path regressions.
+- `audio2audio-real-baseline-compare` is manual and compares one generated Uya report JSON against a named entry in the local `outputs/baselines/audio2audio_baselines.json` manifest.
 - `audio-fixture` for log-mel encoder smoke and PCM preprocessing.
 - `speech-fixture` for tiny speech decoder/vocoder smoke and deterministic WAV output checks.
 - `audio2audio-fixture` for PCM/mel audio input through audio encoder, speech decoder, vocoder, and WAV output.

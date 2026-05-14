@@ -462,13 +462,14 @@
 
 - [x] 支持真实 PCM/WAV 读取：16 kHz mono s16/f32，并明确拒绝不支持格式或自动转码路径。
   - [x] `audio-input-probe` 支持 RIFF/WAVE PCM16、RIFF/WAVE F32 和现有 UYAP PCM；非 16 kHz mono 明确报错，不自动转码。
-- [ ] 对齐官方 audio preprocessing：window、STFT、mel、chunking、padding、streaming cache。
+- [x] 对齐官方 audio preprocessing：window、STFT、mel、chunking、padding、streaming cache。
   - [x] `audio-real-preprocess-probe` 已按 llama.cpp-omni MiniCPM-o 路径输出参数 plan：`frame_size=400`、`filter_bins=201`、`hop_length=160`、`mel_bins=80`、100ms 对齐、center pad 200 samples/side、conv2 下采样和 pool(5,5) 后的 `encoder_positions`。
   - [x] `audio2audio-real --audit-only` 已在 ref/user 输入检查后追加 preprocessing plan，支持显式 ref/user 和 `prefix_0000.wav`/`prefix_0001.wav` 测试格式。
   - [x] `audio-bind` 已验证官方 audio GGUF 的 `filters` metadata：`n_mel=80`、`n_fft/filter_bins=201`、`filters=16080`。
   - [x] `audio-real-mel-probe` 已实现真实 WAV/UYAP -> periodic Hann -> DFT/STFT power -> GGUF `filters` mel filterbank -> log10 clamp/normalize，并输出 frames/elements/checksum/首值。
   - [x] `audio-real-mel-probe --dump-f32` 与 `tests/compare_audio_mel_alignment.py`/`make audio-real-mel-align` 已接好，可对比 `llama.cpp-omni` 的 `log_mel_spectrogram.json` dump。
   - [x] 已与本地 `llama.cpp-omni` `log_mel_spectrogram` dump 做数值误差对齐：`outputs/complex_case2/complex2_0000.wav` 为 `mean_abs=1.2707e-5`、`max_abs=1.4266e-3`，`complex2_0001.wav` 为 `mean_abs=1.2695e-5`、`max_abs=1.4004e-3`；当前默认阈值取 `mean_abs <= 2e-5`、`max_abs <= 2e-3`。
+  - [x] `audio-real-mel-probe --stream-chunk-samples N` 与 `tests/compare_audio_real_stream_alignment.py`/`make audio-real-stream-align` 已接好，可直接验证 streamed overlap/cache 与 one-shot mel 逐元素一致；本地 `complex2_0001.wav` 在 `chunk_samples=1600` 下 `L1=0`、`mean_abs=0`、`max_abs=0`。
 - [x] 移除 tiny audio cap，支持真实用户语音长度和多 chunk 输入。
   - [x] 输入 probe 流式扫描真实 WAV/UYAP，不受 tiny mel cap 限制；`audio-real-encode-probe` 已移除 `480000 samples` 上限，可直接跑更长真实音频。
   - [x] `audio-real-encode-probe` / `audio2audio-real --text-only` 现已对长单文件音频按 encoder context 自动分块 forward，并输出 `chunks=` 诊断，避免单段长音频直接撞 `n_pos=1500` 上限。
@@ -528,19 +529,19 @@
   - [x] 新增 `token2wav-bind <dir>` / `make token2wav-real-bind`，对官方 5 个 GGUF 子文件做 bind-only shape/dtype 校验。
   - [x] 新增 `token2wav-prompt-cache-probe`，可读取 `prompt_cache.gguf` metadata 与 cache tensor checksum。
   - [x] 新增 `token2wav-window-probe`，可按 `chunk_total=28` / `chunk_main=25` / `pre_lookahead=3` 打印真实 token 窗口计划。
-- [ ] 实现 token2mel/flow matching 推理图需要的 attention、conv、norm、sampling/noise schedule。
+- [x] 实现 token2mel/flow matching 推理图需要的 attention、conv、norm、sampling/noise schedule。
   - [x] `flow_matching` bind 已补齐 `bias/q_norm.bias/conv bias/mlp bias/final bias` 等张量校验，不再只检查主 weight。
   - [x] 新增 `token2wav-flow-probe` / `make token2wav-flow-probe`，可在官方 `flow_matching.gguf` + `flow_extra.gguf` + `prompt_cache.gguf` 上跑 reference `speaker affine + timestep embed + attention + conv + MLP + final linear`。
   - [x] `token2wav-flow-probe` 当前支持 `--token-limit`、`--block-limit`、`--n-timesteps`、`--zero-mu|--embed-mu`，便于在小窗口上先验证数学链路。
   - [x] `token2wav-flow-probe --session` 现已按 `prompt_cache.gguf` 的 `chunk_total/chunk_main/pre_lookahead` 重放完整滑窗时序，并输出每窗 `emit_frames/checksum` 与总 mel checksum。
   - [x] `token2wav-flow-probe --dump-f32 out.uyml` 现可导出单窗或 session 聚合后的 mel 输出，便于后续与官方 token2mel / vocoder 输入对照。
-  - [ ] 当前 probe 仍使用 surrogate `mu`，还未接入 `encoder.gguf` 的真实 conformer/upsample forward。
+  - [x] `token2wav-flow-probe --encoder <encoder.gguf>`、`make token2wav-real-mu-align` 与 `audio2audio-real` 的 reference token2wav session 现已接入官方 `encoder.gguf` 的真实 conformer/upsample `mu` 前向；本地 `audio_tokens_chunk_0.txt` 在 `token_limit=4` 下与 surrogate `embed-mu` 产生不同 checksum，且 session/window 路径可复用同一实现。
 - [x] 实现 hifigan2 vocoder forward，输出 24 kHz mono PCM。
 - [x] `audio2audio-real --test-prefix` 真实路径现会在多 turn 间复用 `prompt_cache.gguf` / `flow_extra.gguf` / `flow_matching.gguf` / `hifigan2.gguf` 的已绑定权重，避免每轮重复 mmap/bind。
 - [x] 实现流式 WAV chunk 写入，并支持最终 concat 成完整回答 wav。
   - [x] `audio2audio-real` 现会在输出目录落盘 `answer_chunk_*.wav`、`answer.wav`、`turn.wav`，并保留 `audio_tokens_chunk_*.txt/bin` 供逐段对照。
 - [x] 支持 CPU reference 后端；GPU/多线程优化另设后续任务。
-  - [x] 当前接入 `flow_matching + flow_extra + prompt_cache + hifigan2` 核心张量的 CPU reference `tts2wav` 路径，仍明确保留 `surrogate mu` / 非精确 HiFiGAN2 source-resblock 的限制说明。
+  - [x] 当前接入 `flow_matching + flow_extra + encoder + prompt_cache + hifigan2` 核心张量的 CPU reference `tts2wav` 路径，仍明确保留非精确 HiFiGAN2 source-resblock 的限制说明。
 
 验收标准：
 
@@ -589,7 +590,9 @@ build/minicpm-o-uya audio2audio-real \
   - [x] `audio2audio-real --text-only` / 完整 TTS audio-token 路径现已输出 `ref/user encode`、`llm load/prefill/decode`、`tts_ms`、`generated_tokens`、`tts_audio_tokens`、`token2wav_ms`、`first_audio_ms`、`peak_rss_kb`、`answer_duration_ms`、`rtf`、`total_ms`，并写入 `timing.log`。
   - [x] 新增 `make audio2audio-real-prefix-{audit,text,tokens,wav}` 与 `make audio2audio-real-report`；多 turn `--test-prefix` 会话可直接生成 per-turn `timing.log` 报表 JSON，便于后续和 `llama.cpp-omni` 对照。
 - [ ] 与 `llama.cpp-omni` 同用例对照，记录 CPU-only 基线。
-- [ ] 增加长音频、短音频、静音、中文、英文、中英混合、复杂多项要求用例。
+  - [x] 已新增 `make audio2audio-real-baseline-compare` / `tests/compare_audio2audio_baseline.py`，可把 `make audio2audio-real-report` 生成的 Uya 报告 JSON 与本地 `outputs/baselines/audio2audio_baselines.json` 指定 case 做文本长度、answer/turn wav 时长与 timing 指标对照。
+- [x] 增加长音频、短音频、静音、中文、英文、中英混合、复杂多项要求用例。
+  - [x] 已新增 `make audio2audio-case-matrix` / `tests/build_audio2audio_case_matrix.py`，会生成 `outputs/baselines/audio2audio_case_matrix.json` 与派生 WAV 输入，覆盖 `complex/short/long/silence/english/mixed` 场景；本地生成结果已包含 `complex_multirequirements`、`short_trimmed`、`long_looped`、`silence_guard`、`english_fastpace`、`english_excited`、`mixed_zh_en`。
 - [x] 增加 deterministic smoke 保持无模型 CI 可跑，真实模型测试只在显式环境变量启用。
   - [x] `make test` 现只跑 tiny fixtures；真实 `audio2audio-real-*` 仍通过 `MINICPM_O_REAL_BUNDLE` / 手工命令显式启用。
 - [x] 文档记录当前速度预期：第一版先正确，再优化，不承诺立即达到 llama.cpp-omni 性能。

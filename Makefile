@@ -5,7 +5,7 @@ RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 AUDIO2AUDIO_REAL_ENCODE_PROBE_FLAG := $(if $(MINICPM_O_REAL_ENCODE_PROBE),--encode-probe,)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind token2wav-prompt-cache-probe token2wav-window-probe token2wav-flow-probe tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio2audio-real-audit audio2audio-real-input-audit audio2audio-real-text audio2audio-real-tokens audio2audio-real-wav audio2audio-real-prefix-audit audio2audio-real-prefix-text audio2audio-real-prefix-tokens audio2audio-real-prefix-wav audio2audio-real-report clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind token2wav-prompt-cache-probe token2wav-window-probe token2wav-flow-probe token2wav-real-mu-align tts-condition-probe tts-simplex-probe tts-token-align tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio-real-stream-align audio2audio-case-matrix audio2audio-real-audit audio2audio-real-input-audit audio2audio-real-text audio2audio-real-tokens audio2audio-real-wav audio2audio-real-prefix-audit audio2audio-real-prefix-text audio2audio-real-prefix-tokens audio2audio-real-prefix-wav audio2audio-real-report audio2audio-real-baseline-compare clean FORCE
 
 build: build-release
 
@@ -267,6 +267,24 @@ token2wav-flow-probe: build
 		$$( [ "$${MINICPM_O_T2W_SESSION:-0}" = "1" ] && printf '%s' --session ) \
 		$$(if [ "$${MINICPM_O_T2W_ZERO_MU:-0}" = "1" ]; then printf '%s' --zero-mu; else printf '%s' --embed-mu; fi)
 
+token2wav-real-mu-align: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_AUDIO_TOKENS_TXT)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_AUDIO_TOKENS_TXT=/path/to/audio_tokens_chunk.txt [MINICPM_O_T2W_TOKEN_LIMIT=8] [MINICPM_O_T2W_BLOCK_LIMIT=4] [MINICPM_O_T2W_N_TIMESTEPS=5] [MINICPM_O_T2W_SESSION=1] [MINICPM_O_T2W_REQUIRE_DIFFERENT=1] make token2wav-real-mu-align"; \
+		exit 2; \
+	fi
+	python3 tests/compare_token2wav_real_mu.py \
+		--uya "$(OUT)" \
+		--encoder-model "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf/encoder.gguf" \
+		--flow-matching-model "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf/flow_matching.gguf" \
+		--flow-extra-model "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf/flow_extra.gguf" \
+		--prompt-cache-model "$(MINICPM_O_REAL_BUNDLE)/token2wav-gguf/prompt_cache.gguf" \
+		--audio-tokens "$(MINICPM_O_AUDIO_TOKENS_TXT)" \
+		--token-limit "$${MINICPM_O_T2W_TOKEN_LIMIT:-8}" \
+		--block-limit "$${MINICPM_O_T2W_BLOCK_LIMIT:-4}" \
+		--n-timesteps "$${MINICPM_O_T2W_N_TIMESTEPS:-5}" \
+		$$( [ "$${MINICPM_O_T2W_SESSION:-0}" = "1" ] && printf '%s' --session ) \
+		$$( [ "$${MINICPM_O_T2W_REQUIRE_DIFFERENT:-1}" = "1" ] && printf '%s' --require-different )
+
 tts-condition-probe: build
 	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_TTS_TOKEN_IDS)" ] || [ -z "$(MINICPM_O_TTS_HIDDEN_BIN)" ]; then \
 		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_TTS_TOKEN_IDS=/path/to/llm_token_ids.txt MINICPM_O_TTS_HIDDEN_BIN=/path/to/llm_hidden_states.bin [MINICPM_O_TTS_MERGED_OUT=/tmp/minicpm-o-uya-merged.bin] [MINICPM_O_TTS_PROJECTED_OUT=/tmp/minicpm-o-uya-projected.bin] [MINICPM_O_TTS_FILTERED_IDS_OUT=/tmp/minicpm-o-uya-filtered-ids.txt] [MINICPM_O_TTS_CONDITION_OUT=/tmp/minicpm-o-uya-condition.bin] [MINICPM_O_TTS_AUDIO_BOS_ID=151687] make tts-condition-probe"; \
@@ -358,6 +376,19 @@ audio-real-mel-align: build
 		--llama-json "$(MINICPM_O_REAL_MEL_JSON)" \
 		--max-abs-threshold "$${MINICPM_O_MEL_ALIGN_MAX_ABS:-2e-3}" \
 		--mean-abs-threshold "$${MINICPM_O_MEL_ALIGN_MEAN_ABS:-2e-5}"
+
+audio-real-stream-align: build
+	@if [ -z "$(MINICPM_O_REAL_BUNDLE)" ] || [ -z "$(MINICPM_O_REAL_USER_AUDIO)" ]; then \
+		echo "usage: MINICPM_O_REAL_BUNDLE=/path/to/MiniCPM-o-4_5-gguf MINICPM_O_REAL_USER_AUDIO=user.wav [MINICPM_O_REAL_STREAM_CHUNK_SAMPLES=1600] [MINICPM_O_REAL_STREAM_MAX_ABS=2e-6] [MINICPM_O_REAL_STREAM_MEAN_ABS=2e-7] make audio-real-stream-align"; \
+		exit 2; \
+	fi
+	python3 tests/compare_audio_real_stream_alignment.py \
+		--uya "$(OUT)" \
+		--audio-model "$(MINICPM_O_REAL_BUNDLE)/audio/MiniCPM-o-4_5-audio-F16.gguf" \
+		--audio "$(MINICPM_O_REAL_USER_AUDIO)" \
+		--chunk-samples "$${MINICPM_O_REAL_STREAM_CHUNK_SAMPLES:-1600}" \
+		--max-abs-threshold "$${MINICPM_O_REAL_STREAM_MAX_ABS:-2e-6}" \
+		--mean-abs-threshold "$${MINICPM_O_REAL_STREAM_MEAN_ABS:-2e-7}"
 
 text-real-align: build
 	@if [ -z "$(MINICPM_O_TEXT_GGUF)" ] || [ -z "$(LLAMA_COMPLETION_BIN)" ]; then \
@@ -498,6 +529,21 @@ audio2audio-real-report:
 	else \
 		python3 tests/audio2audio_real_manifest.py "$$artifact_dir"; \
 	fi
+
+audio2audio-case-matrix:
+	python3 tests/build_audio2audio_case_matrix.py \
+		--output "$${MINICPM_O_CASE_MATRIX_OUT:-outputs/baselines/audio2audio_case_matrix.json}" \
+		--derived-dir "$${MINICPM_O_CASE_MATRIX_DIR:-outputs/case_matrix}"
+
+audio2audio-real-baseline-compare:
+	@if [ -z "$(MINICPM_O_REAL_REPORT_JSON)" ] || [ -z "$(MINICPM_O_BASELINE_CASE)" ]; then \
+		echo "usage: MINICPM_O_REAL_REPORT_JSON=/path/to/uya_report.json MINICPM_O_BASELINE_CASE=complex_case2 [MINICPM_O_BASELINE_MANIFEST=outputs/baselines/audio2audio_baselines.json] make audio2audio-real-baseline-compare"; \
+		exit 2; \
+	fi
+	python3 tests/compare_audio2audio_baseline.py \
+		--uya-report "$(MINICPM_O_REAL_REPORT_JSON)" \
+		--baseline-manifest "$${MINICPM_O_BASELINE_MANIFEST:-outputs/baselines/audio2audio_baselines.json}" \
+		--case-name "$(MINICPM_O_BASELINE_CASE)"
 
 clean:
 	rm -rf build

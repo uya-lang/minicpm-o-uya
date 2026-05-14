@@ -1674,42 +1674,63 @@ fn audio2audio_plan_tts_chunks(tok: &Tokenizer, token_ids: &const u32, token_cou
     return *chunk_count > 0;
 }
 
-fn audio_real_mel_compute(pcm: &AudioRealPcmHeap, filters: &AudioRealFilterBank, cos_table: &const f32, sin_table: &const f32, mel_values: &f32, mel_frames: u64, aligned_samples: u64) bool {
+fn audio_real_build_padded_samples(pcm: &AudioRealPcmHeap, aligned_samples: u64, padded_samples: &f32, padded_count: u64) void {
+    var i: u64 = 0;
+    while i < padded_count {
+        padded_samples[i as usize] = audio_real_centered_sample(pcm, aligned_samples, i);
+        i = i + 1;
+    }
+}
+
+fn audio_real_compute_log_frame_from_samples(samples: &const f32, sample_count: usize, frame_start: usize, filters: &AudioRealFilterBank, cos_table: &const f32, sin_table: &const f32, out_frame: &f32) bool {
+    if cos_table == null || sin_table == null { _ = printf("error: audio-real-mel trig table unavailable\n"); return false; }
     var hann: [f32: 400] = [];
     var n_hann: u32 = 0;
     while n_hann < AUDIO_REAL_FRAME_SIZE { hann[n_hann as usize] = audio_real_hann(n_hann); n_hann = n_hann + 1; }
-    if cos_table == null || sin_table == null { _ = printf("error: audio-real-mel trig table unavailable\n"); return false; }
+    var power: [f32: 201] = [];
+    var k: u32 = 0;
+    while k < AUDIO_REAL_FILTER_BINS {
+        var re: f32 = 0.0;
+        var im: f32 = 0.0;
+        var n: u32 = 0;
+        while n < AUDIO_REAL_FRAME_SIZE {
+            const sample_index: usize = frame_start + n as usize;
+            if sample_index >= sample_count {
+                _ = printf("error: audio-real-mel frame sample_index=%zu exceeds sample_count=%zu\n", sample_index, sample_count);
+                return false;
+            }
+            const sample: f32 = samples[sample_index] * hann[n as usize];
+            const tidx: usize = (k * AUDIO_REAL_FRAME_SIZE + n) as usize;
+            re = re + sample * cos_table[tidx];
+            im = im - sample * sin_table[tidx];
+            n = n + 1;
+        }
+        power[k as usize] = re * re + im * im;
+        k = k + 1;
+    }
+    var mel: u32 = 0;
+    while mel < AUDIO_REAL_MEL_BINS {
+        var sum: f32 = 0.0;
+        var bin: u32 = 0;
+        while bin < AUDIO_REAL_FILTER_BINS {
+            sum = sum + power[bin as usize] * filters.values[(mel * AUDIO_REAL_FILTER_BINS + bin) as usize];
+            bin = bin + 1;
+        }
+        if sum < 0.0000000001 { sum = 0.0000000001; }
+        out_frame[mel as usize] = log10f(sum);
+        mel = mel + 1;
+    }
+    return true;
+}
+
+fn audio_real_finalize_log_mel(mel_values: &f32, mel_frames: u64) void {
     var mmax: f32 = -1000000000.0;
     var frame: u64 = 0;
     while frame < mel_frames {
-        var power: [f32: 201] = [];
-        var k: u32 = 0;
-        while k < AUDIO_REAL_FILTER_BINS {
-            var re: f32 = 0.0;
-            var im: f32 = 0.0;
-            var n: u32 = 0;
-            while n < AUDIO_REAL_FRAME_SIZE {
-                const sample: f32 = audio_real_centered_sample(pcm, aligned_samples, frame * (AUDIO_REAL_HOP_LENGTH as u64) + (n as u64)) * hann[n as usize];
-                const tidx: usize = (k * AUDIO_REAL_FRAME_SIZE + n) as usize;
-                re = re + sample * cos_table[tidx];
-                im = im - sample * sin_table[tidx];
-                n = n + 1;
-            }
-            power[k as usize] = re * re + im * im;
-            k = k + 1;
-        }
         var mel: u32 = 0;
         while mel < AUDIO_REAL_MEL_BINS {
-            var sum: f32 = 0.0;
-            var bin: u32 = 0;
-            while bin < AUDIO_REAL_FILTER_BINS {
-                sum = sum + power[bin as usize] * filters.values[(mel * AUDIO_REAL_FILTER_BINS + bin) as usize];
-                bin = bin + 1;
-            }
-            if sum < 0.0000000001 { sum = 0.0000000001; }
-            const log_value: f32 = log10f(sum);
-            mel_values[(mel as u64 * mel_frames + frame) as usize] = log_value;
-            if log_value > mmax { mmax = log_value; }
+            const value: f32 = mel_values[(mel as u64 * mel_frames + frame) as usize];
+            if value > mmax { mmax = value; }
             mel = mel + 1;
         }
         frame = frame + 1;
@@ -1723,6 +1744,104 @@ fn audio_real_mel_compute(pcm: &AudioRealPcmHeap, filters: &AudioRealFilterBank,
         mel_values[i as usize] = (value + 4.0) / 4.0;
         i = i + 1;
     }
+}
+
+fn audio_real_mel_compute_from_padded_samples(padded_samples: &const f32, padded_count: u64, filters: &AudioRealFilterBank, cos_table: &const f32, sin_table: &const f32, mel_values: &f32, mel_frames: u64) bool {
+    var frame_values: [f32: 80] = [];
+    var frame: u64 = 0;
+    while frame < mel_frames {
+        const frame_start: usize = (frame * (AUDIO_REAL_HOP_LENGTH as u64)) as usize;
+        if !audio_real_compute_log_frame_from_samples(padded_samples, padded_count as usize, frame_start, filters, cos_table, sin_table, &frame_values[0]) { return false; }
+        var mel: u32 = 0;
+        while mel < AUDIO_REAL_MEL_BINS {
+            mel_values[(mel as u64 * mel_frames + frame) as usize] = frame_values[mel as usize];
+            mel = mel + 1;
+        }
+        frame = frame + 1;
+    }
+    audio_real_finalize_log_mel(mel_values, mel_frames);
+    return true;
+}
+
+fn audio_real_mel_compute(pcm: &AudioRealPcmHeap, filters: &AudioRealFilterBank, cos_table: &const f32, sin_table: &const f32, mel_values: &f32, mel_frames: u64, aligned_samples: u64) bool {
+    const padded_count: u64 = aligned_samples + (AUDIO_REAL_CENTER_PAD as u64) * (2 as u64);
+    const padded_samples: &f32 = calloc(padded_count as usize, 4) as &f32;
+    if padded_samples == null { _ = printf("error: audio-real-mel padded sample allocation failed samples=%llu\n", padded_count); return false; }
+    audio_real_build_padded_samples(pcm, aligned_samples, padded_samples, padded_count);
+    const ok: bool = audio_real_mel_compute_from_padded_samples(padded_samples as &const f32, padded_count, filters, cos_table, sin_table, mel_values, mel_frames);
+    free(padded_samples as &void);
+    return ok;
+}
+
+fn audio_real_mel_compute_streaming(pcm: &AudioRealPcmHeap, filters: &AudioRealFilterBank, cos_table: &const f32, sin_table: &const f32, mel_values: &f32, mel_frames: u64, aligned_samples: u64, chunk_samples: usize, peak_buffer_samples: &usize) bool {
+    peak_buffer_samples[0] = 0;
+    if chunk_samples == 0 { _ = printf("error: audio-real-mel stream chunk_samples=0\n"); return false; }
+    const padded_count: u64 = aligned_samples + (AUDIO_REAL_CENTER_PAD as u64) * (2 as u64);
+    const padded_samples: &f32 = calloc(padded_count as usize, 4) as &f32;
+    if padded_samples == null { _ = printf("error: audio-real-mel padded sample allocation failed samples=%llu\n", padded_count); return false; }
+    audio_real_build_padded_samples(pcm, aligned_samples, padded_samples, padded_count);
+    var cache_cap: usize = chunk_samples + (AUDIO_REAL_FRAME_SIZE as usize) * 2 + (AUDIO_REAL_HOP_LENGTH as usize);
+    if cache_cap < (AUDIO_REAL_FRAME_SIZE as usize) * 3 { cache_cap = (AUDIO_REAL_FRAME_SIZE as usize) * 3; }
+    const cache: &f32 = calloc(cache_cap, 4) as &f32;
+    if cache == null {
+        free(padded_samples as &void);
+        _ = printf("error: audio-real-mel stream cache allocation failed cap=%zu\n", cache_cap);
+        return false;
+    }
+    var cache_len: usize = 0;
+    var consumed_start: usize = 0;
+    var produced_frames: u64 = 0;
+    var cursor: usize = 0;
+    var frame_values: [f32: 80] = [];
+    while cursor < padded_count as usize {
+        var chunk: usize = chunk_samples;
+        if cursor + chunk > padded_count as usize { chunk = padded_count as usize - cursor; }
+        if cache_len + chunk > cache_cap {
+            free(cache as &void);
+            free(padded_samples as &void);
+            _ = printf("error: audio-real-mel stream cache overflow cache_len=%zu chunk=%zu cap=%zu\n", cache_len, chunk, cache_cap);
+            return false;
+        }
+        var append_index: usize = 0;
+        while append_index < chunk {
+            cache[cache_len + append_index] = padded_samples[cursor + append_index];
+            append_index = append_index + 1;
+        }
+        cache_len = cache_len + chunk;
+        if cache_len > peak_buffer_samples[0] { peak_buffer_samples[0] = cache_len; }
+        while consumed_start + (AUDIO_REAL_FRAME_SIZE as usize) <= cache_len && produced_frames < mel_frames {
+            if !audio_real_compute_log_frame_from_samples(cache as &const f32, cache_len, consumed_start, filters, cos_table, sin_table, &frame_values[0]) {
+                free(cache as &void);
+                free(padded_samples as &void);
+                return false;
+            }
+            var mel: u32 = 0;
+            while mel < AUDIO_REAL_MEL_BINS {
+                mel_values[(mel as u64 * mel_frames + produced_frames) as usize] = frame_values[mel as usize];
+                mel = mel + 1;
+            }
+            produced_frames = produced_frames + 1;
+            consumed_start = consumed_start + (AUDIO_REAL_HOP_LENGTH as usize);
+        }
+        if consumed_start > AUDIO_REAL_FRAME_SIZE as usize {
+            const keep_start: usize = consumed_start - (AUDIO_REAL_FRAME_SIZE as usize);
+            var keep_index: usize = 0;
+            while keep_start + keep_index < cache_len {
+                cache[keep_index] = cache[keep_start + keep_index];
+                keep_index = keep_index + 1;
+            }
+            cache_len = keep_index;
+            consumed_start = AUDIO_REAL_FRAME_SIZE as usize;
+        }
+        cursor = cursor + chunk;
+    }
+    free(cache as &void);
+    free(padded_samples as &void);
+    if produced_frames != mel_frames {
+        _ = printf("error: audio-real-mel stream produced_frames=%llu expected=%llu\n", produced_frames, mel_frames);
+        return false;
+    }
+    audio_real_finalize_log_mel(mel_values, mel_frames);
     return true;
 }
 
@@ -1738,7 +1857,7 @@ fn audio_real_copy_mel_chunk(dst: &f32, src: &const f32, mel_bins: usize, total_
     }
 }
 
-fn audio_real_mel_probe_run(audio_model_path: &const byte, audio_path: &const byte, dump_path: &const byte) i32 {
+fn audio_real_mel_probe_run(audio_model_path: &const byte, audio_path: &const byte, dump_path: &const byte, stream_chunk_samples: usize) i32 {
     var session: AudioRealEncoderSession = audio_real_encoder_session_init();
     if !audio_real_encoder_session_open(audio_model_path, &session) { return 1; }
     var pcm: AudioRealPcmHeap = audio_real_pcm_heap_init();
@@ -1750,7 +1869,12 @@ fn audio_real_mel_probe_run(audio_model_path: &const byte, audio_path: &const by
     if mel_frames == 0 || mel_count == 0 { _ = printf("error: audio-real-mel produced empty mel frames\n"); audio_real_pcm_heap_free(&pcm); audio_real_encoder_session_free(&session); return 1; }
     var mel_values: &f32 = calloc(mel_count as usize, 4) as &f32;
     if mel_values == null { _ = printf("error: audio-real-mel output allocation failed elements=%llu\n", mel_count); audio_real_pcm_heap_free(&pcm); audio_real_encoder_session_free(&session); return 1; }
-    if !audio_real_mel_compute(&pcm, &session.filters, session.cos_table as &const f32, session.sin_table as &const f32, mel_values, mel_frames, aligned_samples) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_encoder_session_free(&session); return 1; }
+    var peak_buffer_samples: usize = 0;
+    if stream_chunk_samples > 0 {
+        if !audio_real_mel_compute_streaming(&pcm, &session.filters, session.cos_table as &const f32, session.sin_table as &const f32, mel_values, mel_frames, aligned_samples, stream_chunk_samples, &peak_buffer_samples) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_encoder_session_free(&session); return 1; }
+    } else {
+        if !audio_real_mel_compute(&pcm, &session.filters, session.cos_table as &const f32, session.sin_table as &const f32, mel_values, mel_frames, aligned_samples) { free(mel_values as &void); audio_real_pcm_heap_free(&pcm); audio_real_encoder_session_free(&session); return 1; }
+    }
     var min_value: f32 = 0.0;
     var max_value: f32 = 0.0;
     var have: bool = false;
@@ -1761,6 +1885,9 @@ fn audio_real_mel_probe_run(audio_model_path: &const byte, audio_path: &const by
     var encoder_positions: u64 = 0;
     if conv_tokens >= (AUDIO_REAL_POOL_KERNEL as u64) { encoder_positions = ((conv_tokens - (AUDIO_REAL_POOL_KERNEL as u64)) / (AUDIO_REAL_POOL_STRIDE as u64)) + 1; }
     _ = printf("audio-real-mel input: model=%s audio=%s samples=%llu aligned_samples=%llu padded_samples=%llu\n", audio_model_path, audio_path, pcm.sample_count, aligned_samples, padded_samples);
+    if stream_chunk_samples > 0 {
+        _ = printf("audio-real-mel stream: chunk_samples=%zu peak_buffer_samples=%zu\n", stream_chunk_samples, peak_buffer_samples);
+    }
     _ = printf("audio-real-mel shape: frames=%llu mel_bins=%u elements=%llu filter_bins=%u conv_tokens=%llu encoder_positions=%llu checksum=0x%x min=%.6f max=%.6f\n", mel_frames, AUDIO_REAL_MEL_BINS, mel_count, AUDIO_REAL_FILTER_BINS, conv_tokens, encoder_positions, checksum, min_value as f64, max_value as f64);
     _ = printf("audio-real-mel values[0..5]: %.6f %.6f %.6f %.6f %.6f %.6f\n", mel_values[0] as f64, mel_values[1] as f64, mel_values[2] as f64, mel_values[3] as f64, mel_values[4] as f64, mel_values[5] as f64);
     if dump_path != null {
@@ -1774,24 +1901,56 @@ fn audio_real_mel_probe_run(audio_model_path: &const byte, audio_path: &const by
 }
 
 export fn audio_real_mel_probe_cli(audio_model_path: &const byte, audio_path: &const byte) i32 {
-    return audio_real_mel_probe_run(audio_model_path, audio_path, null);
+    return audio_real_mel_probe_run(audio_model_path, audio_path, null, 0);
+}
+
+fn audio_real_parse_u32_ascii(text: &const byte, pos: &usize, out: &u32) bool {
+    while text[*pos] == 32 || text[*pos] == 9 || text[*pos] == 10 || text[*pos] == 13 { *pos = *pos + 1; }
+    if text[*pos] == 0 || text[*pos] < 48 || text[*pos] > 57 { return false; }
+    var value: u32 = 0;
+    while text[*pos] >= 48 && text[*pos] <= 57 {
+        value = value * 10 + ((text[*pos] - 48) as u32);
+        *pos = *pos + 1;
+    }
+    *out = value;
+    return true;
 }
 
 export fn audio_real_mel_probe_args_cli(argc: i32, argv: & &byte) i32 {
-    if argc != 4 && argc != 6 {
-        _ = printf("usage: minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--dump-f32 out.uyml]\n");
+    if argc < 4 {
+        _ = printf("usage: minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--stream-chunk-samples N] [--dump-f32 out.uyml]\n");
         return 1;
     }
     var dump_path: &const byte = null;
-    if argc == 6 {
-        if strcmp(argv[4] as *const byte, "--dump-f32\0" as *const byte) != 0 {
-            _ = printf("error: audio-real-mel-probe expected optional flag --dump-f32\n");
-            _ = printf("usage: minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--dump-f32 out.uyml]\n");
-            return 1;
+    var stream_chunk_samples: usize = 0;
+    var i: i32 = 4;
+    while i < argc {
+        if strcmp(argv[i] as *const byte, "--dump-f32\0" as *const byte) == 0 {
+            if i + 1 >= argc {
+                _ = printf("usage: minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--stream-chunk-samples N] [--dump-f32 out.uyml]\n");
+                return 1;
+            }
+            dump_path = argv[i + 1] as &const byte;
+            i = i + 2;
+            continue;
         }
-        dump_path = argv[5] as &const byte;
+        if strcmp(argv[i] as *const byte, "--stream-chunk-samples\0" as *const byte) == 0 {
+            var pos: usize = 0;
+            var parsed: u32 = 0;
+            if i + 1 >= argc || !audio_real_parse_u32_ascii(argv[i + 1] as &const byte, &pos, &parsed) || parsed == 0 {
+                _ = printf("error: audio-real-mel-probe expected positive --stream-chunk-samples N\n");
+                _ = printf("usage: minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--stream-chunk-samples N] [--dump-f32 out.uyml]\n");
+                return 1;
+            }
+            stream_chunk_samples = parsed as usize;
+            i = i + 2;
+            continue;
+        }
+        _ = printf("error: audio-real-mel-probe unknown flag %s\n", argv[i] as &const byte);
+        _ = printf("usage: minicpm-o-uya audio-real-mel-probe <audio.gguf> <audio.wav|audio.uyap.pcm> [--stream-chunk-samples N] [--dump-f32 out.uyml]\n");
+        return 1;
     }
-    return audio_real_mel_probe_run(argv[2] as &const byte, argv[3] as &const byte, dump_path);
+    return audio_real_mel_probe_run(argv[2] as &const byte, argv[3] as &const byte, dump_path, stream_chunk_samples);
 }
 
 fn audio_pcm_load(path: &const byte, pcm: &AudioRawPcm) bool {
