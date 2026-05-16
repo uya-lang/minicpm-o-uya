@@ -2138,7 +2138,7 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
     qwen3_bench_print_rate("text_prompt\0" as &const byte, prompt_units, prompt_micros, "tokens\0" as &const byte, bench.repetitions);
     qwen3_bench_print_rate("text_decode\0" as &const byte, decode_units, decode_micros, "tokens\0" as &const byte, bench.repetitions);
     _ = printf("bench memory: peak_estimate_bytes=%llu weights_mmap=%llu runtime=%llu kv=%llu rope=%llu prompt_ids=%llu logits=%llu\n", peak_bytes, summary_file_size, runtime_bytes, kv_layout.total_bytes, rope_bytes, prompt_bytes, logits_bytes);
-    _ = printf("bench optimize: hot_matvec=q8_0_uya_parallel kv_cache=contiguous rope=precomputed sampler=fixed-seed\n");
+    _ = printf("bench optimize: hot_matvec=k_quant_uya_parallel kv_cache=contiguous rope=precomputed sampler=fixed-seed\n");
     _ = printf("bench reference_error: n/a mode=real-timing\n");
     _ = printf("bench: PASS\n");
     return 0;
