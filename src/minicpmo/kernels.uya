@@ -7,65 +7,29 @@ use libc.tanh;
 
 const KERNEL_NEG_INF: f32 = -(3.4028234663852886e38 as f32);
 
-type KernelVec4f32 = @vector(f32, 4);
-
 export fn f32_fill(dst: &f32, n: usize, value: f32) void {
     var i: usize = 0;
-    const simd_end: usize = n - (n % (4 as usize));
-    const fill: KernelVec4f32 = @vector.splat(value);
-    while i < simd_end {
-        @vector.store(&dst[i], fill);
-        i = i + (4 as usize);
-    }
     while i < n { dst[i] = value; i = i + 1; }
 }
 
 export fn f32_copy(dst: &f32, src: &const f32, n: usize) void {
     var i: usize = 0;
-    const simd_end: usize = n - (n % (4 as usize));
-    while i < simd_end {
-        const v: KernelVec4f32 = @vector.load(&src[i]);
-        @vector.store(&dst[i], v);
-        i = i + (4 as usize);
-    }
     while i < n { dst[i] = src[i]; i = i + 1; }
 }
 
 export fn f32_add(dst: &f32, a: &const f32, b: &const f32, n: usize) void {
     var i: usize = 0;
-    const simd_end: usize = n - (n % (4 as usize));
-    while i < simd_end {
-        const av: KernelVec4f32 = @vector.load(&a[i]);
-        const bv: KernelVec4f32 = @vector.load(&b[i]);
-        @vector.store(&dst[i], av + bv);
-        i = i + (4 as usize);
-    }
     while i < n { dst[i] = a[i] + b[i]; i = i + 1; }
 }
 
 export fn f32_mul(dst: &f32, a: &const f32, b: &const f32, n: usize) void {
     var i: usize = 0;
-    const simd_end: usize = n - (n % (4 as usize));
-    while i < simd_end {
-        const av: KernelVec4f32 = @vector.load(&a[i]);
-        const bv: KernelVec4f32 = @vector.load(&b[i]);
-        @vector.store(&dst[i], av * bv);
-        i = i + (4 as usize);
-    }
     while i < n { dst[i] = a[i] * b[i]; i = i + 1; }
 }
 
 export fn f32_dot(a: &const f32, b: &const f32, n: usize) f32 {
-    var acc: KernelVec4f32 = @vector.splat(0.0f32);
+    var sum: f32 = 0.0;
     var i: usize = 0;
-    const simd_end: usize = n - (n % (4 as usize));
-    while i < simd_end {
-        const av: KernelVec4f32 = @vector.load(&a[i]);
-        const bv: KernelVec4f32 = @vector.load(&b[i]);
-        acc = acc + av * bv;
-        i = i + (4 as usize);
-    }
-    var sum: f32 = @vector.reduce_add(acc);
     while i < n { sum = sum + a[i] * b[i]; i = i + 1; }
     return sum;
 }
@@ -109,54 +73,25 @@ export fn bf16_load_f32(bits: u16) f32 {
 
 export fn rms_norm(dst: &f32, src: &const f32, weight: &const f32, n: usize, eps: f32) void {
     if n == 0 { return; }
-    const sum: f32 = f32_dot(src, src, n);
-    const scale: f32 = 1.0 / sqrtf(sum / (n as f32) + eps);
-    const scale_vec: KernelVec4f32 = @vector.splat(scale);
+    var sum: f32 = 0.0;
     var i: usize = 0;
-    const simd_end: usize = n - (n % (4 as usize));
-    while i < simd_end {
-        const sv: KernelVec4f32 = @vector.load(&src[i]);
-        const wv: KernelVec4f32 = @vector.load(&weight[i]);
-        @vector.store(&dst[i], sv * scale_vec * wv);
-        i = i + (4 as usize);
-    }
+    while i < n { sum = sum + src[i] * src[i]; i = i + 1; }
+    const scale: f32 = 1.0 / sqrtf(sum / (n as f32) + eps);
+    i = 0;
     while i < n { dst[i] = src[i] * scale * weight[i]; i = i + 1; }
 }
 
 export fn layer_norm(dst: &f32, src: &const f32, weight: &const f32, bias: &const f32, n: usize, eps: f32) void {
     if n == 0 { return; }
-    var acc: KernelVec4f32 = @vector.splat(0.0f32);
+    var mean: f32 = 0.0;
     var i: usize = 0;
-    const simd_end: usize = n - (n % (4 as usize));
-    while i < simd_end {
-        const sv: KernelVec4f32 = @vector.load(&src[i]);
-        acc = acc + sv;
-        i = i + (4 as usize);
-    }
-    var mean: f32 = @vector.reduce_add(acc);
     while i < n { mean = mean + src[i]; i = i + 1; }
     mean = mean / (n as f32);
-
-    const mean_vec: KernelVec4f32 = @vector.splat(mean);
-    var var_acc: KernelVec4f32 = @vector.splat(0.0f32);
+    var var_sum: f32 = 0.0;
     i = 0;
-    while i < simd_end {
-        const d: KernelVec4f32 = @vector.load(&src[i]) - mean_vec;
-        var_acc = var_acc + d * d;
-        i = i + (4 as usize);
-    }
-    var var_sum: f32 = @vector.reduce_add(var_acc);
     while i < n { const d: f32 = src[i] - mean; var_sum = var_sum + d * d; i = i + 1; }
     const scale: f32 = 1.0 / sqrtf(var_sum / (n as f32) + eps);
-    const scale_vec: KernelVec4f32 = @vector.splat(scale);
     i = 0;
-    while i < simd_end {
-        const normalized: KernelVec4f32 = (@vector.load(&src[i]) - mean_vec) * scale_vec;
-        const wv: KernelVec4f32 = @vector.load(&weight[i]);
-        const bv: KernelVec4f32 = @vector.load(&bias[i]);
-        @vector.store(&dst[i], normalized * wv + bv);
-        i = i + (4 as usize);
-    }
     while i < n { dst[i] = (src[i] - mean) * scale * weight[i] + bias[i]; i = i + 1; }
 }
 
