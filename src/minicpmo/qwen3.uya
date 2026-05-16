@@ -5,6 +5,7 @@ use libc.cosf;
 use libc.fgets;
 use libc.fflush;
 use libc.free;
+use libc.getenv;
 use libc.powf;
 use libc.pthread_create;
 use libc.pthread_join;
@@ -29,6 +30,28 @@ use minicpmo.kernels.bf16_load_f32;
 use minicpmo.kernels.f16_load_f32;
 use minicpmo.kernels.silu;
 use minicpmo.kernels.softmax;
+use minicpmo.gpu.GpuContext;
+use minicpmo.gpu.gpu_context_close;
+use minicpmo.gpu.gpu_context_init;
+use minicpmo.gpu.gpu_context_attention;
+use minicpmo.gpu.gpu_context_attention_slots;
+use minicpmo.gpu.gpu_context_last_error;
+use minicpmo.gpu.gpu_context_matvec;
+use minicpmo.gpu.gpu_context_open;
+use minicpmo.gpu.gpu_context_prepare_attention;
+use minicpmo.gpu.gpu_context_refresh_stats;
+use minicpmo.gpu.gpu_context_smoke;
+use minicpmo.gpu.gpu_context_slot_add_inplace;
+use minicpmo.gpu.gpu_context_slot_download_f32;
+use minicpmo.gpu.gpu_context_slot_head_norm;
+use minicpmo.gpu.gpu_context_slot_matvec;
+use minicpmo.gpu.gpu_context_slot_rms_norm;
+use minicpmo.gpu.gpu_context_slot_rope;
+use minicpmo.gpu.gpu_context_slot_silu_mul;
+use minicpmo.gpu.gpu_context_slot_upload_f32;
+use minicpmo.gpu.gpu_context_upload_tensor;
+use minicpmo.gpu.gpu_dtype_matvec_supported;
+use minicpmo.gpu.gpu_print_runtime_unsupported;
 use minicpmo.tensor.TensorDType;
 use minicpmo.tensor.LlmKvCacheLayout;
 use minicpmo.tensor.TensorView;
@@ -86,6 +109,18 @@ const QWEN3_BENCH_SEED_CAP: usize = 64;
 const QWEN3_BENCH_DEFAULT_PROMPT_TOKENS: u32 = 8;
 const QWEN3_BENCH_DEFAULT_GEN_TOKENS: u32 = 8;
 const QWEN3_BENCH_DEFAULT_REPETITIONS: u32 = 3;
+const QWEN3_GPU_SLOT_HIDDEN: u32 = 0;
+const QWEN3_GPU_SLOT_NORMED: u32 = 1;
+const QWEN3_GPU_SLOT_Q: u32 = 2;
+const QWEN3_GPU_SLOT_K: u32 = 3;
+const QWEN3_GPU_SLOT_V: u32 = 4;
+const QWEN3_GPU_SLOT_ATTN_CTX: u32 = 5;
+const QWEN3_GPU_SLOT_ATTN_OUT: u32 = 6;
+const QWEN3_GPU_SLOT_GATE: u32 = 7;
+const QWEN3_GPU_SLOT_UP: u32 = 8;
+const QWEN3_GPU_SLOT_FUSED: u32 = 9;
+const QWEN3_GPU_SLOT_DOWN: u32 = 10;
+const QWEN3_GPU_SLOT_LOGITS: u32 = 11;
 
 var qwen3_thread_count: usize = 1;
 
@@ -150,6 +185,7 @@ export struct Qwen3Runtime {
     total_tokens: usize,
     seed: u32,
     device: Qwen3Device,
+    gpu: GpuContext,
 }
 
 export struct Qwen3Config {
@@ -260,10 +296,7 @@ fn qwen3_parse_backend_value(text: &const byte, out: &BackendKind) bool {
 }
 
 fn qwen3_backend_supported(kind: BackendKind) bool {
-    if kind == BackendKind.Cuda {
-        _ = printf("error: backend=cuda is not implemented yet; use --backend cpu\n");
-        return false;
-    }
+    _ = kind;
     return true;
 }
 
@@ -450,6 +483,44 @@ fn qwen3_validate_runtime_matvec_dtypes(weights: &Qwen3Weights) bool {
         if !qwen3_check_runtime_tensor_dtype(lw.gate_proj, "ffn_gate\0" as &const byte, layer) { return false; }
         if !qwen3_check_runtime_tensor_dtype(lw.up_proj, "ffn_up\0" as &const byte, layer) { return false; }
         if !qwen3_check_runtime_tensor_dtype(lw.down_proj, "ffn_down\0" as &const byte, layer) { return false; }
+        layer = layer + 1;
+    }
+    return true;
+}
+
+fn qwen3_check_cuda_runtime_matvec_tensor(view: &TensorView, role: &const byte, layer: u32) bool {
+    if gpu_dtype_matvec_supported(view.dtype) { return true; }
+    _ = printf("error: qwen3 runtime layer=%u tensor=%s role=%s dtype=%s backend=cuda supported_dtypes=F32|F16|BF16|Q4_K|Q6_K attention=cuda kv_cache=device no_cpu_fallback=true\n", layer, &view.name[0], role, tensor_dtype_name(view.dtype));
+    return false;
+}
+
+fn qwen3_check_cuda_runtime_vec_tensor(view: &TensorView, role: &const byte, layer: u32) bool {
+    if view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 || view.dtype == TensorDType.BF16 { return true; }
+    _ = printf("error: qwen3 runtime layer=%u tensor=%s role=%s dtype=%s backend=cuda supported_vector_dtypes=F32|F16|BF16 attention=cuda kv_cache=device no_cpu_fallback=true\n", layer, &view.name[0], role, tensor_dtype_name(view.dtype));
+    return false;
+}
+
+fn qwen3_validate_cuda_runtime_dtypes(weights: &Qwen3Weights) bool {
+    if !qwen3_dtype_supported(weights.token_embedding.dtype) {
+        _ = printf("error: qwen3 runtime tensor=%s role=token_embedding dtype=%s backend=cuda cpu_side_embedding_copy_unsupported=true\n", &weights.token_embedding.name[0], tensor_dtype_name(weights.token_embedding.dtype));
+        return false;
+    }
+    if !qwen3_check_cuda_runtime_vec_tensor(weights.output_norm, "output_norm\0" as &const byte, weights.layer_count) { return false; }
+    if !qwen3_check_cuda_runtime_matvec_tensor(weights.output, "lm_head\0" as &const byte, weights.layer_count) { return false; }
+    var layer: u32 = 0;
+    while layer < weights.layer_count {
+        const lw: &Qwen3LayerWeights = &weights.layers[layer as usize];
+        if !qwen3_check_cuda_runtime_vec_tensor(lw.attn_norm, "attn_norm\0" as &const byte, layer) { return false; }
+        if !qwen3_check_cuda_runtime_matvec_tensor(lw.q_proj, "attn_q\0" as &const byte, layer) { return false; }
+        if !qwen3_check_cuda_runtime_matvec_tensor(lw.k_proj, "attn_k\0" as &const byte, layer) { return false; }
+        if !qwen3_check_cuda_runtime_matvec_tensor(lw.v_proj, "attn_v\0" as &const byte, layer) { return false; }
+        if !qwen3_check_cuda_runtime_matvec_tensor(lw.o_proj, "attn_o\0" as &const byte, layer) { return false; }
+        if lw.q_norm != null && !qwen3_check_cuda_runtime_vec_tensor(lw.q_norm, "q_norm\0" as &const byte, layer) { return false; }
+        if lw.k_norm != null && !qwen3_check_cuda_runtime_vec_tensor(lw.k_norm, "k_norm\0" as &const byte, layer) { return false; }
+        if !qwen3_check_cuda_runtime_vec_tensor(lw.ffn_norm, "ffn_norm\0" as &const byte, layer) { return false; }
+        if !qwen3_check_cuda_runtime_matvec_tensor(lw.gate_proj, "ffn_gate\0" as &const byte, layer) { return false; }
+        if !qwen3_check_cuda_runtime_matvec_tensor(lw.up_proj, "ffn_up\0" as &const byte, layer) { return false; }
+        if !qwen3_check_cuda_runtime_matvec_tensor(lw.down_proj, "ffn_down\0" as &const byte, layer) { return false; }
         layer = layer + 1;
     }
     return true;
@@ -1089,6 +1160,35 @@ fn qwen3_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usiz
     qwen3_dense_matvec_range(dst, matrix, x, in_dim, 0, out_dim);
 }
 
+fn qwen3_runtime_matvec_view(runtime: &Qwen3Runtime, dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) bool {
+    if runtime.device.backend == BackendKind.Cuda {
+        if !gpu_dtype_matvec_supported(matrix.dtype) {
+            gpu_print_runtime_unsupported("qwen3 cuda matvec unsupported\0" as &const byte, matrix);
+            return false;
+        }
+        if !gpu_context_matvec(&runtime.gpu, matrix, x, in_dim, out_dim, dst) {
+            _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+            return false;
+        }
+        return true;
+    }
+    qwen3_matvec_view(dst, matrix, x, in_dim, out_dim);
+    return true;
+}
+
+fn qwen3_runtime_attention_view(runtime: &Qwen3Runtime, dst: &f32, q: &const f32, k: &const f32, v: &const f32, layer: usize, pos: usize, head_count: usize, kv_head_count: usize, head_dim: usize) bool {
+    if runtime.device.backend == BackendKind.Cuda {
+        if !gpu_context_attention(&runtime.gpu, q, k, v, layer, pos, head_count, kv_head_count, head_dim, runtime.context_capacity, dst) {
+            _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+            return false;
+        }
+        return true;
+    }
+    qwen3_write_kv_cache(runtime.k_cache, runtime.v_cache, layer, pos, k, v, kv_head_count * head_dim, runtime.context_capacity);
+    qwen3_attention(dst, q, runtime.k_cache, runtime.v_cache, layer, pos, head_count, kv_head_count, head_dim, runtime.context_capacity);
+    return true;
+}
+
 fn qwen3_apply_head_norm(vec: &f32, norm: &TensorView, head_count: usize, head_dim: usize) void {
     var h: usize = 0;
     while h < head_count {
@@ -1411,6 +1511,141 @@ export fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, toke
     return qwen3_forward_token_with_rope(config, weights, token_id, pos, k_cache, v_cache, logits, compute_logits, null as &const f32, null as &const f32, QWEN3_FORWARD_COMPAT_CONTEXT, null as &f32, 0);
 }
 
+fn qwen3_forward_embedding_runtime_cuda(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, embedding: &const f32, pos: usize, logits: &f32, compute_logits: bool, hidden_out: &f32, hidden_out_len: usize) bool {
+    const hidden_n: usize = config.hidden_size as usize;
+    const vocab_n: usize = config.vocab_size as usize;
+    const ffn_n: usize = config.intermediate_size as usize;
+    const head_count: usize = config.head_count as usize;
+    const kv_head_count: usize = config.kv_head_count as usize;
+    const head_dim: usize = config.head_dim as usize;
+    const q_dim: usize = head_count * head_dim;
+    const kv_dim: usize = kv_head_count * head_dim;
+    const rope_freq_base: f32 = qwen3_config_rope_freq_base(config);
+    const rope_freq_scale: f32 = qwen3_config_rope_freq_scale(config);
+    if !gpu_context_slot_upload_f32(&runtime.gpu, QWEN3_GPU_SLOT_HIDDEN, embedding, hidden_n) {
+        _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+        return false;
+    }
+    var layer: usize = 0;
+    while layer < config.layer_count as usize {
+        const lw: &Qwen3LayerWeights = &weights.layers[layer];
+        if !gpu_context_slot_rms_norm(&runtime.gpu, QWEN3_GPU_SLOT_NORMED, QWEN3_GPU_SLOT_HIDDEN, lw.attn_norm, hidden_n, QWEN3_FORWARD_EPS) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_Q, lw.q_proj, QWEN3_GPU_SLOT_NORMED, hidden_n, q_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_K, lw.k_proj, QWEN3_GPU_SLOT_NORMED, hidden_n, kv_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_V, lw.v_proj, QWEN3_GPU_SLOT_NORMED, hidden_n, kv_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if lw.q_norm != null && !gpu_context_slot_head_norm(&runtime.gpu, QWEN3_GPU_SLOT_Q, lw.q_norm, head_count, head_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if lw.k_norm != null && !gpu_context_slot_head_norm(&runtime.gpu, QWEN3_GPU_SLOT_K, lw.k_norm, kv_head_count, head_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_rope(&runtime.gpu, QWEN3_GPU_SLOT_Q, head_count, head_dim, pos, rope_freq_base, rope_freq_scale) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_rope(&runtime.gpu, QWEN3_GPU_SLOT_K, kv_head_count, head_dim, pos, rope_freq_base, rope_freq_scale) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_attention_slots(&runtime.gpu, QWEN3_GPU_SLOT_ATTN_CTX, QWEN3_GPU_SLOT_Q, QWEN3_GPU_SLOT_K, QWEN3_GPU_SLOT_V, layer, pos, head_count, kv_head_count, head_dim, runtime.context_capacity) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_ATTN_OUT, lw.o_proj, QWEN3_GPU_SLOT_ATTN_CTX, q_dim, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_add_inplace(&runtime.gpu, QWEN3_GPU_SLOT_HIDDEN, QWEN3_GPU_SLOT_ATTN_OUT, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_rms_norm(&runtime.gpu, QWEN3_GPU_SLOT_NORMED, QWEN3_GPU_SLOT_HIDDEN, lw.ffn_norm, hidden_n, QWEN3_FORWARD_EPS) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_GATE, lw.gate_proj, QWEN3_GPU_SLOT_NORMED, hidden_n, ffn_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_UP, lw.up_proj, QWEN3_GPU_SLOT_NORMED, hidden_n, ffn_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_silu_mul(&runtime.gpu, QWEN3_GPU_SLOT_FUSED, QWEN3_GPU_SLOT_GATE, QWEN3_GPU_SLOT_UP, ffn_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_DOWN, lw.down_proj, QWEN3_GPU_SLOT_FUSED, ffn_n, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_add_inplace(&runtime.gpu, QWEN3_GPU_SLOT_HIDDEN, QWEN3_GPU_SLOT_DOWN, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        layer = layer + 1;
+    }
+    if hidden_out != null {
+        if hidden_out_len < hidden_n {
+            _ = printf("error: qwen3 hidden capture buffer too small len=%zu hidden=%zu\n", hidden_out_len, hidden_n);
+            return false;
+        }
+        if !gpu_context_slot_download_f32(&runtime.gpu, QWEN3_GPU_SLOT_HIDDEN, hidden_out, hidden_n) {
+            _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+            return false;
+        }
+    }
+    if compute_logits {
+        if !gpu_context_slot_rms_norm(&runtime.gpu, QWEN3_GPU_SLOT_NORMED, QWEN3_GPU_SLOT_HIDDEN, weights.output_norm, hidden_n, QWEN3_FORWARD_EPS) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_LOGITS, weights.output, QWEN3_GPU_SLOT_NORMED, hidden_n, vocab_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_download_f32(&runtime.gpu, QWEN3_GPU_SLOT_LOGITS, logits, vocab_n) {
+            _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+            return false;
+        }
+    }
+    return true;
+}
+
+fn qwen3_forward_embedding_runtime(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, embedding: &const f32, pos: usize, logits: &f32, compute_logits: bool, hidden_out: &f32, hidden_out_len: usize) bool {
+    if pos >= runtime.context_capacity || pos >= QWEN3_FORWARD_MAX_CONTEXT {
+        _ = printf("error: qwen3 forward pos=%zu exceeds runtime_context=%zu max_context=%zu\n", pos, runtime.context_capacity, QWEN3_FORWARD_MAX_CONTEXT);
+        return false;
+    }
+    if runtime.device.backend == BackendKind.Cuda {
+        return qwen3_forward_embedding_runtime_cuda(config, weights, runtime, embedding, pos, logits, compute_logits, hidden_out, hidden_out_len);
+    }
+    const hidden_n: usize = config.hidden_size as usize;
+    const vocab_n: usize = config.vocab_size as usize;
+    const ffn_n: usize = config.intermediate_size as usize;
+    const head_count: usize = config.head_count as usize;
+    const kv_head_count: usize = config.kv_head_count as usize;
+    const head_dim: usize = config.head_dim as usize;
+    const q_dim: usize = head_count * head_dim;
+    const kv_dim: usize = kv_head_count * head_dim;
+    const rope_freq_base: f32 = qwen3_config_rope_freq_base(config);
+    const rope_freq_scale: f32 = qwen3_config_rope_freq_scale(config);
+    var hidden: [f32: QWEN3_FORWARD_MAX_HIDDEN] = [];
+    var normed: [f32: QWEN3_FORWARD_MAX_HIDDEN] = [];
+    var q: [f32: QWEN3_FORWARD_MAX_QDIM] = [];
+    var k: [f32: QWEN3_FORWARD_MAX_KVDIM] = [];
+    var v: [f32: QWEN3_FORWARD_MAX_KVDIM] = [];
+    var attn_ctx: [f32: QWEN3_FORWARD_MAX_QDIM] = [];
+    var attn_out: [f32: QWEN3_FORWARD_MAX_HIDDEN] = [];
+    var gate: [f32: QWEN3_FORWARD_MAX_FFN] = [];
+    var up: [f32: QWEN3_FORWARD_MAX_FFN] = [];
+    var fused: [f32: QWEN3_FORWARD_MAX_FFN] = [];
+    var down: [f32: QWEN3_FORWARD_MAX_HIDDEN] = [];
+    var copy_i: usize = 0;
+    while copy_i < hidden_n { hidden[copy_i] = embedding[copy_i]; copy_i = copy_i + 1; }
+    var layer: usize = 0;
+    while layer < config.layer_count as usize {
+        const lw: &Qwen3LayerWeights = &weights.layers[layer];
+        qwen3_rms_norm_view(&normed[0], &hidden[0], lw.attn_norm, hidden_n);
+        if !qwen3_runtime_matvec_view(runtime, &q[0], lw.q_proj, &normed[0], hidden_n, q_dim) { return false; }
+        if !qwen3_runtime_matvec_view(runtime, &k[0], lw.k_proj, &normed[0], hidden_n, kv_dim) { return false; }
+        if !qwen3_runtime_matvec_view(runtime, &v[0], lw.v_proj, &normed[0], hidden_n, kv_dim) { return false; }
+        if lw.q_norm != null { qwen3_apply_head_norm(&q[0], lw.q_norm, head_count, head_dim); }
+        if lw.k_norm != null { qwen3_apply_head_norm(&k[0], lw.k_norm, kv_head_count, head_dim); }
+        qwen3_apply_rope(&q[0], head_count, head_dim, pos, rope_freq_base, rope_freq_scale, runtime.rope_cos, runtime.rope_sin);
+        qwen3_apply_rope(&k[0], kv_head_count, head_dim, pos, rope_freq_base, rope_freq_scale, runtime.rope_cos, runtime.rope_sin);
+        if !qwen3_runtime_attention_view(runtime, &attn_ctx[0], &q[0], &k[0], &v[0], layer, pos, head_count, kv_head_count, head_dim) { return false; }
+        if !qwen3_runtime_matvec_view(runtime, &attn_out[0], lw.o_proj, &attn_ctx[0], q_dim, hidden_n) { return false; }
+        var i: usize = 0;
+        while i < hidden_n { hidden[i] = hidden[i] + attn_out[i]; i = i + 1; }
+        qwen3_rms_norm_view(&normed[0], &hidden[0], lw.ffn_norm, hidden_n);
+        if !qwen3_runtime_matvec_view(runtime, &gate[0], lw.gate_proj, &normed[0], hidden_n, ffn_n) { return false; }
+        if !qwen3_runtime_matvec_view(runtime, &up[0], lw.up_proj, &normed[0], hidden_n, ffn_n) { return false; }
+        i = 0;
+        while i < ffn_n { fused[i] = silu(gate[i]) * up[i]; i = i + 1; }
+        if !qwen3_runtime_matvec_view(runtime, &down[0], lw.down_proj, &fused[0], ffn_n, hidden_n) { return false; }
+        i = 0;
+        while i < hidden_n { hidden[i] = hidden[i] + down[i]; i = i + 1; }
+        layer = layer + 1;
+    }
+    if hidden_out != null {
+        if hidden_out_len < hidden_n {
+            _ = printf("error: qwen3 hidden capture buffer too small len=%zu hidden=%zu\n", hidden_out_len, hidden_n);
+            return false;
+        }
+        var hidden_i: usize = 0;
+        while hidden_i < hidden_n { hidden_out[hidden_i] = hidden[hidden_i]; hidden_i = hidden_i + 1; }
+    }
+    if compute_logits {
+        qwen3_rms_norm_view(&normed[0], &hidden[0], weights.output_norm, hidden_n);
+        if !qwen3_runtime_matvec_view(runtime, logits, weights.output, &normed[0], hidden_n, vocab_n) { return false; }
+    }
+    return true;
+}
+
+fn qwen3_forward_token_runtime(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, token_id: u32, pos: usize, logits: &f32, compute_logits: bool, hidden_out: &f32, hidden_out_len: usize) bool {
+    var embedding: [f32: QWEN3_FORWARD_MAX_HIDDEN] = [];
+    qwen3_copy_embedding(&embedding[0], weights.token_embedding, token_id, config.hidden_size as usize, config.vocab_size as usize);
+    return qwen3_forward_embedding_runtime(config, weights, runtime, &embedding[0] as &const f32, pos, logits, compute_logits, hidden_out, hidden_out_len);
+}
+
 
 export fn qwen3_sampler_init() Qwen3SamplerConfig {
     return Qwen3SamplerConfig{ max_new_tokens: 0, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true, verbose: false, dump_hidden: false, threads: 1, backend: qwen3_backend_default() };
@@ -1649,7 +1884,7 @@ fn qwen3_parse_bench_args(argc: i32, argv: & &byte, start_index: i32, bench: &Qw
 }
 
 export fn qwen3_runtime_init() Qwen3Runtime {
-    return Qwen3Runtime{ k_cache: null, v_cache: null, rope_cos: null, rope_sin: null, prompt_ids: null, last_hidden: null, context_capacity: 0, rope_half_dim: 0, last_hidden_len: 0, last_hidden_valid: false, prompt_count: 0, total_tokens: 0, seed: QWEN3_SAMPLER_DEFAULT_SEED, device: qwen3_device_init() };
+    return Qwen3Runtime{ k_cache: null, v_cache: null, rope_cos: null, rope_sin: null, prompt_ids: null, last_hidden: null, context_capacity: 0, rope_half_dim: 0, last_hidden_len: 0, last_hidden_valid: false, prompt_count: 0, total_tokens: 0, seed: QWEN3_SAMPLER_DEFAULT_SEED, device: qwen3_device_init(), gpu: gpu_context_init() };
 }
 
 fn qwen3_runtime_context_capacity(config: &Qwen3Config) usize {
@@ -1658,18 +1893,80 @@ fn qwen3_runtime_context_capacity(config: &Qwen3Config) usize {
     return cap;
 }
 
+fn qwen3_runtime_gpu_upload_weights(weights: &Qwen3Weights, runtime: &Qwen3Runtime) bool {
+    if runtime.device.backend != BackendKind.Cuda { return true; }
+    if !gpu_context_upload_tensor(&runtime.gpu, weights.output_norm) {
+        _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+        return false;
+    }
+    if !gpu_context_upload_tensor(&runtime.gpu, weights.output) {
+        _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+        return false;
+    }
+    var layer: u32 = 0;
+    while layer < weights.layer_count {
+        const lw: &Qwen3LayerWeights = &weights.layers[layer as usize];
+        if !gpu_context_upload_tensor(&runtime.gpu, lw.attn_norm) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_upload_tensor(&runtime.gpu, lw.q_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_upload_tensor(&runtime.gpu, lw.k_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_upload_tensor(&runtime.gpu, lw.v_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_upload_tensor(&runtime.gpu, lw.o_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if lw.q_norm != null && !gpu_context_upload_tensor(&runtime.gpu, lw.q_norm) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if lw.k_norm != null && !gpu_context_upload_tensor(&runtime.gpu, lw.k_norm) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_upload_tensor(&runtime.gpu, lw.ffn_norm) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_upload_tensor(&runtime.gpu, lw.gate_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_upload_tensor(&runtime.gpu, lw.up_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_upload_tensor(&runtime.gpu, lw.down_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        layer = layer + 1;
+    }
+    gpu_context_refresh_stats(&runtime.gpu);
+    return true;
+}
+
+fn qwen3_runtime_backend_open(weights: &Qwen3Weights, runtime: &Qwen3Runtime) bool {
+    if runtime.device.backend != BackendKind.Cuda { return true; }
+    if runtime.device.index != 0 {
+        _ = printf("error: backend=cuda first version only supports device.index=0 requested=%u\n", runtime.device.index);
+        return false;
+    }
+    if !qwen3_validate_cuda_runtime_dtypes(weights) { return false; }
+    if !gpu_context_open(runtime.device.index, &runtime.gpu) {
+        _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+        return false;
+    }
+    if !gpu_context_smoke(&runtime.gpu) {
+        _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+        gpu_context_close(&runtime.gpu);
+        return false;
+    }
+    if !qwen3_runtime_gpu_upload_weights(weights, runtime) {
+        gpu_context_close(&runtime.gpu);
+        return false;
+    }
+    return true;
+}
+
 fn qwen3_runtime_alloc(config: &Qwen3Config, runtime: &Qwen3Runtime) bool {
     const kv_dim: usize = (config.kv_head_count * config.head_dim) as usize;
     const context_capacity: usize = qwen3_runtime_context_capacity(config);
     const cache_count: usize = (config.layer_count as usize) * context_capacity * kv_dim;
-    runtime.k_cache = calloc(cache_count, 4) as &f32;
-    runtime.v_cache = calloc(cache_count, 4) as &f32;
+    const use_device_kv: bool = runtime.device.backend == BackendKind.Cuda;
+    if use_device_kv {
+        runtime.k_cache = null;
+        runtime.v_cache = null;
+    } else {
+        runtime.k_cache = calloc(cache_count, 4) as &f32;
+        runtime.v_cache = calloc(cache_count, 4) as &f32;
+    }
     runtime.prompt_ids = calloc(context_capacity, 4) as &u32;
     runtime.last_hidden = calloc(config.hidden_size as usize, 4) as &f32;
-    if runtime.k_cache == null || runtime.v_cache == null || runtime.prompt_ids == null || runtime.last_hidden == null {
+    if (!use_device_kv && (runtime.k_cache == null || runtime.v_cache == null)) || runtime.prompt_ids == null || runtime.last_hidden == null {
         _ = printf("error: qwen3 runtime allocation failed cache_floats=%zu runtime_context=%zu kv_dim=%zu hidden=%u\n", cache_count, context_capacity, kv_dim, config.hidden_size);
         free(runtime.k_cache as &void); free(runtime.v_cache as &void); free(runtime.prompt_ids as &void); free(runtime.last_hidden as &void);
-        runtime[0] = qwen3_runtime_init();
+        runtime.k_cache = null;
+        runtime.v_cache = null;
+        runtime.prompt_ids = null;
+        runtime.last_hidden = null;
         return false;
     }
     runtime.context_capacity = context_capacity;
@@ -1677,7 +1974,20 @@ fn qwen3_runtime_alloc(config: &Qwen3Config, runtime: &Qwen3Runtime) bool {
     runtime.last_hidden_valid = false;
     if !qwen3_precompute_rope(config, runtime) {
         free(runtime.k_cache as &void); free(runtime.v_cache as &void); free(runtime.prompt_ids as &void); free(runtime.last_hidden as &void);
-        runtime[0] = qwen3_runtime_init();
+        runtime.k_cache = null;
+        runtime.v_cache = null;
+        runtime.prompt_ids = null;
+        runtime.last_hidden = null;
+        return false;
+    }
+    if use_device_kv && !gpu_context_prepare_attention(&runtime.gpu, config.layer_count as usize, context_capacity, kv_dim) {
+        _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+        free(runtime.prompt_ids as &void); free(runtime.last_hidden as &void);
+        free(runtime.rope_cos as &void); free(runtime.rope_sin as &void);
+        runtime.prompt_ids = null;
+        runtime.last_hidden = null;
+        runtime.rope_cos = null;
+        runtime.rope_sin = null;
         return false;
     }
     runtime.prompt_count = 0;
@@ -1693,6 +2003,7 @@ fn qwen3_runtime_free(runtime: &Qwen3Runtime) void {
     if runtime.rope_sin != null { free(runtime.rope_sin as &void); }
     if runtime.prompt_ids != null { free(runtime.prompt_ids as &void); }
     if runtime.last_hidden != null { free(runtime.last_hidden as &void); }
+    gpu_context_close(&runtime.gpu);
     runtime[0] = qwen3_runtime_init();
 }
 
@@ -1731,6 +2042,14 @@ fn qwen3_bench_print_duration(label: &const byte, micros: u64, repetitions: u32)
     _ = printf("bench %s: ms=%llu.%03llu avg_ms=%llu.%03llu repetitions=%u\n", label, micros / (1000 as u64), micros % (1000 as u64), avg / (1000 as u64), avg % (1000 as u64), repetitions);
 }
 
+fn qwen3_bench_print_micros(label: &const byte, micros: u64, repetitions: u32) void {
+    var avg: u64 = 0;
+    if repetitions != 0 {
+        avg = micros / (repetitions as u64);
+    }
+    _ = printf("bench %s: us=%llu avg_us=%llu repetitions=%u\n", label, micros, avg, repetitions);
+}
+
 fn qwen3_bench_make_prompt_ids(seed_ids: &const u32, seed_count: usize, prompt_ids: &u32, prompt_count: usize) bool {
     if seed_count == 0 || prompt_count == 0 { return false; }
     var i: usize = 0;
@@ -1741,7 +2060,8 @@ fn qwen3_bench_make_prompt_ids(seed_ids: &const u32, seed_count: usize, prompt_i
     return true;
 }
 
-fn qwen3_bench_decode_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, logits: &f32, seed_ids: &const u32, seed_count: usize, gen_count: usize) bool {
+fn qwen3_bench_decode_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, logits: &f32, seed_ids: &const u32, seed_count: usize, gen_count: usize, first_token_us: &u64) bool {
+    first_token_us[0] = 0;
     if gen_count == 0 { return true; }
     if seed_count == 0 { return false; }
     if runtime.total_tokens + gen_count > config.context_length as usize || runtime.total_tokens + gen_count > runtime.context_capacity {
@@ -1753,7 +2073,10 @@ fn qwen3_bench_decode_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runti
         const next_id: u32 = seed_ids[i % seed_count];
         runtime.prompt_ids[runtime.total_tokens] = next_id;
         runtime.total_tokens = runtime.total_tokens + 1;
-        if !qwen3_forward_token_with_rope(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, true, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity, null as &f32, 0) { return false; }
+        var token_start_us: u64 = 0;
+        if i == 0 { token_start_us = qwen3_bench_clock_micros(); }
+        if !qwen3_forward_token_runtime(config, weights, runtime, next_id, runtime.total_tokens - 1, logits, true, null as &f32, 0) { return false; }
+        if i == 0 { first_token_us[0] = qwen3_bench_elapsed_micros(token_start_us, qwen3_bench_clock_micros()); }
         i = i + 1;
     }
     return true;
@@ -1801,7 +2124,8 @@ fn qwen3_bench_warmup(model_path: &const byte, bench: &Qwen3BenchConfig) bool {
         qwen3_close_runtime(&table, &tok, &runtime);
         return false;
     }
-    const ok: bool = qwen3_append_prompt_ids(&config, &weights, &runtime, prompt_ids as &const u32, bench.prompt_tokens as usize, logits) && qwen3_bench_decode_tokens(&config, &weights, &runtime, logits, &seed_ids[0], seed_count, bench.gen_tokens as usize);
+    var ignored_first_token_us: u64 = 0;
+    const ok: bool = qwen3_append_prompt_ids(&config, &weights, &runtime, prompt_ids as &const u32, bench.prompt_tokens as usize, logits) && qwen3_bench_decode_tokens(&config, &weights, &runtime, logits, &seed_ids[0], seed_count, bench.gen_tokens as usize, &ignored_first_token_us);
     free(prompt_ids as &void);
     qwen3_close_runtime(&table, &tok, &runtime);
     free(logits as &void);
@@ -1822,7 +2146,7 @@ export fn qwen3_append_prompt_ids(config: &Qwen3Config, weights: &Qwen3Weights, 
         const pos: usize = runtime.total_tokens;
         runtime.prompt_ids[pos] = ids[i];
         const compute_logits: bool = (i + (1 as usize)) == id_count;
-        if !qwen3_forward_token_with_rope(config, weights, ids[i], pos, runtime.k_cache, runtime.v_cache, logits, compute_logits, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity, runtime.last_hidden, runtime.last_hidden_len) { return false; }
+        if !qwen3_forward_token_runtime(config, weights, runtime, ids[i], pos, logits, compute_logits, runtime.last_hidden, runtime.last_hidden_len) { return false; }
         runtime.last_hidden_valid = true;
         runtime.total_tokens = runtime.total_tokens + 1;
         i = i + 1;
@@ -1871,7 +2195,7 @@ export fn qwen3_append_prompt_embeddings(config: &Qwen3Config, weights: &Qwen3We
         const pos: usize = runtime.total_tokens;
         runtime.prompt_ids[pos] = placeholder_id;
         const compute_logits: bool = (i + (1 as usize)) == span_count;
-        if !qwen3_forward_embedding_with_rope(config, weights, &embeddings[i * hidden_n] as &const f32, pos, runtime.k_cache, runtime.v_cache, logits, compute_logits, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity, runtime.last_hidden, runtime.last_hidden_len) {
+        if !qwen3_forward_embedding_runtime(config, weights, runtime, &embeddings[i * hidden_n] as &const f32, pos, logits, compute_logits, runtime.last_hidden, runtime.last_hidden_len) {
             return false;
         }
         runtime.last_hidden_valid = true;
@@ -1932,7 +2256,7 @@ export fn qwen3_generate_capture_timed(config: &Qwen3Config, weights: &Qwen3Weig
         const should_forward_generated: bool = preserve_final_cache || sampler.dump_hidden || !will_stop_after_token;
         if should_forward_generated {
             const compute_next_logits: bool = !will_stop_after_token;
-            if !qwen3_forward_token_with_rope(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, compute_next_logits, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity, runtime.last_hidden, runtime.last_hidden_len) { return 1; }
+            if !qwen3_forward_token_runtime(config, weights, runtime, next_id, runtime.total_tokens - 1, logits, compute_next_logits, runtime.last_hidden, runtime.last_hidden_len) { return 1; }
             runtime.last_hidden_valid = true;
             if sampler.dump_hidden {
                 _ = printf("\n");
@@ -2007,7 +2331,7 @@ export fn qwen3_generate_capture_hidden(config: &Qwen3Config, weights: &Qwen3Wei
         runtime.total_tokens = runtime.total_tokens + 1;
         const will_stop_after_token: bool = sampler.max_new_tokens != 0 && (generated + (1 as usize)) >= sampler.max_new_tokens as usize;
         const compute_next_logits: bool = !will_stop_after_token;
-        if !qwen3_forward_token_with_rope(config, weights, next_id, runtime.total_tokens - 1, runtime.k_cache, runtime.v_cache, logits, compute_next_logits, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity, runtime.last_hidden, runtime.last_hidden_len) { return 1; }
+        if !qwen3_forward_token_runtime(config, weights, runtime, next_id, runtime.total_tokens - 1, logits, compute_next_logits, runtime.last_hidden, runtime.last_hidden_len) { return 1; }
         runtime.last_hidden_valid = true;
         out_ids[generated] = next_id;
         var hidden_i: usize = 0;
@@ -2036,6 +2360,7 @@ fn qwen3_generate_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: 
 }
 
 export fn qwen3_open_runtime(path: &const byte, config: &Qwen3Config, table: &TensorWeightTable, weights: &Qwen3Weights, tok: &Tokenizer, runtime: &Qwen3Runtime) bool {
+    const requested_device: Qwen3Device = runtime.device;
     if !qwen3_backend_supported(runtime.device.backend) { return false; }
     if !qwen3_config_load_metadata(path, config) { return false; }
     table[0] = tensor_table_init();
@@ -2045,11 +2370,23 @@ export fn qwen3_open_runtime(path: &const byte, config: &Qwen3Config, table: &Te
     if !tensor_weight_table_attach_mmap(path, table) { return false; }
     weights[0] = qwen3_weights_init();
     if !qwen3_bind_weights(table, config, weights) { tensor_weight_table_detach_mmap(table); return false; }
-    if !qwen3_validate_runtime_matvec_dtypes(weights) { tensor_weight_table_detach_mmap(table); return false; }
+    if requested_device.backend == BackendKind.Cpu && !qwen3_validate_runtime_matvec_dtypes(weights) { tensor_weight_table_detach_mmap(table); return false; }
     tok[0] = tokenizer_init();
     if !tokenizer_load(path, tok) { tensor_weight_table_detach_mmap(table); return false; }
     runtime[0] = qwen3_runtime_init();
-    if !qwen3_runtime_alloc(config, runtime) { tensor_weight_table_detach_mmap(table); return false; }
+    runtime.device = requested_device;
+    if !qwen3_runtime_backend_open(weights, runtime) {
+        tokenizer_free(tok);
+        tensor_weight_table_detach_mmap(table);
+        runtime[0] = qwen3_runtime_init();
+        return false;
+    }
+    if !qwen3_runtime_alloc(config, runtime) {
+        qwen3_runtime_free(runtime);
+        tokenizer_free(tok);
+        tensor_weight_table_detach_mmap(table);
+        return false;
+    }
     return true;
 }
 
@@ -2089,6 +2426,20 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
     var load_micros: u64 = 0;
     var prompt_micros: u64 = 0;
     var decode_micros: u64 = 0;
+    var first_token_micros: u64 = 0;
+    var backend_init_micros: u64 = 0;
+    var host_to_device_bytes: u64 = 0;
+    var device_to_host_bytes: u64 = 0;
+    var weight_upload_bytes: u64 = 0;
+    var scratch_x_bytes_peak: u64 = 0;
+    var scratch_y_bytes_peak: u64 = 0;
+    var uploaded_weight_count: u64 = 0;
+    var native_quant_matvec_count: u64 = 0;
+    var staged_quant_matvec_count: u64 = 0;
+    var q8_1_x_bytes: u64 = 0;
+    var attention_kernel_calls: u64 = 0;
+    var kv_device_bytes: u64 = 0;
+    var kv_host_to_device_bytes: u64 = 0;
     var prompt_units: u64 = 0;
     var decode_units: u64 = 0;
     var summary_config: Qwen3Config = qwen3_config_init();
@@ -2155,6 +2506,12 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
             free(prompt_ids as &void);
             return 1;
         }
+        if bench.backend == BackendKind.Cuda {
+            gpu_context_refresh_stats(&runtime.gpu);
+            backend_init_micros = backend_init_micros + runtime.gpu.stats.backend_init_us;
+            weight_upload_bytes = weight_upload_bytes + runtime.gpu.stats.weight_upload_bytes;
+            if runtime.gpu.stats.uploaded_weight_count > uploaded_weight_count { uploaded_weight_count = runtime.gpu.stats.uploaded_weight_count; }
+        }
         const prompt_start: u64 = qwen3_bench_clock_micros();
         if !qwen3_append_prompt_ids(&config, &weights, &runtime, prompt_ids as &const u32, bench.prompt_tokens as usize, logits) {
             free(prompt_ids as &void);
@@ -2166,14 +2523,31 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
         prompt_units = prompt_units + (bench.prompt_tokens as u64);
 
         const decode_start: u64 = qwen3_bench_clock_micros();
-        if !qwen3_bench_decode_tokens(&config, &weights, &runtime, logits, &seed_ids[0], seed_count, bench.gen_tokens as usize) {
+        var rep_first_token_us: u64 = 0;
+        if !qwen3_bench_decode_tokens(&config, &weights, &runtime, logits, &seed_ids[0], seed_count, bench.gen_tokens as usize, &rep_first_token_us) {
             free(prompt_ids as &void);
             qwen3_close_runtime(&table, &tok, &runtime);
             free(logits as &void);
             return 1;
         }
         decode_micros = decode_micros + qwen3_bench_elapsed_micros(decode_start, qwen3_bench_clock_micros());
+        first_token_micros = first_token_micros + rep_first_token_us;
         decode_units = decode_units + (bench.gen_tokens as u64);
+        if bench.backend == BackendKind.Cuda {
+            gpu_context_refresh_stats(&runtime.gpu);
+            host_to_device_bytes = host_to_device_bytes + runtime.gpu.stats.host_to_device_bytes;
+            device_to_host_bytes = device_to_host_bytes + runtime.gpu.stats.device_to_host_bytes;
+            weight_upload_bytes = weight_upload_bytes + runtime.gpu.stats.weight_upload_bytes;
+            if runtime.gpu.stats.uploaded_weight_count > uploaded_weight_count { uploaded_weight_count = runtime.gpu.stats.uploaded_weight_count; }
+            native_quant_matvec_count = native_quant_matvec_count + runtime.gpu.stats.native_quant_matvec_count;
+            staged_quant_matvec_count = staged_quant_matvec_count + runtime.gpu.stats.staged_quant_matvec_count;
+            q8_1_x_bytes = q8_1_x_bytes + runtime.gpu.stats.q8_1_x_bytes;
+            attention_kernel_calls = attention_kernel_calls + runtime.gpu.stats.attention_kernel_calls;
+            if runtime.gpu.stats.kv_device_bytes > kv_device_bytes { kv_device_bytes = runtime.gpu.stats.kv_device_bytes; }
+            kv_host_to_device_bytes = kv_host_to_device_bytes + runtime.gpu.stats.kv_host_to_device_bytes;
+            if runtime.gpu.stats.scratch_x_bytes > scratch_x_bytes_peak { scratch_x_bytes_peak = runtime.gpu.stats.scratch_x_bytes; }
+            if runtime.gpu.stats.scratch_y_bytes > scratch_y_bytes_peak { scratch_y_bytes_peak = runtime.gpu.stats.scratch_y_bytes; }
+        }
         qwen3_close_runtime(&table, &tok, &runtime);
         free(logits as &void);
         rep = rep + 1;
@@ -2189,15 +2563,38 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
     const runtime_bytes: u64 = kv_layout.total_bytes + rope_bytes + prompt_bytes + logits_bytes;
     const peak_bytes: u64 = runtime_bytes + summary_file_size;
     var warmup_value: u32 = 0;
+    const native_quant_used: bool = native_quant_matvec_count > 0;
+    const device_attention_used: bool = attention_kernel_calls > 0;
+    var attention_backend_name: &const byte = "cpu\0" as &const byte;
+    var kv_cache_name: &const byte = "host\0" as &const byte;
     if bench.warmup { warmup_value = 1; }
+    if device_attention_used {
+        attention_backend_name = "cuda\0" as &const byte;
+        kv_cache_name = "device\0" as &const byte;
+    }
 
     _ = printf("bench config: mode=text-real backend=%s prompt_tokens=%u gen_tokens=%u repetitions=%u warmup=%u threads=%zu\n", qwen3_backend_name(bench.backend), bench.prompt_tokens, bench.gen_tokens, bench.repetitions, warmup_value, qwen3_thread_count);
     _ = printf("bench model: path=%s seed_prompt=%s seed_tokens=%zu vocab=%u context=%u hidden=%u layers=%u kv_heads=%u head_dim=%u\n", argv[2] as &const byte, bench.prompt_seed, seed_count, summary_config.vocab_size, summary_config.context_length, summary_config.hidden_size, summary_config.layer_count, summary_config.kv_head_count, summary_config.head_dim);
     qwen3_bench_print_duration("load\0" as &const byte, load_micros, bench.repetitions);
     qwen3_bench_print_rate("text_prompt\0" as &const byte, prompt_units, prompt_micros, "tokens\0" as &const byte, bench.repetitions);
     qwen3_bench_print_rate("text_decode\0" as &const byte, decode_units, decode_micros, "tokens\0" as &const byte, bench.repetitions);
+    qwen3_bench_print_micros("first_token\0" as &const byte, first_token_micros, bench.repetitions);
     _ = printf("bench memory: peak_estimate_bytes=%llu weights_mmap=%llu runtime=%llu kv=%llu rope=%llu prompt_ids=%llu logits=%llu\n", peak_bytes, summary_file_size, runtime_bytes, kv_layout.total_bytes, rope_bytes, prompt_bytes, logits_bytes);
-    _ = printf("bench optimize: hot_matvec=k_quant_uya_parallel kv_cache=contiguous rope=precomputed sampler=fixed-seed\n");
+    if bench.backend == BackendKind.Cuda {
+        if native_quant_used {
+            _ = printf("bench backend: hot_matvec=cuda_mixed_dense_q8_1_vecdot attention=%s kv_cache=%s prefill=tokenwise device_index=0 quant_path=native_q8_1_vecdot device_cache=persistent_prefix_lru_resident weights_uploaded=%llu\n", attention_backend_name, kv_cache_name, uploaded_weight_count);
+            _ = printf("bench transfer: backend_init_ms=%llu.%03llu host_to_device_bytes=%llu device_to_host_bytes=%llu weights_device_bytes=%llu scratch_x_bytes=%llu scratch_y_bytes=%llu q8_1_x_bytes=%llu native_quant_calls=%llu staged_quant_calls=%llu kv_device_bytes=%llu kv_host_to_device_bytes=%llu attention_calls=%llu\n", backend_init_micros / (1000 as u64), backend_init_micros % (1000 as u64), host_to_device_bytes, device_to_host_bytes, weight_upload_bytes, scratch_x_bytes_peak, scratch_y_bytes_peak, q8_1_x_bytes, native_quant_matvec_count, staged_quant_matvec_count, kv_device_bytes, kv_host_to_device_bytes, attention_kernel_calls);
+            _ = printf("bench optimize: hot_matvec=cuda_mixed_dense_q8_1_vecdot quant=native_q8_1_vecdot attention=%s kv_cache=%s device_cache=persistent_prefix_lru_resident rope=device_slots activations=device_slots sampler=fixed-seed\n", attention_backend_name, kv_cache_name);
+        } else {
+            _ = printf("bench backend: hot_matvec=cuda_cublas_dense attention=%s kv_cache=%s prefill=tokenwise device_index=0 quant_path=host_f16_staging device_cache=persistent_prefix_lru_resident weights_uploaded=%llu\n", attention_backend_name, kv_cache_name, uploaded_weight_count);
+            _ = printf("bench transfer: backend_init_ms=%llu.%03llu host_to_device_bytes=%llu device_to_host_bytes=%llu weights_device_bytes=%llu scratch_x_bytes=%llu scratch_y_bytes=%llu q8_1_x_bytes=%llu native_quant_calls=%llu staged_quant_calls=%llu kv_device_bytes=%llu kv_host_to_device_bytes=%llu attention_calls=%llu\n", backend_init_micros / (1000 as u64), backend_init_micros % (1000 as u64), host_to_device_bytes, device_to_host_bytes, weight_upload_bytes, scratch_x_bytes_peak, scratch_y_bytes_peak, q8_1_x_bytes, native_quant_matvec_count, staged_quant_matvec_count, kv_device_bytes, kv_host_to_device_bytes, attention_kernel_calls);
+            _ = printf("bench optimize: hot_matvec=cuda_cublas_dense quant=host_f16_staging attention=%s kv_cache=%s device_cache=persistent_prefix_lru_resident rope=device_slots activations=device_slots sampler=fixed-seed\n", attention_backend_name, kv_cache_name);
+        }
+    } else {
+        _ = printf("bench backend: hot_matvec=k_quant_uya_parallel attention=cpu kv_cache=host prefill=tokenwise device_index=cpu\n");
+        _ = printf("bench transfer: backend_init_ms=0.000 host_to_device_bytes=0 device_to_host_bytes=0 weights_device_bytes=0 scratch_x_bytes=0 scratch_y_bytes=0\n");
+        _ = printf("bench optimize: hot_matvec=k_quant_uya_parallel attention=cpu kv_cache=host rope=precomputed sampler=fixed-seed\n");
+    }
     _ = printf("bench reference_error: n/a mode=real-timing\n");
     _ = printf("bench: PASS\n");
     return 0;

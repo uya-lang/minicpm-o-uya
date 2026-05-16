@@ -1,26 +1,29 @@
 UYA ?= /home/winger/uya/uya/bin/uya
 SRC := src/main.uya
 OUT := build/minicpm-o-uya
+GPU_HELPER_SO := build/libminicpmo_gpu_helper.so
 RELEASE_CFLAGS ?= -std=c99 -O3 -march=native -fno-builtin
 UYA_GCC_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 AUDIO2AUDIO_REAL_ENCODE_PROBE_FLAG := $(if $(MINICPM_O_REAL_ENCODE_PROBE),--encode-probe,)
 
-.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture baseline-tools-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind token2wav-prompt-cache-probe token2wav-window-probe token2wav-flow-probe token2wav-real-mu-align tts-condition-probe tts-simplex-probe tts-token-align tts-seeded-baseline-record tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio-real-stream-align audio2audio-case-matrix audio2audio-real-audit audio2audio-real-input-audit audio2audio-real-text audio2audio-real-tokens audio2audio-real-wav audio2audio-real-prefix-audit audio2audio-real-prefix-text audio2audio-real-prefix-tokens audio2audio-real-prefix-wav audio2audio-real-report audio2audio-real-baseline-compare clean FORCE
+.PHONY: build build-debug build-release test fixtures inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture cuda-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture baseline-tools-fixture minicpmo-audit audio-real-bind tts-real-bind token2wav-real-bind token2wav-prompt-cache-probe token2wav-window-probe token2wav-flow-probe token2wav-real-mu-align tts-condition-probe tts-simplex-probe tts-token-align tts-seeded-baseline-record tts-merge-align text-real-align audio-real-mel-probe audio-real-encode-probe audio-real-mel-align audio-real-stream-align audio2audio-case-matrix audio2audio-real-audit audio2audio-real-input-audit audio2audio-real-text audio2audio-real-tokens audio2audio-real-wav audio2audio-real-prefix-audit audio2audio-real-prefix-text audio2audio-real-prefix-tokens audio2audio-real-prefix-wav audio2audio-real-report audio2audio-real-baseline-compare clean FORCE
 
 build: build-release
 
 build-debug:
 	mkdir -p build
 	$(UYA) build $(SRC) -o $(OUT)
+	$(CC) -shared -fPIC -O0 -g src/minicpmo/gpu_shim.c -o $(GPU_HELPER_SO) -ldl
 
 build-release:
 	mkdir -p build
 	$(UYA) build $(SRC) -o $(OUT)
 	find .uyacache -name '*.o' -delete
 	$(MAKE) -C .uyacache UYA_OUT="$(abspath $(OUT))" CC="$(CC)" CFLAGS="$(RELEASE_CFLAGS) -I." LDFLAGS="$(LDFLAGS)" -j$(UYA_GCC_JOBS)
+	$(CC) -shared -fPIC $(RELEASE_CFLAGS) src/minicpmo/gpu_shim.c -o $(GPU_HELPER_SO) -ldl
 
 test:
-	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture baseline-tools-fixture
+	$(MAKE) inspect-fixture audit-fixture tokenizer-fixture tensor-fixture kernels-fixture quant-fixture qwen3-fixture generate-fixture cuda-fixture vision-fixture audio-fixture audio-input-fixture speech-fixture audio2audio-fixture omni-fixture omni-chat-fixture stream-chat-fixture bench-fixture chat-fixture baseline-tools-fixture
 
 fixtures:
 	python3 tests/make_tiny_gguf.py
@@ -134,6 +137,21 @@ generate-fixture: FORCE build fixtures
 		exit 1; \
 	else \
 		grep -q "error: invalid generate sampler args" /tmp/minicpm-o-uya-generate-bad.out; \
+	fi
+
+cuda-fixture: FORCE build fixtures
+	@if ! command -v nvidia-smi >/dev/null 2>&1; then \
+		echo "cuda-fixture: SKIP (no nvidia-smi)"; \
+	else \
+		$(OUT) cuda-smoke >/tmp/minicpm-o-uya-cuda-smoke.out && \
+		grep -q "cuda-smoke: PASS" /tmp/minicpm-o-uya-cuda-smoke.out && \
+		$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 3 --backend cpu >/tmp/minicpm-o-uya-generate-cpu.out && \
+		$(OUT) generate tests/fixtures/tiny.gguf hello --max-new-tokens 3 --backend cuda >/tmp/minicpm-o-uya-generate-cuda.out && \
+		cmp -s /tmp/minicpm-o-uya-generate-cpu.out /tmp/minicpm-o-uya-generate-cuda.out && \
+		$(OUT) bench tests/fixtures/tiny.gguf --n-prompt 4 --n-gen 4 --repetitions 1 --no-warmup --backend cuda >/tmp/minicpm-o-uya-bench-cuda.out && \
+		grep -q "bench config: mode=text-real backend=cuda" /tmp/minicpm-o-uya-bench-cuda.out && \
+		grep -q "bench backend: hot_matvec=cuda_cublas_dense attention=cuda kv_cache=device prefill=tokenwise device_index=0 quant_path=host_f16_staging device_cache=persistent_prefix_lru_resident" /tmp/minicpm-o-uya-bench-cuda.out && \
+		grep -q "bench transfer: backend_init_ms=" /tmp/minicpm-o-uya-bench-cuda.out; \
 	fi
 
 vision-fixture: FORCE build fixtures
@@ -629,8 +647,11 @@ bench-fixture: FORCE build fixtures
 	grep -q "bench load: ms=" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench text_prompt:" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench text_decode:" /tmp/minicpm-o-uya-bench-real.out
+	grep -q "bench first_token: us=" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench memory: peak_estimate_bytes=" /tmp/minicpm-o-uya-bench-real.out
-	grep -q "bench optimize: hot_matvec=k_quant_uya_parallel kv_cache=contiguous rope=precomputed sampler=fixed-seed" /tmp/minicpm-o-uya-bench-real.out
+	grep -q "bench backend: hot_matvec=k_quant_uya_parallel attention=cpu kv_cache=host prefill=tokenwise device_index=cpu" /tmp/minicpm-o-uya-bench-real.out
+	grep -q "bench transfer: backend_init_ms=0.000 host_to_device_bytes=0 device_to_host_bytes=0 weights_device_bytes=0 scratch_x_bytes=0 scratch_y_bytes=0" /tmp/minicpm-o-uya-bench-real.out
+	grep -q "bench optimize: hot_matvec=k_quant_uya_parallel attention=cpu kv_cache=host rope=precomputed sampler=fixed-seed" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench reference_error: n/a mode=real-timing" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench: PASS" /tmp/minicpm-o-uya-bench-real.out
 

@@ -16,8 +16,25 @@
 - `BackendKind` / `Qwen3Device` 已进入 `src/minicpmo/qwen3.uya`。
 - `generate` / `chat` / `bench` 已支持 `--backend cpu|cuda`。
 - 默认后端仍是 `cpu`。
-- `cuda` 当前会明确报 `not implemented yet`。
+- `cuda` 已有第一版真实实现：Qwen3 纯文本 matvec 走 cuBLAS，attention / KV cache 仍留在 CPU。
 - `bench` 的真实 text 模式已输出 `backend=...`。
+
+## 当前一版状态
+
+这轮落地后的真实边界如下：
+
+- 支持：Linux + NVIDIA CUDA，单卡固定 `device.index = 0`，`Qwen3` 纯文本 `generate` / `chat` / `bench`。
+- CUDA 覆盖：dense `F32` matvec 直接上 GPU；dense `F16` / `BF16` 可走 CUDA；`Q4_K` / `Q6_K` 默认优先走原生 `Q8_1 + vecdot` kernel，若本机缺 NVRTC/native kernel 初始化失败则明确退回 `host_f16_staging`，因此已经能对 `MiniCPM-o-4_5-Q4_K_M.gguf` 做真 `cpu`/`cuda` 对比。
+- 仍在 CPU：token embedding lookup、sampler，以及 vision / audio / speech / token2wav / vocoder 全路径。
+- 已提供：`cuda-smoke`，tiny fixture 上的 CPU/CUDA 文本输出一致性，以及带 `backend_init_ms` / H2D / D2H / `first_token` / `quant_path` / `device_cache` 的 `bench` 输出。
+- 已提供：一组纯 Uya 的 `llama.cpp` 对齐量化参考，覆盖 `Q8_1` quantize 和 `Q4_K/Q6_K x Q8_1` vecdot，可作为后续 GPU kernel 对照基线。
+- 不做静默回退：`--backend cuda` 若命中不支持的 dtype、缺 CUDA 库、设备不可用或 kernel/BLAS 调用失败，会直接报错退出。
+
+当前主要瓶颈也已经明确暴露：
+
+- 量化权重当前主策略是 `native_q8_1_vecdot + device_cache=persistent_prefix_lru_resident`，并保留 `host_f16_staging` 作为 native kernel 不可用时的明确后备实现。
+- 在当前本机 `MiniCPM-o-4_5-Q4_K_M.gguf` 的 `1 prompt + 1 decode` 探针下，`native_q8_1_vecdot` 已把 `host_to_device_bytes` 压到约 `4.67 GB`，`text_decode` 约 `1.749 tok/s`。
+- 下一阶段最值得做的是继续削减权重上传/host-device 往返、把 sampler / embedding lookup 也逐步设备化、以及更细的 cache 策略，而不是继续扩新 modality。
 
 ---
 

@@ -52,6 +52,7 @@ Generated files:
 - `quant-fixture` for selected GGML quant kernel goldens and unsupported dtype diagnostics.
 - `qwen3-fixture` for tiny Qwen3 config/weight binding and missing tensor diagnostics.
 - `generate-fixture` for deterministic prefill/decode, KV cache writes, logits, sampler output, and hidden-state dump summaries.
+- `cuda-fixture` for `cuda-smoke`, tiny CPU/CUDA text-generation parity, and CUDA bench coverage when `nvidia-smi` is available. It self-skips on non-NVIDIA hosts so CPU-only test runs stay green.
 - `text-real-align` is manual and compares an external official text GGUF against llama.cpp `llama-completion`; it is not part of default CI.
 - `vision-fixture` for raw image tensor smoke, RGB preprocessing, image/video manifest handling, tile counts, and checksum stability.
 - `audio-real-preprocess-probe` is manual and checks real WAV/UYAP input shape, 100ms alignment, center padding, and encoder-position planning.
@@ -84,7 +85,7 @@ Tokenizer golden coverage includes English, Chinese punctuation, newline-capable
 
 Kernel smoke coverage includes F32 vector ops, F16/BF16 loads, normalization, RoPE, softmax, dense matvec, activations, Conv1D/Conv2D, and NaN/Inf/empty-length boundaries.
 
-Quant smoke coverage includes `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ4_NL` fused dequant+dot checks, row-stride `Q8_0` matvec, and unsupported dtype diagnostics with tensor name plus dtype.
+Quant smoke coverage includes `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ4_NL` fused dequant+dot checks, row-stride `Q8_0` matvec, pure-Uya `llama.cpp`-aligned `Q8_1` quantization plus `Q4_K/Q6_K x Q8_1` vecdot checks, and unsupported dtype diagnostics with tensor name plus dtype.
 
 Qwen3 binding coverage uses a tiny one-layer Qwen3-like GGUF with token embedding, output norm/head, attention projections, optional q/k norms, and FFN projections; it also checks missing tensor diagnostics include layer and tensor name.
 
@@ -123,8 +124,29 @@ bench config: mode=text-real backend=cpu prompt_tokens=4 gen_tokens=4 repetition
 bench load: ms=...
 bench text_prompt: ... tokens/s ...
 bench text_decode: ... tokens/s ...
+bench first_token: us=...
+bench backend: hot_matvec=...
+bench transfer: backend_init_ms=...
 bench reference_error: n/a mode=real-timing
 ```
+
+CUDA text-path smoke uses the same fixture:
+
+```sh
+build/minicpm-o-uya cuda-smoke
+build/minicpm-o-uya generate tests/fixtures/tiny.gguf hello --max-new-tokens 3 --backend cpu
+build/minicpm-o-uya generate tests/fixtures/tiny.gguf hello --max-new-tokens 3 --backend cuda
+build/minicpm-o-uya bench tests/fixtures/tiny.gguf --n-prompt 4 --n-gen 4 --repetitions 1 --no-warmup --backend cuda
+```
+
+Real quant-model comparison is now possible too, but the current implementation is intentionally explicit about its staging policy:
+
+```sh
+build/minicpm-o-uya bench models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf --n-prompt 1 --n-gen 1 --repetitions 1 --no-warmup --backend cpu
+build/minicpm-o-uya bench models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf --n-prompt 1 --n-gen 1 --repetitions 1 --no-warmup --backend cuda
+```
+
+The tiny CUDA bench should now say `attention=cuda` and `kv_cache=device`. On hosts where NVRTC/native quant kernels are available, real `Q4_K/Q6_K` CUDA output should additionally say `quant_path=native_q8_1_vecdot`; otherwise it should stay on the explicit `host_f16_staging` path rather than silently falling back to CPU.
 
 ## External Smoke
 
