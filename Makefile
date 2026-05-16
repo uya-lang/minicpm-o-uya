@@ -624,7 +624,7 @@ bench-fixture: FORCE build fixtures
 	grep -q "bench reference_error: text=0.000000 vision=0.000000 audio=0.000000 vocoder=0.000000" /tmp/minicpm-o-uya-bench.out
 	grep -q "omni-smoke: PASS" /tmp/minicpm-o-uya-bench.out
 	$(OUT) bench tests/fixtures/tiny.gguf --n-prompt 4 --n-gen 4 --repetitions 1 --no-warmup >/tmp/minicpm-o-uya-bench-real.out
-	grep -q "bench config: mode=text-real prompt_tokens=4 gen_tokens=4 repetitions=1 warmup=0 threads=1" /tmp/minicpm-o-uya-bench-real.out
+	grep -q "bench config: mode=text-real backend=cpu prompt_tokens=4 gen_tokens=4 repetitions=1 warmup=0 threads=1" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "seed_prompt=hello seed_tokens=1 vocab=19 context=32 hidden=8 layers=1 kv_heads=1 head_dim=4" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench load: ms=" /tmp/minicpm-o-uya-bench-real.out
 	grep -q "bench text_prompt:" /tmp/minicpm-o-uya-bench-real.out

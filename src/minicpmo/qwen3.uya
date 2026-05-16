@@ -89,6 +89,16 @@ const QWEN3_BENCH_DEFAULT_REPETITIONS: u32 = 3;
 
 var qwen3_thread_count: usize = 1;
 
+export enum BackendKind {
+    Cpu,
+    Cuda,
+}
+
+export struct Qwen3Device {
+    backend: BackendKind,
+    index: u32,
+}
+
 export struct Qwen3SamplerConfig {
     max_new_tokens: u32,
     temperature_bits: u32,
@@ -102,6 +112,7 @@ export struct Qwen3SamplerConfig {
     verbose: bool,
     dump_hidden: bool,
     threads: u32,
+    backend: BackendKind,
 }
 
 struct Qwen3BenchConfig {
@@ -111,6 +122,7 @@ struct Qwen3BenchConfig {
     threads: u32,
     warmup: bool,
     prompt_seed: &const byte,
+    backend: BackendKind,
 }
 
 struct Qwen3MatvecTask {
@@ -137,6 +149,7 @@ export struct Qwen3Runtime {
     prompt_count: usize,
     total_tokens: usize,
     seed: u32,
+    device: Qwen3Device,
 }
 
 export struct Qwen3Config {
@@ -219,6 +232,39 @@ fn qwen3_config_copy(dst: &Qwen3Config, src: &Qwen3Config) void {
 
 export fn qwen3_weights_init() Qwen3Weights {
     return Qwen3Weights{ token_embedding: null, output_norm: null, output: null, layers: [], layer_count: 0 };
+}
+
+fn qwen3_backend_default() BackendKind {
+    return BackendKind.Cpu;
+}
+
+export fn qwen3_device_init() Qwen3Device {
+    return Qwen3Device{ backend: BackendKind.Cpu, index: 0 };
+}
+
+fn qwen3_backend_name(kind: BackendKind) &const byte {
+    if kind == BackendKind.Cuda { return "cuda\0" as &const byte; }
+    return "cpu\0" as &const byte;
+}
+
+fn qwen3_parse_backend_value(text: &const byte, out: &BackendKind) bool {
+    if strcmp(text as *const byte, "cpu\0" as *const byte) == 0 {
+        *out = BackendKind.Cpu;
+        return true;
+    }
+    if strcmp(text as *const byte, "cuda\0" as *const byte) == 0 {
+        *out = BackendKind.Cuda;
+        return true;
+    }
+    return false;
+}
+
+fn qwen3_backend_supported(kind: BackendKind) bool {
+    if kind == BackendKind.Cuda {
+        _ = printf("error: backend=cuda is not implemented yet; use --backend cpu\n");
+        return false;
+    }
+    return true;
 }
 
 fn qwen3_cstr_eq(a: &const byte, b: &const byte) bool {
@@ -1367,7 +1413,7 @@ export fn qwen3_forward_token(config: &Qwen3Config, weights: &Qwen3Weights, toke
 
 
 export fn qwen3_sampler_init() Qwen3SamplerConfig {
-    return Qwen3SamplerConfig{ max_new_tokens: 0, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true, verbose: false, dump_hidden: false, threads: 1 };
+    return Qwen3SamplerConfig{ max_new_tokens: 0, temperature_bits: 0x3f800000, top_k: 1, top_p_bits: 0x3f800000, min_p_bits: 0, repeat_penalty_bits: 0x3f800000, seed: QWEN3_SAMPLER_DEFAULT_SEED, stop_token: 2, stop_on_eos: true, verbose: false, dump_hidden: false, threads: 1, backend: qwen3_backend_default() };
 }
 
 fn qwen3_bench_config_init() Qwen3BenchConfig {
@@ -1378,6 +1424,7 @@ fn qwen3_bench_config_init() Qwen3BenchConfig {
         threads: 1,
         warmup: true,
         prompt_seed: "hello\0" as &const byte,
+        backend: qwen3_backend_default(),
     };
 }
 
@@ -1555,6 +1602,10 @@ fn qwen3_parse_sampler_args(argc: i32, argv: & &byte, start_index: i32, sampler:
             if i + 1 >= argc || !qwen3_parse_u32_value(argv[i + 1] as &const byte, &sampler.threads) { return false; }
             i = i + 2; continue;
         }
+        if strcmp(argv[i] as *const byte, "--backend\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_backend_value(argv[i + 1] as &const byte, &sampler.backend) { return false; }
+            i = i + 2; continue;
+        }
         return false;
     }
     return true;
@@ -1588,13 +1639,17 @@ fn qwen3_parse_bench_args(argc: i32, argv: & &byte, start_index: i32, bench: &Qw
             bench.warmup = false;
             i = i + 1; continue;
         }
+        if strcmp(argv[i] as *const byte, "--backend\0" as *const byte) == 0 {
+            if i + 1 >= argc || !qwen3_parse_backend_value(argv[i + 1] as &const byte, &bench.backend) { return false; }
+            i = i + 2; continue;
+        }
         return false;
     }
     return true;
 }
 
 export fn qwen3_runtime_init() Qwen3Runtime {
-    return Qwen3Runtime{ k_cache: null, v_cache: null, rope_cos: null, rope_sin: null, prompt_ids: null, last_hidden: null, context_capacity: 0, rope_half_dim: 0, last_hidden_len: 0, last_hidden_valid: false, prompt_count: 0, total_tokens: 0, seed: QWEN3_SAMPLER_DEFAULT_SEED };
+    return Qwen3Runtime{ k_cache: null, v_cache: null, rope_cos: null, rope_sin: null, prompt_ids: null, last_hidden: null, context_capacity: 0, rope_half_dim: 0, last_hidden_len: 0, last_hidden_valid: false, prompt_count: 0, total_tokens: 0, seed: QWEN3_SAMPLER_DEFAULT_SEED, device: qwen3_device_init() };
 }
 
 fn qwen3_runtime_context_capacity(config: &Qwen3Config) usize {
@@ -1981,6 +2036,7 @@ fn qwen3_generate_tokens(config: &Qwen3Config, weights: &Qwen3Weights, runtime: 
 }
 
 export fn qwen3_open_runtime(path: &const byte, config: &Qwen3Config, table: &TensorWeightTable, weights: &Qwen3Weights, tok: &Tokenizer, runtime: &Qwen3Runtime) bool {
+    if !qwen3_backend_supported(runtime.device.backend) { return false; }
     if !qwen3_config_load_metadata(path, config) { return false; }
     table[0] = tensor_table_init();
     if !tensor_weight_table_load(path, table) { return false; }
@@ -2008,12 +2064,12 @@ fn qwen3_prepare_runtime(path: &const byte, prompt: &const byte, config: &Qwen3C
 
 export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
     if argc < 3 {
-        _ = printf("usage: minicpm-o-uya bench <model.gguf> [--prompt TEXT] [--n-prompt N] [--n-gen N] [--repetitions N] [--threads N] [--no-warmup]\n");
+        _ = printf("usage: minicpm-o-uya bench <model.gguf> [--prompt TEXT] [--n-prompt N] [--n-gen N] [--repetitions N] [--threads N] [--no-warmup] [--backend cpu|cuda]\n");
         return 1;
     }
     var bench: Qwen3BenchConfig = qwen3_bench_config_init();
     if !qwen3_parse_bench_args(argc, argv, 3, &bench) {
-        _ = printf("usage: minicpm-o-uya bench <model.gguf> [--prompt TEXT] [--n-prompt N] [--n-gen N] [--repetitions N] [--threads N] [--no-warmup]\n");
+        _ = printf("usage: minicpm-o-uya bench <model.gguf> [--prompt TEXT] [--n-prompt N] [--n-gen N] [--repetitions N] [--threads N] [--no-warmup] [--backend cpu|cuda]\n");
         return 1;
     }
     if bench.prompt_tokens == 0 {
@@ -2025,6 +2081,7 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
         return 1;
     }
     qwen3_set_thread_count(bench.threads);
+    if !qwen3_backend_supported(bench.backend) { return 1; }
     if bench.warmup && !qwen3_bench_warmup(argv[2] as &const byte, &bench) {
         return 1;
     }
@@ -2046,6 +2103,7 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
         var weights: Qwen3Weights = qwen3_weights_init();
         var tok: Tokenizer = tokenizer_init();
         var runtime: Qwen3Runtime = qwen3_runtime_init();
+        runtime.device.backend = bench.backend;
         const start: u64 = qwen3_bench_clock_micros();
         if !qwen3_open_runtime(argv[2] as &const byte, &config, &table, &weights, &tok, &runtime) { return 1; }
         load_micros = load_micros + qwen3_bench_elapsed_micros(start, qwen3_bench_clock_micros());
@@ -2086,6 +2144,7 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
         var weights: Qwen3Weights = qwen3_weights_init();
         var tok: Tokenizer = tokenizer_init();
         var runtime: Qwen3Runtime = qwen3_runtime_init();
+        runtime.device.backend = bench.backend;
         var logits: &f32 = qwen3_alloc_logits();
         if logits == null {
             free(prompt_ids as &void);
@@ -2132,7 +2191,7 @@ export fn qwen3_bench_args_cli(argc: i32, argv: & &byte) i32 {
     var warmup_value: u32 = 0;
     if bench.warmup { warmup_value = 1; }
 
-    _ = printf("bench config: mode=text-real prompt_tokens=%u gen_tokens=%u repetitions=%u warmup=%u threads=%zu\n", bench.prompt_tokens, bench.gen_tokens, bench.repetitions, warmup_value, qwen3_thread_count);
+    _ = printf("bench config: mode=text-real backend=%s prompt_tokens=%u gen_tokens=%u repetitions=%u warmup=%u threads=%zu\n", qwen3_backend_name(bench.backend), bench.prompt_tokens, bench.gen_tokens, bench.repetitions, warmup_value, qwen3_thread_count);
     _ = printf("bench model: path=%s seed_prompt=%s seed_tokens=%zu vocab=%u context=%u hidden=%u layers=%u kv_heads=%u head_dim=%u\n", argv[2] as &const byte, bench.prompt_seed, seed_count, summary_config.vocab_size, summary_config.context_length, summary_config.hidden_size, summary_config.layer_count, summary_config.kv_head_count, summary_config.head_dim);
     qwen3_bench_print_duration("load\0" as &const byte, load_micros, bench.repetitions);
     qwen3_bench_print_rate("text_prompt\0" as &const byte, prompt_units, prompt_micros, "tokens\0" as &const byte, bench.repetitions);
@@ -2183,7 +2242,7 @@ export fn qwen3_generate_cli(path: &const byte, prompt: &const byte) i32 {
 }
 
 export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
-    if argc < 4 { _ = printf("usage: minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose] [--dump-hidden]\n"); return 1; }
+    if argc < 4 { _ = printf("usage: minicpm-o-uya generate <model.gguf> <prompt> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose] [--dump-hidden] [--backend cpu|cuda]\n"); return 1; }
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
     var weights: Qwen3Weights = qwen3_weights_init();
@@ -2194,6 +2253,7 @@ export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
     var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
     if !qwen3_parse_sampler_args(argc, argv, 4, &sampler) { _ = printf("error: invalid generate sampler args\n"); free(logits as &void); return 1; }
     qwen3_set_thread_count(sampler.threads);
+    runtime.device.backend = sampler.backend;
     if !qwen3_open_runtime(argv[2] as &const byte, &config, &table, &weights, &tok, &runtime) { return 1; }
     if sampler.stop_on_eos && tok.eos_id != QWEN3_TOKENIZER_UNKNOWN_ID { sampler.stop_token = tok.eos_id; }
     runtime.seed = sampler.seed;
@@ -2217,24 +2277,25 @@ export fn qwen3_generate_args_cli(argc: i32, argv: & &byte) i32 {
 }
 
 export fn qwen3_chat_cli(argc: i32, argv: & &byte) i32 {
-    if argc < 3 { _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose] [--dump-hidden]\n"); return 1; }
+    if argc < 3 { _ = printf("usage: minicpm-o-uya chat <model.gguf> [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R] [--seed S] [--stop-token ID] [--threads N] [--verbose] [--dump-hidden] [--backend cpu|cuda]\n"); return 1; }
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
     var weights: Qwen3Weights = qwen3_weights_init();
     var tok: Tokenizer = tokenizer_init();
     var runtime: Qwen3Runtime = qwen3_runtime_init();
+    var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
+    if !qwen3_parse_sampler_args(argc, argv, 3, &sampler) { _ = printf("error: invalid chat sampler args\n"); return 1; }
+    if sampler.max_new_tokens == 0 { sampler.max_new_tokens = QWEN3_CHAT_DEFAULT_MAX_NEW_TOKENS; }
+    qwen3_set_thread_count(sampler.threads);
+    runtime.device.backend = sampler.backend;
     if !qwen3_open_runtime(argv[2] as &const byte, &config, &table, &weights, &tok, &runtime) { return 1; }
     if !tokenizer_chat_template_supported(&tok) {
         _ = printf("error: unsupported chat template: %s\n", &tok.chat_template[0]);
         tensor_weight_table_detach_mmap(&table);
         return 1;
     }
-    var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
     const chat_stop_token: u32 = tokenizer_chat_stop_token(&tok);
     if chat_stop_token != QWEN3_TOKENIZER_UNKNOWN_ID { sampler.stop_token = chat_stop_token; }
-    if !qwen3_parse_sampler_args(argc, argv, 3, &sampler) { _ = printf("error: invalid chat sampler args\n"); tensor_weight_table_detach_mmap(&table); return 1; }
-    if sampler.max_new_tokens == 0 { sampler.max_new_tokens = QWEN3_CHAT_DEFAULT_MAX_NEW_TOKENS; }
-    qwen3_set_thread_count(sampler.threads);
     runtime.seed = sampler.seed;
     var logits: &f32 = qwen3_alloc_logits();
     if logits == null { tensor_weight_table_detach_mmap(&table); return 1; }

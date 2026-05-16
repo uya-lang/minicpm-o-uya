@@ -47,3 +47,4 @@ fixtures/external/
 .venv-edge-tts/
 .gitignore
 outputs/
+.venv-hf/
