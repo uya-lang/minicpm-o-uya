@@ -3014,7 +3014,7 @@ export fn audio2audio_real_text_cli(llm_path: &const byte, audio_model_path: &co
     runtime.seed = sampler.seed;
 
     var audio_placeholder_id: u32 = 0;
-    if !audio_real_single_token(&tok, "<audio>\0" as &const byte, &audio_placeholder_id) {
+    if !audio_real_single_token(&tok, "<|audio|>\0" as &const byte, &audio_placeholder_id) {
         qwen3_close_runtime(&table, &tok, &runtime);
         audio_real_encoded_span_free(&user_span);
         audio_real_encoded_span_free(&ref_span);
@@ -3302,7 +3302,7 @@ fn audio2audio_real_session_generate_cli(llm_path: &const byte, audio_model_path
     runtime.seed = sampler.seed;
 
     var audio_placeholder_id: u32 = 0;
-    if !audio_real_single_token(&tok, "<audio>\0" as &const byte, &audio_placeholder_id) {
+    if !audio_real_single_token(&tok, "<|audio|>\0" as &const byte, &audio_placeholder_id) {
         qwen3_close_runtime(&table, &tok, &runtime);
         audio_real_encoded_span_free(&ref_span);
         audio_real_encoder_runtime_close(&encoder_runtime);
@@ -3424,7 +3424,7 @@ export fn audio2audio_real_text_test_prefix_cli(llm_path: &const byte, audio_mod
     runtime.seed = sampler.seed;
 
     var audio_placeholder_id: u32 = 0;
-    if !audio_real_single_token(&tok, "<audio>\0" as &const byte, &audio_placeholder_id) {
+    if !audio_real_single_token(&tok, "<|audio|>\0" as &const byte, &audio_placeholder_id) {
         qwen3_close_runtime(&table, &tok, &runtime);
         audio_real_encoded_span_free(&ref_span);
         audio_real_encoder_session_free(&session);
