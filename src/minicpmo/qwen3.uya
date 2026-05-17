@@ -136,9 +136,14 @@ const QWEN3_GPU_SLOT_LOGITS: u32 = 11;
 var qwen3_thread_count: usize = 1;
 var qwen3_matvec_pool_ptr: &void = null;
 var qwen3_matvec_pool_threads: usize = 0;
+var qwen3_cpu_q8_1_checked: bool = false;
+var qwen3_cpu_q8_1_flag: bool = false;
 
 extern "libc" fn __sync_fetch_and_add(ptr: &u64, val: u64) u64;
 extern "libc" fn __sync_synchronize() void;
+extern "libc" fn minicpmo_cpu_q8_1_cache_bytes(in_dim: usize) usize;
+extern "libc" fn minicpmo_cpu_quantize_q8_1(cache: &void, x: &const f32, in_dim: usize) i32;
+extern "libc" fn minicpmo_cpu_matvec_q8_1_range(dst: &f32, data: &const byte, dtype: i32, xq_cache: &void, in_dim: usize, out_start: usize, out_end: usize) i32;
 extern "libc" fn minicpmo_cpu_matvec_range(dst: &f32, data: &const byte, dtype: i32, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) i32;
 
 export enum BackendKind {
@@ -198,6 +203,9 @@ struct Qwen3MatvecPool {
     in_dim: usize,
     out_dim: usize,
     dtype: TensorDType,
+    x_q8_1_cache: &void,
+    x_q8_1_capacity: usize,
+    x_q8_1_active: &void,
 }
 
 export struct Qwen3Runtime {
@@ -1150,6 +1158,9 @@ fn qwen3_matvec_pool_do_part(pool: &Qwen3MatvecPool, participant: u64) void {
     if pool.dtype == TensorDType.Q8_0 {
         qwen3_q8_0_matvec_range(pool.dst, pool.matrix, pool.x, pool.in_dim, start, end);
     } else if pool.dtype == TensorDType.Q4_K || pool.dtype == TensorDType.Q5_K || pool.dtype == TensorDType.Q6_K {
+        if pool.x_q8_1_active != null && (pool.dtype == TensorDType.Q4_K || pool.dtype == TensorDType.Q6_K) {
+            if minicpmo_cpu_matvec_q8_1_range(pool.dst, pool.matrix.data, pool.dtype as i32, pool.x_q8_1_active, pool.in_dim, start, end) != 0 { return; }
+        }
         _ = qwen3_k_matvec_range(pool.dst, pool.matrix, pool.x, pool.in_dim, start, end);
     } else {
         qwen3_dense_matvec_range(pool.dst, pool.matrix, pool.x, pool.in_dim, start, end);
@@ -1198,6 +1209,9 @@ fn qwen3_matvec_pool_deinit(pool: &Qwen3MatvecPool) void {
     }
     if pool.worker_args != null {
         free(pool.worker_args as &void);
+    }
+    if pool.x_q8_1_cache != null {
+        free(pool.x_q8_1_cache);
     }
 }
 
@@ -1270,10 +1284,62 @@ fn qwen3_matvec_pool_get(thread_count: usize) &Qwen3MatvecPool {
     return pool;
 }
 
+fn qwen3_cpu_q8_1_enabled() bool {
+    if qwen3_cpu_q8_1_checked {
+        return qwen3_cpu_q8_1_flag;
+    }
+    const value: &const byte = getenv("MINICPMO_CPU_Q8_1\0" as &const byte) as &const byte;
+    if value == null || value[0] == 0 {
+        qwen3_cpu_q8_1_checked = true;
+        qwen3_cpu_q8_1_flag = false;
+        return false;
+    }
+    if value[0] == 48 as byte && value[1] == 0 {
+        qwen3_cpu_q8_1_checked = true;
+        qwen3_cpu_q8_1_flag = false;
+        return false;
+    }
+    qwen3_cpu_q8_1_checked = true;
+    qwen3_cpu_q8_1_flag = true;
+    return qwen3_cpu_q8_1_flag;
+}
+
+fn qwen3_matvec_pool_prepare_q8_1(pool: &Qwen3MatvecPool, x: &const f32, in_dim: usize, dtype: TensorDType) &void {
+    if pool == null || x == null {
+        return null;
+    }
+    if !qwen3_cpu_q8_1_enabled() {
+        return null;
+    }
+    if dtype != TensorDType.Q4_K && dtype != TensorDType.Q6_K {
+        return null;
+    }
+    const bytes: usize = minicpmo_cpu_q8_1_cache_bytes(in_dim);
+    if bytes == 0 {
+        return null;
+    }
+    if pool.x_q8_1_capacity < bytes {
+        const new_cache: &void = calloc(1, bytes);
+        if new_cache == null {
+            return null;
+        }
+        if pool.x_q8_1_cache != null {
+            free(pool.x_q8_1_cache);
+        }
+        pool.x_q8_1_cache = new_cache;
+        pool.x_q8_1_capacity = bytes;
+    }
+    if minicpmo_cpu_quantize_q8_1(pool.x_q8_1_cache, x, in_dim) == 0 {
+        return null;
+    }
+    return pool.x_q8_1_cache;
+}
+
 fn qwen3_matvec_pool_run(pool: &Qwen3MatvecPool, dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize, dtype: TensorDType, participants: u64) bool {
     if pool == null || participants < 2 {
         return false;
     }
+    pool.x_q8_1_active = qwen3_matvec_pool_prepare_q8_1(pool, x, in_dim, dtype);
     pool.dst = dst;
     pool.matrix = matrix;
     pool.x = x;
