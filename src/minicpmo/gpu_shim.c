@@ -233,6 +233,14 @@ typedef struct minicpmo_gpu_context {
     size_t kv_layer_count;
     size_t kv_context_capacity;
     size_t kv_dim;
+    CUdeviceptr device_rope_cos;
+    CUdeviceptr device_rope_sin;
+    size_t device_rope_bytes;
+    const float *rope_cos_host;
+    const float *rope_sin_host;
+    size_t rope_cache_context;
+    size_t rope_cache_half_dim;
+    int rope_cache_valid;
     minicpmo_gpu_upload uploads[MINICPMO_GPU_MAX_UPLOADS];
     size_t upload_count;
     size_t current_device_bytes;
@@ -654,21 +662,29 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "    float gv = gate[idx];\n"
     "    dst[idx] = (gv / (1.0f + expf(-gv))) * up[idx];\n"
     "}\n"
-    "extern \"C\" __global__ void minicpmo_apply_rope(float *vec, int head_count, int head_dim, int pos, float freq_base, float freq_scale) {\n"
+    "extern \"C\" __global__ void minicpmo_apply_rope(float *vec, int head_count, int head_dim, int pos, float freq_base, float freq_scale, const float *rope_cos, const float *rope_sin) {\n"
     "    int h = (int) blockIdx.x;\n"
     "    int d = (int) threadIdx.x;\n"
     "    int half_dim = head_dim / 2;\n"
     "    int base = h * head_dim;\n"
     "    if (h >= head_count || d >= half_dim) { return; }\n"
     "    {\n"
-    "        float theta = 0.0f;\n"
-    "        if (pos != 0) {\n"
-    "            float exponent = ((float) (2 * d)) / ((float) head_dim);\n"
-    "            float log_base = freq_base > 0.0f ? logf(freq_base) : 0.0f;\n"
-    "            theta = ((float) pos) * freq_scale * expf(-log_base * exponent);\n"
+    "        float c;\n"
+    "        float s;\n"
+    "        if (rope_cos != 0 && rope_sin != 0) {\n"
+    "            int rope_index = pos * half_dim + d;\n"
+    "            c = rope_cos[rope_index];\n"
+    "            s = rope_sin[rope_index];\n"
+    "        } else {\n"
+    "            float theta = 0.0f;\n"
+    "            if (pos != 0) {\n"
+    "                float exponent = ((float) (2 * d)) / ((float) head_dim);\n"
+    "                float log_base = freq_base > 0.0f ? logf(freq_base) : 0.0f;\n"
+    "                theta = ((float) pos) * freq_scale * expf(-log_base * exponent);\n"
+    "            }\n"
+    "            c = cosf(theta);\n"
+    "            s = sinf(theta);\n"
     "        }\n"
-    "        float c = cosf(theta);\n"
-    "        float s = sinf(theta);\n"
     "        float x0 = vec[base + d];\n"
     "        float x1 = vec[base + half_dim + d];\n"
     "        vec[base + d] = x0 * c - x1 * s;\n"
@@ -2024,6 +2040,77 @@ static int minicpmo_gpu_ensure_slot(
     return 1;
 }
 
+static int minicpmo_gpu_ensure_rope_table(
+    minicpmo_gpu_context *ctx,
+    const float *rope_cos,
+    const float *rope_sin,
+    size_t rope_context,
+    size_t half_dim,
+    char *error,
+    size_t error_cap) {
+    size_t count;
+    size_t bytes;
+    if (ctx == NULL) {
+        minicpmo_gpu_copy_error(error, error_cap, "error: null gpu rope cache context");
+        return 0;
+    }
+    if (rope_cos == NULL || rope_sin == NULL) {
+        ctx->rope_cache_valid = 0;
+        return 1;
+    }
+    if (half_dim == 0 || rope_context == 0 || half_dim > ((size_t) -1) / rope_context) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: invalid gpu rope cache size");
+        return 0;
+    }
+    count = rope_context * half_dim;
+    bytes = count * sizeof(float);
+    if (bytes / sizeof(float) != count) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: invalid gpu rope cache size");
+        return 0;
+    }
+    if (ctx->rope_cache_valid &&
+        ctx->rope_cos_host == rope_cos &&
+        ctx->rope_sin_host == rope_sin &&
+        ctx->rope_cache_context == rope_context &&
+        ctx->rope_cache_half_dim == half_dim &&
+        ctx->device_rope_bytes >= bytes) {
+        return 1;
+    }
+    if (ctx->device_rope_cos == 0 || ctx->device_rope_sin == 0 || ctx->device_rope_bytes < bytes) {
+        if (ctx->device_rope_cos != 0) {
+            ctx->cuda_mem_free(ctx->device_rope_cos);
+            ctx->device_rope_cos = 0;
+        }
+        if (ctx->device_rope_sin != 0) {
+            ctx->cuda_mem_free(ctx->device_rope_sin);
+            ctx->device_rope_sin = 0;
+        }
+        ctx->device_rope_bytes = 0;
+        ctx->rope_cache_valid = 0;
+        if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_mem_alloc(&ctx->device_rope_cos, bytes), "rope_cos_malloc", error, error_cap)) {
+            return 0;
+        }
+        if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_mem_alloc(&ctx->device_rope_sin, bytes), "rope_sin_malloc", error, error_cap)) {
+            ctx->cuda_mem_free(ctx->device_rope_cos);
+            ctx->device_rope_cos = 0;
+            return 0;
+        }
+        ctx->device_rope_bytes = bytes;
+    }
+    if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_memcpy_hto_d(ctx->device_rope_cos, rope_cos, bytes), "rope_cos_copy_h2d", error, error_cap) ||
+        !minicpmo_gpu_cuda_check(ctx, ctx->cuda_memcpy_hto_d(ctx->device_rope_sin, rope_sin, bytes), "rope_sin_copy_h2d", error, error_cap)) {
+        ctx->rope_cache_valid = 0;
+        return 0;
+    }
+    ctx->stats.host_to_device_bytes += (uint64_t) (bytes * 2u);
+    ctx->rope_cos_host = rope_cos;
+    ctx->rope_sin_host = rope_sin;
+    ctx->rope_cache_context = rope_context;
+    ctx->rope_cache_half_dim = half_dim;
+    ctx->rope_cache_valid = 1;
+    return 1;
+}
+
 static int minicpmo_gpu_cuda_type_for_dtype(int dtype) {
     if (dtype == 0) {
         return CUDA_R_32F;
@@ -2286,6 +2373,14 @@ void minicpmo_gpu_context_destroy(void *handle) {
         if (ctx->scratch_y != 0) {
             ctx->cuda_mem_free(ctx->scratch_y);
             ctx->scratch_y = 0;
+        }
+        if (ctx->device_rope_cos != 0) {
+            ctx->cuda_mem_free(ctx->device_rope_cos);
+            ctx->device_rope_cos = 0;
+        }
+        if (ctx->device_rope_sin != 0) {
+            ctx->cuda_mem_free(ctx->device_rope_sin);
+            ctx->device_rope_sin = 0;
         }
     }
     if (ctx->cublas_destroy != NULL && ctx->cublas_handle != NULL) {
@@ -3360,24 +3455,41 @@ int minicpmo_gpu_context_slot_rope(
     size_t pos,
     float freq_base,
     float freq_scale,
+    const float *rope_cos,
+    const float *rope_sin,
+    size_t rope_context,
     char *error,
     size_t error_cap) {
     minicpmo_gpu_context *ctx = (minicpmo_gpu_context *) handle;
     int head_count_i;
     int head_dim_i;
     int pos_i;
-    void *args[6];
+    CUdeviceptr rope_cos_device = 0;
+    CUdeviceptr rope_sin_device = 0;
+    void *args[8];
     size_t bytes = head_count * head_dim * sizeof(float);
+    size_t half_dim = head_dim / 2u;
     if (ctx == NULL) {
         minicpmo_gpu_copy_error(error, error_cap, "error: null gpu rope context");
         return 0;
     }
-    if (head_count == 0 || head_dim == 0 || slot >= MINICPMO_GPU_SLOT_COUNT || head_dim / 2 > MINICPMO_GPU_VECTOR_THREADS || ctx->slots[slot].device_ptr == 0 || ctx->slots[slot].bytes < bytes) {
+    if (head_count == 0 || head_dim == 0 || slot >= MINICPMO_GPU_SLOT_COUNT || half_dim > MINICPMO_GPU_VECTOR_THREADS || ctx->slots[slot].device_ptr == 0 || ctx->slots[slot].bytes < bytes) {
         minicpmo_gpu_set_error(ctx, error, error_cap, "error: invalid gpu rope arguments");
         return 0;
     }
     if (!minicpmo_gpu_prepare_quant_kernels(ctx, error, error_cap) || ctx->rope_fn == NULL) {
         return 0;
+    }
+    if (rope_cos != NULL && rope_sin != NULL) {
+        if (pos >= rope_context) {
+            minicpmo_gpu_set_error(ctx, error, error_cap, "error: gpu rope position exceeds table context");
+            return 0;
+        }
+        if (!minicpmo_gpu_ensure_rope_table(ctx, rope_cos, rope_sin, rope_context, half_dim, error, error_cap)) {
+            return 0;
+        }
+        rope_cos_device = ctx->device_rope_cos;
+        rope_sin_device = ctx->device_rope_sin;
     }
     head_count_i = (int) head_count;
     head_dim_i = (int) head_dim;
@@ -3388,6 +3500,8 @@ int minicpmo_gpu_context_slot_rope(
     args[3] = &pos_i;
     args[4] = &freq_base;
     args[5] = &freq_scale;
+    args[6] = &rope_cos_device;
+    args[7] = &rope_sin_device;
     if (!minicpmo_gpu_cuda_check(
             ctx,
             ctx->cuda_launch_kernel(

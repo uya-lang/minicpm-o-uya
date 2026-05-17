@@ -45,7 +45,7 @@ extern "libc" fn minicpmo_gpu_context_slot_matvec2(handle: &void, dst_slot0: u32
 extern "libc" fn minicpmo_gpu_context_slot_matvec3(handle: &void, dst_slot0: u32, tensor_name0: &const byte, host_ptr0: &const byte, dtype0: i32, out_dim0: usize, dst_slot1: u32, tensor_name1: &const byte, host_ptr1: &const byte, dtype1: i32, out_dim1: usize, dst_slot2: u32, tensor_name2: &const byte, host_ptr2: &const byte, dtype2: i32, out_dim2: usize, src_slot: u32, in_dim: usize, err_text: &byte, error_cap: usize) i32;
 extern "libc" fn minicpmo_gpu_context_slot_rms_norm(handle: &void, dst_slot: u32, src_slot: u32, weight_host_ptr: &const byte, n: usize, eps: f32, err_text: &byte, error_cap: usize) i32;
 extern "libc" fn minicpmo_gpu_context_slot_head_norm(handle: &void, slot: u32, weight_host_ptr: &const byte, head_count: usize, head_dim: usize, err_text: &byte, error_cap: usize) i32;
-extern "libc" fn minicpmo_gpu_context_slot_rope(handle: &void, slot: u32, head_count: usize, head_dim: usize, pos: usize, freq_base: f32, freq_scale: f32, err_text: &byte, error_cap: usize) i32;
+extern "libc" fn minicpmo_gpu_context_slot_rope(handle: &void, slot: u32, head_count: usize, head_dim: usize, pos: usize, freq_base: f32, freq_scale: f32, rope_cos: &const f32, rope_sin: &const f32, rope_context: usize, err_text: &byte, error_cap: usize) i32;
 extern "libc" fn minicpmo_gpu_context_slot_add_inplace(handle: &void, dst_slot: u32, src_slot: u32, len: usize, err_text: &byte, error_cap: usize) i32;
 extern "libc" fn minicpmo_gpu_context_slot_silu_mul(handle: &void, dst_slot: u32, gate_slot: u32, up_slot: u32, len: usize, err_text: &byte, error_cap: usize) i32;
 extern "libc" fn minicpmo_gpu_context_attention_slots(handle: &void, dst_slot: u32, q_slot: u32, k_slot: u32, v_slot: u32, layer: usize, pos: usize, head_count: usize, kv_head_count: usize, head_dim: usize, context_capacity: usize, err_text: &byte, error_cap: usize) i32;
@@ -253,10 +253,10 @@ export fn gpu_context_slot_head_norm(ctx: &GpuContext, slot: u32, weight: &Tenso
     return true;
 }
 
-export fn gpu_context_slot_rope(ctx: &GpuContext, slot: u32, head_count: usize, head_dim: usize, pos: usize, freq_base: f32, freq_scale: f32) bool {
+export fn gpu_context_slot_rope(ctx: &GpuContext, slot: u32, head_count: usize, head_dim: usize, pos: usize, freq_base: f32, freq_scale: f32, rope_cos: &const f32, rope_sin: &const f32, rope_context: usize) bool {
     gpu_context_error_reset(ctx);
     if ctx.handle == null { return false; }
-    if minicpmo_gpu_context_slot_rope(ctx.handle, slot, head_count, head_dim, pos, freq_base, freq_scale, &ctx.last_error[0], GPU_ERROR_CAP) == 0 {
+    if minicpmo_gpu_context_slot_rope(ctx.handle, slot, head_count, head_dim, pos, freq_base, freq_scale, rope_cos, rope_sin, rope_context, &ctx.last_error[0], GPU_ERROR_CAP) == 0 {
         return false;
     }
     gpu_context_refresh_stats(ctx);

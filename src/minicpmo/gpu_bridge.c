@@ -38,7 +38,7 @@ typedef int (*minicpmo_gpu_context_slot_matvec2_fn)(void *, unsigned int, const 
 typedef int (*minicpmo_gpu_context_slot_matvec3_fn)(void *, unsigned int, const char *, const void *, int, size_t, unsigned int, const char *, const void *, int, size_t, unsigned int, const char *, const void *, int, size_t, unsigned int, size_t, char *, size_t);
 typedef int (*minicpmo_gpu_context_slot_rms_norm_fn)(void *, unsigned int, unsigned int, const void *, size_t, float, char *, size_t);
 typedef int (*minicpmo_gpu_context_slot_head_norm_fn)(void *, unsigned int, const void *, size_t, size_t, char *, size_t);
-typedef int (*minicpmo_gpu_context_slot_rope_fn)(void *, unsigned int, size_t, size_t, size_t, float, float, char *, size_t);
+typedef int (*minicpmo_gpu_context_slot_rope_fn)(void *, unsigned int, size_t, size_t, size_t, float, float, const float *, const float *, size_t, char *, size_t);
 typedef int (*minicpmo_gpu_context_slot_add_inplace_fn)(void *, unsigned int, unsigned int, size_t, char *, size_t);
 typedef int (*minicpmo_gpu_context_slot_silu_mul_fn)(void *, unsigned int, unsigned int, unsigned int, size_t, char *, size_t);
 typedef int (*minicpmo_gpu_context_attention_slots_fn)(void *, unsigned int, unsigned int, unsigned int, unsigned int, size_t, size_t, size_t, size_t, size_t, size_t, char *, size_t);
@@ -83,7 +83,7 @@ int minicpmo_gpu_context_slot_matvec2(void *handle, unsigned int dst_slot0, cons
 int minicpmo_gpu_context_slot_matvec3(void *handle, unsigned int dst_slot0, const char *tensor_name0, const void *host_ptr0, int dtype0, size_t out_dim0, unsigned int dst_slot1, const char *tensor_name1, const void *host_ptr1, int dtype1, size_t out_dim1, unsigned int dst_slot2, const char *tensor_name2, const void *host_ptr2, int dtype2, size_t out_dim2, unsigned int src_slot, size_t in_dim, char *error, size_t error_cap);
 int minicpmo_gpu_context_slot_rms_norm(void *handle, unsigned int dst_slot, unsigned int src_slot, const void *weight_host_ptr, size_t n, float eps, char *error, size_t error_cap);
 int minicpmo_gpu_context_slot_head_norm(void *handle, unsigned int slot, const void *weight_host_ptr, size_t head_count, size_t head_dim, char *error, size_t error_cap);
-int minicpmo_gpu_context_slot_rope(void *handle, unsigned int slot, size_t head_count, size_t head_dim, size_t pos, float freq_base, float freq_scale, char *error, size_t error_cap);
+int minicpmo_gpu_context_slot_rope(void *handle, unsigned int slot, size_t head_count, size_t head_dim, size_t pos, float freq_base, float freq_scale, const float *rope_cos, const float *rope_sin, size_t rope_context, char *error, size_t error_cap);
 int minicpmo_gpu_context_slot_add_inplace(void *handle, unsigned int dst_slot, unsigned int src_slot, size_t len, char *error, size_t error_cap);
 int minicpmo_gpu_context_slot_silu_mul(void *handle, unsigned int dst_slot, unsigned int gate_slot, unsigned int up_slot, size_t len, char *error, size_t error_cap);
 int minicpmo_gpu_context_attention_slots(void *handle, unsigned int dst_slot, unsigned int q_slot, unsigned int k_slot, unsigned int v_slot, size_t layer, size_t pos, size_t head_count, size_t kv_head_count, size_t head_dim, size_t context_capacity, char *error, size_t error_cap);
@@ -275,11 +275,11 @@ int minicpmo_gpu_context_slot_head_norm(void *handle, unsigned int slot, const v
     return minicpmo_gpu_helper.slot_head_norm(handle, slot, weight_host_ptr, head_count, head_dim, error, error_cap);
 }
 
-int minicpmo_gpu_context_slot_rope(void *handle, unsigned int slot, size_t head_count, size_t head_dim, size_t pos, float freq_base, float freq_scale, char *error, size_t error_cap) {
+int minicpmo_gpu_context_slot_rope(void *handle, unsigned int slot, size_t head_count, size_t head_dim, size_t pos, float freq_base, float freq_scale, const float *rope_cos, const float *rope_sin, size_t rope_context, char *error, size_t error_cap) {
     if (!minicpmo_gpu_bridge_open(error, error_cap)) {
         return 0;
     }
-    return minicpmo_gpu_helper.slot_rope(handle, slot, head_count, head_dim, pos, freq_base, freq_scale, error, error_cap);
+    return minicpmo_gpu_helper.slot_rope(handle, slot, head_count, head_dim, pos, freq_base, freq_scale, rope_cos, rope_sin, rope_context, error, error_cap);
 }
 
 int minicpmo_gpu_context_slot_add_inplace(void *handle, unsigned int dst_slot, unsigned int src_slot, size_t len, char *error, size_t error_cap) {

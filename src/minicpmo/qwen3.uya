@@ -1785,8 +1785,8 @@ fn qwen3_forward_embedding_runtime_cuda(config: &Qwen3Config, weights: &Qwen3Wei
         if !gpu_context_slot_matvec3(&runtime.gpu, QWEN3_GPU_SLOT_Q, lw.q_proj, q_dim, QWEN3_GPU_SLOT_K, lw.k_proj, kv_dim, QWEN3_GPU_SLOT_V, lw.v_proj, kv_dim, QWEN3_GPU_SLOT_NORMED, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if lw.q_norm != null && !gpu_context_slot_head_norm(&runtime.gpu, QWEN3_GPU_SLOT_Q, lw.q_norm, head_count, head_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if lw.k_norm != null && !gpu_context_slot_head_norm(&runtime.gpu, QWEN3_GPU_SLOT_K, lw.k_norm, kv_head_count, head_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_slot_rope(&runtime.gpu, QWEN3_GPU_SLOT_Q, head_count, head_dim, pos, rope_freq_base, rope_freq_scale) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_slot_rope(&runtime.gpu, QWEN3_GPU_SLOT_K, kv_head_count, head_dim, pos, rope_freq_base, rope_freq_scale) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_rope(&runtime.gpu, QWEN3_GPU_SLOT_Q, head_count, head_dim, pos, rope_freq_base, rope_freq_scale, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_rope(&runtime.gpu, QWEN3_GPU_SLOT_K, kv_head_count, head_dim, pos, rope_freq_base, rope_freq_scale, runtime.rope_cos, runtime.rope_sin, runtime.context_capacity) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if !gpu_context_attention_slots(&runtime.gpu, QWEN3_GPU_SLOT_ATTN_CTX, QWEN3_GPU_SLOT_Q, QWEN3_GPU_SLOT_K, QWEN3_GPU_SLOT_V, layer, pos, head_count, kv_head_count, head_dim, runtime.context_capacity) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_ATTN_OUT, lw.o_proj, QWEN3_GPU_SLOT_ATTN_CTX, q_dim, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if !gpu_context_slot_add_inplace(&runtime.gpu, QWEN3_GPU_SLOT_HIDDEN, QWEN3_GPU_SLOT_ATTN_OUT, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
@@ -2346,6 +2346,7 @@ fn qwen3_bench_warmup(model_path: &const byte, bench: &Qwen3BenchConfig) bool {
     var weights: Qwen3Weights = qwen3_weights_init();
     var tok: Tokenizer = tokenizer_init();
     var runtime: Qwen3Runtime = qwen3_runtime_init();
+    runtime.device.backend = bench.backend;
     var logits: &f32 = qwen3_alloc_logits();
     if logits == null { return false; }
     var seed_ids: [u32: QWEN3_BENCH_SEED_CAP] = [];
