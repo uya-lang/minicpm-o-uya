@@ -108,9 +108,9 @@ const QWEN3_FORWARD_MAX_PROMPT: usize = 256;
 const QWEN3_FORWARD_EPS: f32 = 0.000001;
 const QWEN3_DEFAULT_ROPE_FREQ_BASE: f32 = 1000000.0;
 const QWEN3_SAMPLER_DEFAULT_SEED: u32 = 1;
-const QWEN3_CHAT_LINE_CAP: usize = 512;
-const QWEN3_CHAT_TURN_CAP: usize = 1024;
-const QWEN3_CHAT_DEFAULT_MAX_NEW_TOKENS: u32 = 512;
+const QWEN3_CHAT_LINE_CAP: usize = 4096;
+const QWEN3_CHAT_MESSAGE_CAP: usize = 8192;
+const QWEN3_CHAT_TURN_CAP: usize = 12288;
 const QWEN3_GENERATED_TEXT_CAP: usize = 4096;
 const QWEN3_TOKENIZER_UNKNOWN_ID: u32 = 4294967295;
 const QWEN3_MAX_THREADS: usize = 64;
@@ -147,6 +147,7 @@ extern "libc" fn minicpmo_cpu_q8_1_cache_bytes(in_dim: usize) usize;
 extern "libc" fn minicpmo_cpu_quantize_q8_1(cache: &void, x: &const f32, in_dim: usize) i32;
 extern "libc" fn minicpmo_cpu_matvec_q8_1_range(dst: &f32, data: &const byte, dtype: i32, xq_cache: &void, in_dim: usize, out_start: usize, out_end: usize) i32;
 extern "libc" fn minicpmo_cpu_matvec_range(dst: &f32, data: &const byte, dtype: i32, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) i32;
+extern "libc" fn minicpmo_cpu_read_line(prompt: &const byte, out: &byte, cap: usize) i32;
 
 export enum BackendKind {
     Cpu,
@@ -182,6 +183,13 @@ struct Qwen3BenchConfig {
     warmup: bool,
     prompt_seed: &const byte,
     backend: BackendKind,
+}
+
+struct Qwen3TextRenderState {
+    pending_escape: bool,
+    pending_escaped_backslash: bool,
+    in_code_fence: bool,
+    backtick_run: usize,
 }
 
 struct Qwen3MatvecWorkerArg {
@@ -352,6 +360,97 @@ fn qwen3_copy_cstr(dest: &byte, dest_cap: usize, src: &const byte) void {
         i = i + 1;
     }
     dest[i] = 0;
+}
+
+fn qwen3_text_render_state_init() Qwen3TextRenderState {
+    return Qwen3TextRenderState{ pending_escape: false, pending_escaped_backslash: false, in_code_fence: false, backtick_run: 0 };
+}
+
+fn qwen3_text_render_note_char(state: &Qwen3TextRenderState, ch: byte) void {
+    if ch == 96 {
+        state.backtick_run = state.backtick_run + 1;
+        if state.backtick_run == 3 {
+            state.in_code_fence = !state.in_code_fence;
+            state.backtick_run = 0;
+        }
+    } else {
+        state.backtick_run = 0;
+    }
+}
+
+fn qwen3_text_render_put_char(state: &Qwen3TextRenderState, ch: byte) void {
+    _ = printf("%c", ch as i32);
+    qwen3_text_render_note_char(state, ch);
+}
+
+fn qwen3_text_render_piece(state: &Qwen3TextRenderState, text: &const byte) void {
+    var i: usize = 0;
+    while text[i] != 0 {
+        const ch: byte = text[i];
+        if state.pending_escaped_backslash {
+            state.pending_escaped_backslash = false;
+            if !state.in_code_fence && ch == 110 {
+                qwen3_text_render_put_char(state, 10 as byte);
+                i = i + 1;
+                continue;
+            }
+            if !state.in_code_fence && ch == 116 {
+                qwen3_text_render_put_char(state, 9 as byte);
+                i = i + 1;
+                continue;
+            }
+            qwen3_text_render_put_char(state, 92 as byte);
+        }
+        if state.pending_escape {
+            state.pending_escape = false;
+            if ch == 92 {
+                if state.in_code_fence {
+                    qwen3_text_render_put_char(state, 92 as byte);
+                } else {
+                    state.pending_escaped_backslash = true;
+                }
+                i = i + 1;
+                continue;
+            }
+            if ch == 34 {
+                qwen3_text_render_put_char(state, 34 as byte);
+                i = i + 1;
+                continue;
+            }
+            if !state.in_code_fence && ch == 110 {
+                qwen3_text_render_put_char(state, 10 as byte);
+                i = i + 1;
+                continue;
+            }
+            if !state.in_code_fence && ch == 116 {
+                qwen3_text_render_put_char(state, 9 as byte);
+                i = i + 1;
+                continue;
+            }
+            qwen3_text_render_put_char(state, 92 as byte);
+            qwen3_text_render_put_char(state, ch);
+            i = i + 1;
+            continue;
+        }
+        if ch == 92 {
+            state.pending_escape = true;
+            i = i + 1;
+            continue;
+        }
+        qwen3_text_render_put_char(state, ch);
+        i = i + 1;
+    }
+}
+
+fn qwen3_text_render_flush(state: &Qwen3TextRenderState) void {
+    if state.pending_escaped_backslash {
+        qwen3_text_render_put_char(state, 92 as byte);
+        state.pending_escaped_backslash = false;
+    }
+    if state.pending_escape {
+        qwen3_text_render_put_char(state, 92 as byte);
+        state.pending_escape = false;
+    }
 }
 
 fn qwen3_scalar_metadata_size(value_type: u32) u64 {
@@ -2460,6 +2559,8 @@ export fn qwen3_append_prompt_embeddings(config: &Qwen3Config, weights: &Qwen3We
 export fn qwen3_generate_capture_timed(config: &Qwen3Config, weights: &Qwen3Weights, runtime: &Qwen3Runtime, sampler: &Qwen3SamplerConfig, tok: &Tokenizer, logits: &f32, text_label: &const byte, preserve_final_cache: bool, capture: &byte, capture_cap: usize, capture_len: &usize, first_token_us: &u64) i32 {
     capture_len[0] = 0;
     first_token_us[0] = 0;
+    var print_label: bool = false;
+    if text_label != null && text_label[0] != 0 { print_label = true; }
     if capture_cap > 0 {
         capture[0] = 0;
     }
@@ -2467,16 +2568,22 @@ export fn qwen3_generate_capture_timed(config: &Qwen3Config, weights: &Qwen3Weig
         qwen3_print_hidden_summary("prompt hidden\0" as &const byte, runtime.total_tokens - (1 as usize), runtime.prompt_ids[runtime.total_tokens - (1 as usize)], runtime.last_hidden as &const f32, runtime.last_hidden_len);
     }
     var generated: usize = 0;
+    var render_state: Qwen3TextRenderState = qwen3_text_render_state_init();
     if sampler.verbose {
         _ = printf("threads: %zu\n", qwen3_thread_count);
     }
-    _ = printf("%s: ", text_label);
-    _ = fflush(stdout);
+    if print_label {
+        _ = printf("%s: ", text_label);
+        _ = fflush(stdout);
+    }
     const generate_start_us: u64 = qwen3_bench_clock_micros();
     while sampler.max_new_tokens == 0 || generated < sampler.max_new_tokens as usize {
         if runtime.total_tokens >= config.context_length as usize || runtime.total_tokens >= runtime.context_capacity {
+            if !print_label { qwen3_text_render_flush(&render_state); }
             _ = printf("\n");
-            _ = printf("stop: context_limit=%zu model_context=%u total_tokens=%zu\n", runtime.context_capacity, config.context_length, runtime.total_tokens);
+            if print_label || sampler.verbose {
+                _ = printf("stop: context_limit=%zu model_context=%u total_tokens=%zu\n", runtime.context_capacity, config.context_length, runtime.total_tokens);
+            }
             return 0;
         }
         const next_id: u32 = qwen3_sample(logits, config.vocab_size as usize, runtime.prompt_ids, runtime.total_tokens, sampler, &runtime.seed);
@@ -2484,8 +2591,11 @@ export fn qwen3_generate_capture_timed(config: &Qwen3Config, weights: &Qwen3Weig
             _ = printf("sampled token[%zu]: %u piece=%s\n", generated, next_id, tokenizer_piece(tok, next_id));
         }
         if next_id == sampler.stop_token {
+            if !print_label { qwen3_text_render_flush(&render_state); }
             _ = printf("\n");
-            _ = printf("stop: token=%u\n", next_id);
+            if print_label || sampler.verbose {
+                _ = printf("stop: token=%u\n", next_id);
+            }
             return 0;
         }
         var piece_text: [byte: QWEN3_GENERATED_TEXT_CAP] = [];
@@ -2499,7 +2609,11 @@ export fn qwen3_generate_capture_timed(config: &Qwen3Config, weights: &Qwen3Weig
             return 1;
         }
         if generated == 0 { first_token_us[0] = qwen3_bench_elapsed_micros(generate_start_us, qwen3_bench_clock_micros()); }
-        _ = printf("%s", &piece_text[0]);
+        if print_label {
+            _ = printf("%s", &piece_text[0]);
+        } else {
+            qwen3_text_render_piece(&render_state, &piece_text[0] as &const byte);
+        }
         _ = fflush(stdout);
         runtime.prompt_ids[runtime.total_tokens] = next_id;
         runtime.total_tokens = runtime.total_tokens + 1;
@@ -2516,8 +2630,9 @@ export fn qwen3_generate_capture_timed(config: &Qwen3Config, weights: &Qwen3Weig
         }
         generated = generated + 1;
     }
+    if !print_label { qwen3_text_render_flush(&render_state); }
     _ = printf("\n");
-    if sampler.max_new_tokens != 0 {
+    if sampler.max_new_tokens != 0 && (print_label || sampler.verbose) {
         _ = printf("stop: max_new_tokens=%u\n", sampler.max_new_tokens);
     }
     return 0;
@@ -2868,6 +2983,64 @@ fn qwen3_trim_line(line: &byte) void {
     }
 }
 
+fn qwen3_chat_print_help() void {
+    _ = printf("Available Commands:\n");
+    _ = printf("  /clear          Clear conversation context\n");
+    _ = printf("  /bye            Exit\n");
+    _ = printf("  /?, /help       Show this help\n");
+    _ = printf("\n");
+    _ = printf("Use \"\"\" to begin a multi-line message.\n");
+}
+
+fn qwen3_chat_read_line(prompt: &const byte, line: &byte) bool {
+    return minicpmo_cpu_read_line(prompt, line, QWEN3_CHAT_LINE_CAP) != 0;
+}
+
+fn qwen3_chat_reset_runtime(runtime: &Qwen3Runtime, seed: u32) void {
+    runtime.prompt_count = 0;
+    runtime.total_tokens = 0;
+    runtime.last_hidden_valid = false;
+    runtime.seed = seed;
+    if runtime.prompt_ids != null && runtime.context_capacity > 0 {
+        runtime.prompt_ids[0] = 0;
+    }
+}
+
+fn qwen3_chat_append_cstr(dest: &byte, dest_cap: usize, pos: &usize, src: &const byte) bool {
+    var i: usize = 0;
+    while src[i] != 0 {
+        if *pos + 1 >= dest_cap {
+            if dest_cap > 0 { dest[dest_cap - (1 as usize)] = 0; }
+            return false;
+        }
+        dest[*pos] = src[i];
+        *pos = *pos + 1;
+        dest[*pos] = 0;
+        i = i + 1;
+    }
+    return true;
+}
+
+fn qwen3_chat_read_multiline(line: &byte, dest: &byte, dest_cap: usize, out_closed: &bool) bool {
+    dest[0] = 0;
+    out_closed[0] = false;
+    var pos: usize = 0;
+    while qwen3_chat_read_line("... \0" as &const byte, line) {
+        qwen3_trim_line(line);
+        if qwen3_cstr_eq(line as &const byte, "\"\"\"\0" as &const byte) {
+            out_closed[0] = true;
+            return true;
+        }
+        if !qwen3_chat_append_cstr(dest, dest_cap, &pos, line as &const byte) {
+            return false;
+        }
+        if !qwen3_chat_append_cstr(dest, dest_cap, &pos, "\n\0" as &const byte) {
+            return false;
+        }
+    }
+    return true;
+}
+
 export fn qwen3_generate_cli(path: &const byte, prompt: &const byte) i32 {
     var config: Qwen3Config = qwen3_config_init();
     var table: TensorWeightTable = tensor_table_init();
@@ -2939,7 +3112,6 @@ export fn qwen3_chat_cli(argc: i32, argv: & &byte) i32 {
     var runtime: Qwen3Runtime = qwen3_runtime_init();
     var sampler: Qwen3SamplerConfig = qwen3_sampler_init();
     if !qwen3_parse_sampler_args(argc, argv, 3, &sampler) { _ = printf("error: invalid chat sampler args\n"); return 1; }
-    if sampler.max_new_tokens == 0 { sampler.max_new_tokens = QWEN3_CHAT_DEFAULT_MAX_NEW_TOKENS; }
     qwen3_set_thread_count(sampler.threads);
     runtime.device.backend = sampler.backend;
     if !qwen3_open_runtime(argv[2] as &const byte, &config, &table, &weights, &tok, &runtime) { return 1; }
@@ -2954,16 +3126,49 @@ export fn qwen3_chat_cli(argc: i32, argv: & &byte) i32 {
     var logits: &f32 = qwen3_alloc_logits();
     if logits == null { tensor_weight_table_detach_mmap(&table); return 1; }
     var line: [byte: QWEN3_CHAT_LINE_CAP] = [];
+    var message: [byte: QWEN3_CHAT_MESSAGE_CAP] = [];
     var turn_prompt: [byte: QWEN3_CHAT_TURN_CAP] = [];
     var close_previous_assistant: bool = false;
-    _ = printf("chat> ");
-    while fgets(&line[0], QWEN3_CHAT_LINE_CAP, stdin) != null {
+    while qwen3_chat_read_line(">>> \0" as &const byte, &line[0]) {
         qwen3_trim_line(&line[0]);
         if line[0] == 0 {
-            _ = printf("chat> ");
             continue;
         }
-        if !tokenizer_format_chat_prompt(&tok, &line[0] as &const byte, close_previous_assistant, &turn_prompt[0], QWEN3_CHAT_TURN_CAP) {
+        if qwen3_cstr_eq(&line[0] as &const byte, "/bye\0" as &const byte) || qwen3_cstr_eq(&line[0] as &const byte, "/exit\0" as &const byte) || qwen3_cstr_eq(&line[0] as &const byte, "/quit\0" as &const byte) {
+            break;
+        }
+        if qwen3_cstr_eq(&line[0] as &const byte, "/?\0" as &const byte) || qwen3_cstr_eq(&line[0] as &const byte, "/help\0" as &const byte) {
+            qwen3_chat_print_help();
+            continue;
+        }
+        if qwen3_cstr_eq(&line[0] as &const byte, "/clear\0" as &const byte) {
+            qwen3_chat_reset_runtime(&runtime, sampler.seed);
+            close_previous_assistant = false;
+            _ = printf("cleared\n");
+            continue;
+        }
+        var user_text: &const byte = &line[0] as &const byte;
+        if qwen3_cstr_eq(&line[0] as &const byte, "\"\"\"\0" as &const byte) {
+            var multiline_closed: bool = false;
+            if !qwen3_chat_read_multiline(&line[0], &message[0], QWEN3_CHAT_MESSAGE_CAP, &multiline_closed) {
+                _ = printf("error: multiline chat message exceeds buffer cap=%zu\n", QWEN3_CHAT_MESSAGE_CAP);
+                tensor_weight_table_detach_mmap(&table);
+                free(logits as &void);
+                return 1;
+            }
+            if !multiline_closed {
+                break;
+            }
+            if message[0] == 0 {
+                continue;
+            }
+            user_text = &message[0] as &const byte;
+        } else if line[0] == 47 {
+            _ = printf("Unknown command: %s\n", &line[0] as &const byte);
+            _ = printf("Type /? for help\n");
+            continue;
+        }
+        if !tokenizer_format_chat_prompt(&tok, user_text, close_previous_assistant, &turn_prompt[0], QWEN3_CHAT_TURN_CAP) {
             _ = printf("error: formatted chat prompt exceeds buffer cap=%zu\n", QWEN3_CHAT_TURN_CAP);
             tensor_weight_table_detach_mmap(&table);
             free(logits as &void);
@@ -2974,9 +3179,8 @@ export fn qwen3_chat_cli(argc: i32, argv: & &byte) i32 {
             free(logits as &void);
             return 1;
         }
-        if qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, logits, "assistant text\0" as &const byte, true) != 0 { tensor_weight_table_detach_mmap(&table); free(logits as &void); return 1; }
+        if qwen3_generate_tokens(&config, &weights, &runtime, &sampler, &tok, logits, "\0" as &const byte, true) != 0 { tensor_weight_table_detach_mmap(&table); free(logits as &void); return 1; }
         close_previous_assistant = true;
-        _ = printf("chat> ");
     }
     tensor_weight_table_detach_mmap(&table);
     free(logits as &void);

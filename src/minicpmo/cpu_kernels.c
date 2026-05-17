@@ -1,5 +1,13 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/select.h>
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -14,6 +22,251 @@ typedef struct {
     float s;
     int8_t qs[32];
 } minicpmo_block_q8_1;
+
+#if defined(__unix__) || defined(__APPLE__)
+static void minicpmo_write_all(int fd, const char *data, size_t len) {
+    while (len > 0) {
+        const ssize_t written = write(fd, data, len);
+        if (written <= 0) {
+            return;
+        }
+        data += (size_t) written;
+        len -= (size_t) written;
+    }
+}
+
+static size_t minicpmo_utf8_sequence_len(unsigned char first) {
+    if (first < 0x80u) {
+        return 1;
+    }
+    if (first >= 0xc2u && first <= 0xdfu) {
+        return 2;
+    }
+    if (first >= 0xe0u && first <= 0xefu) {
+        return 3;
+    }
+    if (first >= 0xf0u && first <= 0xf4u) {
+        return 4;
+    }
+    return 1;
+}
+
+static size_t minicpmo_utf8_prev_start(const char *line, size_t len) {
+    size_t start = len;
+    while (start > 0 && (((unsigned char) line[start - 1u]) & 0xc0u) == 0x80u) {
+        start -= 1u;
+    }
+    if (start == 0) {
+        return 0;
+    }
+    return start - 1u;
+}
+
+static uint32_t minicpmo_utf8_decode(const char *text, size_t len) {
+    const unsigned char c0 = (unsigned char) text[0];
+    if (c0 < 0x80u || len == 1u) {
+        return (uint32_t) c0;
+    }
+    if (len == 2u) {
+        return ((uint32_t) (c0 & 0x1fu) << 6) | (uint32_t) (((unsigned char) text[1]) & 0x3fu);
+    }
+    if (len == 3u) {
+        return ((uint32_t) (c0 & 0x0fu) << 12) | ((uint32_t) (((unsigned char) text[1]) & 0x3fu) << 6) | (uint32_t) (((unsigned char) text[2]) & 0x3fu);
+    }
+    return ((uint32_t) (c0 & 0x07u) << 18) | ((uint32_t) (((unsigned char) text[1]) & 0x3fu) << 12) | ((uint32_t) (((unsigned char) text[2]) & 0x3fu) << 6) | (uint32_t) (((unsigned char) text[3]) & 0x3fu);
+}
+
+static int minicpmo_codepoint_width(uint32_t cp) {
+    if (cp == 0 || cp < 32u || (cp >= 0x7fu && cp < 0xa0u)) {
+        return 0;
+    }
+    if (cp >= 0x1100u &&
+        (cp <= 0x115fu ||
+         cp == 0x2329u || cp == 0x232au ||
+         (cp >= 0x2e80u && cp <= 0xa4cfu && cp != 0x303fu) ||
+         (cp >= 0xac00u && cp <= 0xd7a3u) ||
+         (cp >= 0xf900u && cp <= 0xfaffu) ||
+         (cp >= 0xfe10u && cp <= 0xfe19u) ||
+         (cp >= 0xfe30u && cp <= 0xfe6fu) ||
+         (cp >= 0xff00u && cp <= 0xff60u) ||
+         (cp >= 0xffe0u && cp <= 0xffe6u) ||
+         (cp >= 0x20000u && cp <= 0x3fffdu))) {
+        return 2;
+    }
+    return 1;
+}
+
+static int minicpmo_utf8_char_width(const char *text, size_t len) {
+    const uint32_t cp = minicpmo_utf8_decode(text, len);
+    const int width = minicpmo_codepoint_width(cp);
+    return width > 0 ? width : 1;
+}
+
+static void minicpmo_erase_columns(int columns) {
+    while (columns > 0) {
+        minicpmo_write_all(STDOUT_FILENO, "\b \b", 3u);
+        columns -= 1;
+    }
+}
+
+static void minicpmo_erase_last_char(char *line, size_t *len) {
+    const size_t start = minicpmo_utf8_prev_start(line, *len);
+    const int width = minicpmo_utf8_char_width(line + start, *len - start);
+    minicpmo_erase_columns(width);
+    *len = start;
+    line[*len] = 0;
+}
+
+static void minicpmo_skip_escape_sequence(void) {
+    char ch;
+    size_t skipped = 0;
+    while (skipped < 8u) {
+        fd_set read_fds;
+        struct timeval timeout;
+        FD_ZERO(&read_fds);
+        FD_SET(STDIN_FILENO, &read_fds);
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 1000;
+        if (select(STDIN_FILENO + 1, &read_fds, NULL, NULL, &timeout) <= 0) {
+            return;
+        }
+        if (read(STDIN_FILENO, &ch, 1u) != 1) {
+            return;
+        }
+        skipped += 1u;
+        if (skipped == 1u) {
+            if (ch != '[' && ch != 'O') {
+                return;
+            }
+            continue;
+        }
+        if ((ch >= '@' && ch <= '~') || ch == 27) {
+            return;
+        }
+    }
+}
+#endif
+
+int minicpmo_cpu_read_line(const char *prompt, char *out, size_t cap) {
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+    out[0] = 0;
+#if defined(__unix__) || defined(__APPLE__)
+    if (!isatty(STDIN_FILENO)) {
+        return fgets(out, (int) cap, stdin) != NULL ? 1 : 0;
+    }
+
+    struct termios old_tio;
+    struct termios raw_tio;
+    if (tcgetattr(STDIN_FILENO, &old_tio) != 0) {
+        if (prompt != NULL) {
+            fputs(prompt, stdout);
+            fflush(stdout);
+        }
+        return fgets(out, (int) cap, stdin) != NULL ? 1 : 0;
+    }
+    raw_tio = old_tio;
+    raw_tio.c_lflag &= (tcflag_t) ~(ICANON | ECHO | ISIG);
+#if defined(IUTF8)
+    raw_tio.c_iflag |= IUTF8;
+#endif
+    raw_tio.c_cc[VMIN] = 1;
+    raw_tio.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw_tio) != 0) {
+        if (prompt != NULL) {
+            fputs(prompt, stdout);
+            fflush(stdout);
+        }
+        return fgets(out, (int) cap, stdin) != NULL ? 1 : 0;
+    }
+
+    if (prompt != NULL) {
+        minicpmo_write_all(STDOUT_FILENO, prompt, strlen(prompt));
+    }
+
+    size_t len = 0;
+    for (;;) {
+        unsigned char ch = 0;
+        if (read(STDIN_FILENO, &ch, 1u) != 1) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+            return len > 0 ? 1 : 0;
+        }
+        if (ch == '\r' || ch == '\n') {
+            out[len] = 0;
+            minicpmo_write_all(STDOUT_FILENO, "\n", 1u);
+            tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+            return 1;
+        }
+        if (ch == 3u) {
+            out[0] = 0;
+            minicpmo_write_all(STDOUT_FILENO, "^C\n", 3u);
+            tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+            return 0;
+        }
+        if (ch == 4u) {
+            if (len == 0) {
+                minicpmo_write_all(STDOUT_FILENO, "\n", 1u);
+                tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+                return 0;
+            }
+            continue;
+        }
+        if (ch == 8u || ch == 127u) {
+            if (len > 0) {
+                minicpmo_erase_last_char(out, &len);
+            }
+            continue;
+        }
+        if (ch == 21u) {
+            while (len > 0) {
+                minicpmo_erase_last_char(out, &len);
+            }
+            continue;
+        }
+        if (ch == 12u) {
+            minicpmo_write_all(STDOUT_FILENO, "\r\x1b[2K", 5u);
+            if (prompt != NULL) {
+                minicpmo_write_all(STDOUT_FILENO, prompt, strlen(prompt));
+            }
+            minicpmo_write_all(STDOUT_FILENO, out, len);
+            continue;
+        }
+        if (ch == 27u) {
+            minicpmo_skip_escape_sequence();
+            continue;
+        }
+        if (ch < 32u && ch != '\t') {
+            continue;
+        }
+
+        char seq[4];
+        size_t seq_len = minicpmo_utf8_sequence_len(ch);
+        size_t got = 1;
+        seq[0] = (char) ch;
+        while (got < seq_len) {
+            if (read(STDIN_FILENO, &seq[got], 1u) != 1) {
+                break;
+            }
+            got += 1u;
+        }
+        if (len + got >= cap) {
+            minicpmo_write_all(STDOUT_FILENO, "\a", 1u);
+            continue;
+        }
+        memcpy(out + len, seq, got);
+        len += got;
+        out[len] = 0;
+        minicpmo_write_all(STDOUT_FILENO, seq, got);
+    }
+#else
+    if (prompt != NULL) {
+        fputs(prompt, stdout);
+        fflush(stdout);
+    }
+    return fgets(out, (int) cap, stdin) != NULL ? 1 : 0;
+#endif
+}
 
 static float minicpmo_f16_to_f32(uint16_t bits) {
     const uint32_t sign = ((uint32_t) bits & 0x8000u) << 16;
