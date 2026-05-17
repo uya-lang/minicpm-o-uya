@@ -52,6 +52,8 @@ use minicpmo.gpu.gpu_context_slot_add_inplace;
 use minicpmo.gpu.gpu_context_slot_download_f32;
 use minicpmo.gpu.gpu_context_slot_head_norm;
 use minicpmo.gpu.gpu_context_slot_matvec;
+use minicpmo.gpu.gpu_context_slot_matvec2;
+use minicpmo.gpu.gpu_context_slot_matvec3;
 use minicpmo.gpu.gpu_context_slot_rms_norm;
 use minicpmo.gpu.gpu_context_slot_rope;
 use minicpmo.gpu.gpu_context_slot_silu_mul;
@@ -1758,9 +1760,7 @@ fn qwen3_forward_embedding_runtime_cuda(config: &Qwen3Config, weights: &Qwen3Wei
     while layer < config.layer_count as usize {
         const lw: &Qwen3LayerWeights = &weights.layers[layer];
         if !gpu_context_slot_rms_norm(&runtime.gpu, QWEN3_GPU_SLOT_NORMED, QWEN3_GPU_SLOT_HIDDEN, lw.attn_norm, hidden_n, QWEN3_FORWARD_EPS) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_Q, lw.q_proj, QWEN3_GPU_SLOT_NORMED, hidden_n, q_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_K, lw.k_proj, QWEN3_GPU_SLOT_NORMED, hidden_n, kv_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_V, lw.v_proj, QWEN3_GPU_SLOT_NORMED, hidden_n, kv_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_matvec3(&runtime.gpu, QWEN3_GPU_SLOT_Q, lw.q_proj, q_dim, QWEN3_GPU_SLOT_K, lw.k_proj, kv_dim, QWEN3_GPU_SLOT_V, lw.v_proj, kv_dim, QWEN3_GPU_SLOT_NORMED, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if lw.q_norm != null && !gpu_context_slot_head_norm(&runtime.gpu, QWEN3_GPU_SLOT_Q, lw.q_norm, head_count, head_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if lw.k_norm != null && !gpu_context_slot_head_norm(&runtime.gpu, QWEN3_GPU_SLOT_K, lw.k_norm, kv_head_count, head_dim) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if !gpu_context_slot_rope(&runtime.gpu, QWEN3_GPU_SLOT_Q, head_count, head_dim, pos, rope_freq_base, rope_freq_scale) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
@@ -1769,8 +1769,7 @@ fn qwen3_forward_embedding_runtime_cuda(config: &Qwen3Config, weights: &Qwen3Wei
         if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_ATTN_OUT, lw.o_proj, QWEN3_GPU_SLOT_ATTN_CTX, q_dim, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if !gpu_context_slot_add_inplace(&runtime.gpu, QWEN3_GPU_SLOT_HIDDEN, QWEN3_GPU_SLOT_ATTN_OUT, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if !gpu_context_slot_rms_norm(&runtime.gpu, QWEN3_GPU_SLOT_NORMED, QWEN3_GPU_SLOT_HIDDEN, lw.ffn_norm, hidden_n, QWEN3_FORWARD_EPS) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_GATE, lw.gate_proj, QWEN3_GPU_SLOT_NORMED, hidden_n, ffn_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_UP, lw.up_proj, QWEN3_GPU_SLOT_NORMED, hidden_n, ffn_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !gpu_context_slot_matvec2(&runtime.gpu, QWEN3_GPU_SLOT_GATE, lw.gate_proj, ffn_n, QWEN3_GPU_SLOT_UP, lw.up_proj, ffn_n, QWEN3_GPU_SLOT_NORMED, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if !gpu_context_slot_silu_mul(&runtime.gpu, QWEN3_GPU_SLOT_FUSED, QWEN3_GPU_SLOT_GATE, QWEN3_GPU_SLOT_UP, ffn_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if !gpu_context_slot_matvec(&runtime.gpu, QWEN3_GPU_SLOT_DOWN, lw.down_proj, QWEN3_GPU_SLOT_FUSED, ffn_n, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if !gpu_context_slot_add_inplace(&runtime.gpu, QWEN3_GPU_SLOT_HIDDEN, QWEN3_GPU_SLOT_DOWN, hidden_n) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }

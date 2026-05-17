@@ -203,6 +203,8 @@ typedef struct minicpmo_gpu_context {
     CUmodule quant_module;
     CUfunction q4_k_matvec_fn;
     CUfunction q6_k_matvec_fn;
+    CUfunction q4_k_matvec_multi_fn;
+    CUfunction q6_k_matvec_multi_fn;
     CUfunction q8_1_quantize_fn;
     CUfunction attention_decode_fn;
     CUfunction f32_to_f16_fn;
@@ -661,6 +663,69 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "        vec[base + tid] = vec[base + tid] * inv_shared * minicpmo_vec_weight_at(weight, weight_dtype, tid);\n"
     "    }\n"
     "}\n"
+    "extern \"C\" __device__ __forceinline__ float minicpmo_q4_k_dot_row(const unsigned char *weights, const unsigned char *xq, int row, int cols) {\n"
+    "    int tid = (int) threadIdx.x;\n"
+    "    int blocks_per_row = cols / 256;\n"
+    "    float sum = 0.0f;\n"
+    "    unsigned long long row_offset = (unsigned long long) row * (unsigned long long) blocks_per_row * 144ull;\n"
+    "    for (int block = tid; block < blocks_per_row; block += (int) blockDim.x) {\n"
+    "        const unsigned char *base = weights + row_offset + (unsigned long long) block * 144ull;\n"
+    "        const unsigned char *xq_base = xq + (unsigned long long) block * 288ull;\n"
+    "        float d = minicpmo_half_to_float((unsigned short) (base[0] | ((unsigned short) base[1] << 8)));\n"
+    "        float dmin = minicpmo_half_to_float((unsigned short) (base[2] | ((unsigned short) base[3] << 8)));\n"
+    "        const unsigned char *scales = base + 4;\n"
+    "        const unsigned char *qs = base + 16;\n"
+    "        const signed char *xqs = (const signed char *) (xq_base + 32);\n"
+    "        for (int group = 0; group < 4; ++group) {\n"
+    "            int qbase = group * 32;\n"
+    "            int q8_base0 = group * 64;\n"
+    "            int q8_base1 = q8_base0 + 32;\n"
+    "            float wd0 = d * (float) minicpmo_q4_k_scale_at(group * 2 + 0, scales);\n"
+    "            float wm0 = dmin * (float) minicpmo_q4_k_min_at(group * 2 + 0, scales);\n"
+    "            float wd1 = d * (float) minicpmo_q4_k_scale_at(group * 2 + 1, scales);\n"
+    "            float wm1 = dmin * (float) minicpmo_q4_k_min_at(group * 2 + 1, scales);\n"
+    "            float xd0 = minicpmo_q8_1_d_at(xq_base, group * 2 + 0);\n"
+    "            float xd1 = minicpmo_q8_1_d_at(xq_base, group * 2 + 1);\n"
+    "            int dot0 = 0;\n"
+    "            int dot1 = 0;\n"
+    "            int sum0 = 0;\n"
+    "            int sum1 = 0;\n"
+    "            for (int l = 0; l < 32; ++l) {\n"
+    "                int xv0 = (int) xqs[q8_base0 + l];\n"
+    "                int xv1 = (int) xqs[q8_base1 + l];\n"
+    "                dot0 += (int) (qs[qbase + l] & 15u) * xv0;\n"
+    "                dot1 += (int) (qs[qbase + l] >> 4) * xv1;\n"
+    "                sum0 += xv0;\n"
+    "                sum1 += xv1;\n"
+    "            }\n"
+    "            sum += xd0 * (wd0 * (float) dot0 - wm0 * (float) sum0);\n"
+    "            sum += xd1 * (wd1 * (float) dot1 - wm1 * (float) sum1);\n"
+    "        }\n"
+    "    }\n"
+    "    return sum;\n"
+    "}\n"
+    "extern \"C\" __global__ void minicpmo_q4_k_matvec_multi(const unsigned char *w0, const unsigned char *w1, const unsigned char *w2, const unsigned char *xq, float *d0, float *d1, float *d2, int rows0, int rows1, int rows2, int cols, int count) {\n"
+    "    int linear = (int) blockIdx.x;\n"
+    "    int row = linear;\n"
+    "    int tid = (int) threadIdx.x;\n"
+    "    const unsigned char *weights = w0;\n"
+    "    float *dst = d0;\n"
+    "    int limit1 = rows0 + rows1;\n"
+    "    __shared__ float reduce_buf[128];\n"
+    "    if (linear >= rows0) {\n"
+    "        if (count > 1 && linear < limit1) { weights = w1; dst = d1; row = linear - rows0; }\n"
+    "        else if (count > 2 && linear < limit1 + rows2) { weights = w2; dst = d2; row = linear - limit1; }\n"
+    "        else { return; }\n"
+    "    }\n"
+    "    if (weights == 0 || dst == 0) { return; }\n"
+    "    reduce_buf[tid] = minicpmo_q4_k_dot_row(weights, xq, row, cols);\n"
+    "    __syncthreads();\n"
+    "    for (int stride = (int) blockDim.x / 2; stride > 0; stride >>= 1) {\n"
+    "        if (tid < stride) { reduce_buf[tid] += reduce_buf[tid + stride]; }\n"
+    "        __syncthreads();\n"
+    "    }\n"
+    "    if (tid == 0) { dst[row] = reduce_buf[0]; }\n"
+    "}\n"
     "extern \"C\" __global__ void minicpmo_q4_k_matvec(const unsigned char *weights, const unsigned char *xq, float *dst, int rows, int cols) {\n"
     "    int row = (int) blockIdx.x;\n"
     "    int tid = (int) threadIdx.x;\n"
@@ -706,6 +771,61 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "        }\n"
     "    }\n"
     "    reduce_buf[tid] = sum;\n"
+    "    __syncthreads();\n"
+    "    for (int stride = (int) blockDim.x / 2; stride > 0; stride >>= 1) {\n"
+    "        if (tid < stride) { reduce_buf[tid] += reduce_buf[tid + stride]; }\n"
+    "        __syncthreads();\n"
+    "    }\n"
+    "    if (tid == 0) { dst[row] = reduce_buf[0]; }\n"
+    "}\n"
+    "extern \"C\" __device__ __forceinline__ float minicpmo_q6_k_dot_row(const unsigned char *weights, const unsigned char *xq, int row, int cols) {\n"
+    "    int tid = (int) threadIdx.x;\n"
+    "    int blocks_per_row = cols / 256;\n"
+    "    float sum = 0.0f;\n"
+    "    unsigned long long row_offset = (unsigned long long) row * (unsigned long long) blocks_per_row * 210ull;\n"
+    "    for (int block = tid; block < blocks_per_row; block += (int) blockDim.x) {\n"
+    "        const unsigned char *base = weights + row_offset + (unsigned long long) block * 210ull;\n"
+    "        const unsigned char *xq_base = xq + (unsigned long long) block * 288ull;\n"
+    "        const unsigned char *ql = base;\n"
+    "        const unsigned char *qh = base + 128;\n"
+    "        const signed char *sc = (const signed char *) (base + 192);\n"
+    "        float d = minicpmo_half_to_float((unsigned short) (base[208] | ((unsigned short) base[209] << 8)));\n"
+    "        const signed char *xqs = (const signed char *) (xq_base + 32);\n"
+    "        for (int n = 0; n < 256; n += 128) {\n"
+    "            float xd0 = minicpmo_q8_1_d_at(xq_base, n / 32 + 0);\n"
+    "            float xd1 = minicpmo_q8_1_d_at(xq_base, n / 32 + 1);\n"
+    "            float xd2 = minicpmo_q8_1_d_at(xq_base, n / 32 + 2);\n"
+    "            float xd3 = minicpmo_q8_1_d_at(xq_base, n / 32 + 3);\n"
+    "            for (int l = 0; l < 32; ++l) {\n"
+    "                int isv = l / 16;\n"
+    "                int q1 = ((int) (ql[n / 2 + l] & 15u) | (((int) ((qh[n / 4 + l] >> 0) & 3u)) << 4)) - 32;\n"
+    "                int q2 = ((int) (ql[n / 2 + l + 32] & 15u) | (((int) ((qh[n / 4 + l] >> 2) & 3u)) << 4)) - 32;\n"
+    "                int q3 = ((int) (ql[n / 2 + l] >> 4) | (((int) ((qh[n / 4 + l] >> 4) & 3u)) << 4)) - 32;\n"
+    "                int q4 = ((int) (ql[n / 2 + l + 32] >> 4) | (((int) ((qh[n / 4 + l] >> 6) & 3u)) << 4)) - 32;\n"
+    "                sum += xd0 * ((float) xqs[n + l]) * d * (float) sc[n / 16 + isv + 0] * (float) q1;\n"
+    "                sum += xd1 * ((float) xqs[n + 32 + l]) * d * (float) sc[n / 16 + isv + 2] * (float) q2;\n"
+    "                sum += xd2 * ((float) xqs[n + 64 + l]) * d * (float) sc[n / 16 + isv + 4] * (float) q3;\n"
+    "                sum += xd3 * ((float) xqs[n + 96 + l]) * d * (float) sc[n / 16 + isv + 6] * (float) q4;\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "    return sum;\n"
+    "}\n"
+    "extern \"C\" __global__ void minicpmo_q6_k_matvec_multi(const unsigned char *w0, const unsigned char *w1, const unsigned char *w2, const unsigned char *xq, float *d0, float *d1, float *d2, int rows0, int rows1, int rows2, int cols, int count) {\n"
+    "    int linear = (int) blockIdx.x;\n"
+    "    int row = linear;\n"
+    "    int tid = (int) threadIdx.x;\n"
+    "    const unsigned char *weights = w0;\n"
+    "    float *dst = d0;\n"
+    "    int limit1 = rows0 + rows1;\n"
+    "    __shared__ float reduce_buf[128];\n"
+    "    if (linear >= rows0) {\n"
+    "        if (count > 1 && linear < limit1) { weights = w1; dst = d1; row = linear - rows0; }\n"
+    "        else if (count > 2 && linear < limit1 + rows2) { weights = w2; dst = d2; row = linear - limit1; }\n"
+    "        else { return; }\n"
+    "    }\n"
+    "    if (weights == 0 || dst == 0) { return; }\n"
+    "    reduce_buf[tid] = minicpmo_q6_k_dot_row(weights, xq, row, cols);\n"
     "    __syncthreads();\n"
     "    for (int stride = (int) blockDim.x / 2; stride > 0; stride >>= 1) {\n"
     "        if (tid < stride) { reduce_buf[tid] += reduce_buf[tid + stride]; }\n"
@@ -950,6 +1070,8 @@ static int minicpmo_gpu_prepare_quant_kernels(minicpmo_gpu_context *ctx, char *e
     if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_load_data_ex(&ctx->quant_module, ptx, 0, NULL, NULL), "module_load_data_ex", error, error_cap) ||
         !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->q4_k_matvec_fn, ctx->quant_module, "minicpmo_q4_k_matvec"), "module_get_function_q4_k", error, error_cap) ||
         !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->q6_k_matvec_fn, ctx->quant_module, "minicpmo_q6_k_matvec"), "module_get_function_q6_k", error, error_cap) ||
+        !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->q4_k_matvec_multi_fn, ctx->quant_module, "minicpmo_q4_k_matvec_multi"), "module_get_function_q4_k_multi", error, error_cap) ||
+        !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->q6_k_matvec_multi_fn, ctx->quant_module, "minicpmo_q6_k_matvec_multi"), "module_get_function_q6_k_multi", error, error_cap) ||
         !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->q8_1_quantize_fn, ctx->quant_module, "minicpmo_q8_1_quantize"), "module_get_function_q8_1_quantize", error, error_cap) ||
         !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->attention_decode_fn, ctx->quant_module, "minicpmo_qwen3_attention_decode"), "module_get_function_attention_decode", error, error_cap) ||
         !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->f32_to_f16_fn, ctx->quant_module, "minicpmo_f32_to_f16"), "module_get_function_f32_to_f16", error, error_cap) ||
@@ -964,6 +1086,8 @@ static int minicpmo_gpu_prepare_quant_kernels(minicpmo_gpu_context *ctx, char *e
         ctx->quant_module = NULL;
         ctx->q4_k_matvec_fn = NULL;
         ctx->q6_k_matvec_fn = NULL;
+        ctx->q4_k_matvec_multi_fn = NULL;
+        ctx->q6_k_matvec_multi_fn = NULL;
         ctx->q8_1_quantize_fn = NULL;
         ctx->attention_decode_fn = NULL;
         ctx->f32_to_f16_fn = NULL;
@@ -1042,6 +1166,96 @@ static int minicpmo_gpu_launch_quant_matvec(
     char *error,
     size_t error_cap) {
     return minicpmo_gpu_launch_quant_matvec_to(ctx, upload, ctx->scratch_x, ctx->scratch_y, out_dim, in_dim, error, error_cap);
+}
+
+static int minicpmo_gpu_launch_quant_matvec_multi_to(
+    minicpmo_gpu_context *ctx,
+    minicpmo_gpu_upload **uploads,
+    size_t count,
+    CUdeviceptr x_ptr,
+    CUdeviceptr *dst_ptrs,
+    size_t *out_dims,
+    size_t in_dim,
+    char *error,
+    size_t error_cap) {
+    CUfunction fn = NULL;
+    CUdeviceptr w0 = 0;
+    CUdeviceptr w1 = 0;
+    CUdeviceptr w2 = 0;
+    CUdeviceptr d0 = 0;
+    CUdeviceptr d1 = 0;
+    CUdeviceptr d2 = 0;
+    int rows0 = 0;
+    int rows1 = 0;
+    int rows2 = 0;
+    int cols = (int) in_dim;
+    int count_i = (int) count;
+    size_t total_rows = 0;
+    void *args[12];
+    if (count < 2u || count > 3u || uploads == NULL || dst_ptrs == NULL || out_dims == NULL) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: invalid grouped quant matvec arguments");
+        return 0;
+    }
+    if (!minicpmo_gpu_prepare_quant_kernels(ctx, error, error_cap)) {
+        return 0;
+    }
+    if (uploads[0]->upload_dtype == 10) {
+        fn = ctx->q4_k_matvec_multi_fn;
+    } else if (uploads[0]->upload_dtype == 12) {
+        fn = ctx->q6_k_matvec_multi_fn;
+    } else {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: unsupported grouped native quant kernel dtype");
+        return 0;
+    }
+    w0 = uploads[0]->device_ptr;
+    w1 = uploads[1]->device_ptr;
+    d0 = dst_ptrs[0];
+    d1 = dst_ptrs[1];
+    rows0 = (int) out_dims[0];
+    rows1 = (int) out_dims[1];
+    total_rows = out_dims[0] + out_dims[1];
+    if (count == 3u) {
+        w2 = uploads[2]->device_ptr;
+        d2 = dst_ptrs[2];
+        rows2 = (int) out_dims[2];
+        total_rows += out_dims[2];
+    }
+    if (total_rows == 0 || total_rows > 2147483647ull) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: grouped native quant matvec rows exceed int32 limit");
+        return 0;
+    }
+    args[0] = &w0;
+    args[1] = &w1;
+    args[2] = &w2;
+    args[3] = &x_ptr;
+    args[4] = &d0;
+    args[5] = &d1;
+    args[6] = &d2;
+    args[7] = &rows0;
+    args[8] = &rows1;
+    args[9] = &rows2;
+    args[10] = &cols;
+    args[11] = &count_i;
+    if (!minicpmo_gpu_cuda_check(
+            ctx,
+            ctx->cuda_launch_kernel(
+                fn,
+                (unsigned int) total_rows,
+                1,
+                1,
+                MINICPMO_GPU_QUANT_THREADS,
+                1,
+                1,
+                0,
+                NULL,
+                args,
+                NULL),
+            "launch_quant_matvec_multi",
+            error,
+            error_cap)) {
+        return 0;
+    }
+    return 1;
 }
 
 static void minicpmo_gpu_release_attention_cache(minicpmo_gpu_context *ctx) {
@@ -1983,6 +2197,8 @@ void minicpmo_gpu_context_destroy(void *handle) {
         ctx->quant_module = NULL;
         ctx->q4_k_matvec_fn = NULL;
         ctx->q6_k_matvec_fn = NULL;
+        ctx->q4_k_matvec_multi_fn = NULL;
+        ctx->q6_k_matvec_multi_fn = NULL;
         ctx->q8_1_quantize_fn = NULL;
         ctx->attention_decode_fn = NULL;
         ctx->f32_to_f16_fn = NULL;
@@ -2594,6 +2810,282 @@ slot_matvec_cleanup:
         minicpmo_gpu_release_upload(ctx, upload);
     }
     return ok;
+}
+
+static int minicpmo_gpu_context_slot_matvec_multi_fallback(
+    void *handle,
+    size_t count,
+    unsigned int *dst_slots,
+    const char **tensor_names,
+    const void **host_ptrs,
+    int *dtypes,
+    size_t *out_dims,
+    unsigned int src_slot,
+    size_t in_dim,
+    char *error,
+    size_t error_cap) {
+    size_t i;
+    for (i = 0; i < count; ++i) {
+        if (!minicpmo_gpu_context_slot_matvec(
+                handle,
+                dst_slots[i],
+                tensor_names[i],
+                host_ptrs[i],
+                dtypes[i],
+                src_slot,
+                in_dim,
+                out_dims[i],
+                error,
+                error_cap)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int minicpmo_gpu_context_slot_matvec_multi_native(
+    minicpmo_gpu_context *ctx,
+    size_t count,
+    unsigned int *dst_slots,
+    const char **tensor_names,
+    const void **host_ptrs,
+    int *dtypes,
+    size_t *out_dims,
+    unsigned int src_slot,
+    size_t in_dim,
+    char *error,
+    size_t error_cap) {
+    minicpmo_gpu_upload *uploads[3] = {NULL, NULL, NULL};
+    CUdeviceptr dst_ptrs[3] = {0, 0, 0};
+    int release_after_use[3] = {0, 0, 0};
+    size_t x_bytes = in_dim * sizeof(float);
+    size_t x_q8_bytes = 0;
+    int cols_i = (int) in_dim;
+    void *qargs[3];
+    int cache_hit = 0;
+    int result = 1;
+    size_t i;
+    if (ctx == NULL || count < 2u || count > 3u || dst_slots == NULL || tensor_names == NULL || host_ptrs == NULL || dtypes == NULL || out_dims == NULL) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: invalid grouped gpu slot matvec arguments");
+        return 0;
+    }
+    if (dtypes[0] != 10 && dtypes[0] != 12) {
+        return -1;
+    }
+    for (i = 1; i < count; ++i) {
+        if (dtypes[i] != dtypes[0]) {
+            return -1;
+        }
+    }
+    if (in_dim == 0 || src_slot >= MINICPMO_GPU_SLOT_COUNT || ctx->slots[src_slot].device_ptr == 0 || ctx->slots[src_slot].bytes < x_bytes) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: gpu grouped slot matvec source not ready");
+        return 0;
+    }
+    if (in_dim > 2147483647u) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: gpu grouped slot matvec shape exceeds int32 limit");
+        return 0;
+    }
+    if (!minicpmo_gpu_prepare_quant_kernels(ctx, error, error_cap) ||
+        ctx->q8_1_quantize_fn == NULL ||
+        ctx->q4_k_matvec_multi_fn == NULL ||
+        ctx->q6_k_matvec_multi_fn == NULL) {
+        return -1;
+    }
+    for (i = 0; i < count; ++i) {
+        if (host_ptrs[i] == NULL || out_dims[i] == 0 || out_dims[i] > 2147483647u || dst_slots[i] >= MINICPMO_GPU_SLOT_COUNT) {
+            minicpmo_gpu_set_error(ctx, error, error_cap, "error: invalid grouped gpu slot matvec arguments");
+            result = 0;
+            goto grouped_cleanup;
+        }
+        uploads[i] = minicpmo_gpu_find_upload(ctx, host_ptrs[i]);
+        if (uploads[i] == NULL) {
+            char message[256];
+            snprintf(message, sizeof(message), "error: gpu tensor not uploaded tensor=%s", tensor_names[i] != NULL ? tensor_names[i] : "(null)");
+            minicpmo_gpu_set_error(ctx, error, error_cap, message);
+            result = 0;
+            goto grouped_cleanup;
+        }
+        if (uploads[i]->cols != in_dim || uploads[i]->rows != out_dims[i]) {
+            char message[256];
+            snprintf(message, sizeof(message), "error: gpu tensor shape mismatch tensor=%s tracked_rows=%zu tracked_cols=%zu matvec_out=%zu matvec_in=%zu", tensor_names[i] != NULL ? tensor_names[i] : "(null)", uploads[i]->rows, uploads[i]->cols, out_dims[i], in_dim);
+            minicpmo_gpu_set_error(ctx, error, error_cap, message);
+            result = 0;
+            goto grouped_cleanup;
+        }
+        if (!minicpmo_gpu_ensure_upload_device(ctx, uploads[i], tensor_names[i], &release_after_use[i], error, error_cap)) {
+            result = 0;
+            goto grouped_cleanup;
+        }
+        if (uploads[i]->upload_dtype != dtypes[0]) {
+            result = -1;
+            goto grouped_cleanup;
+        }
+        if (!minicpmo_gpu_ensure_slot(ctx, dst_slots[i], out_dims[i] * sizeof(float), "slot_matvec_group_dst_malloc", error, error_cap)) {
+            result = 0;
+            goto grouped_cleanup;
+        }
+        dst_ptrs[i] = ctx->slots[dst_slots[i]].device_ptr;
+    }
+    x_q8_bytes = minicpmo_gpu_q8_1_super_bytes_for_cols(in_dim);
+    if (x_q8_bytes == 0) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: gpu grouped native quant matvec expects in_dim multiple of 256");
+        result = 0;
+        goto grouped_cleanup;
+    }
+    if (!minicpmo_gpu_ensure_scratch(ctx, &ctx->scratch_x, &ctx->scratch_x_bytes, x_q8_bytes, "slot_group_q8_1_malloc", error, error_cap)) {
+        result = 0;
+        goto grouped_cleanup;
+    }
+    ctx->stats.scratch_x_bytes = (uint64_t) ctx->scratch_x_bytes;
+    cache_hit = ctx->q8_1_cache_valid &&
+        ctx->q8_1_cache_slot == src_slot &&
+        ctx->q8_1_cache_cols == in_dim &&
+        ctx->scratch_x != 0 &&
+        ctx->scratch_x_bytes >= x_q8_bytes;
+    if (!cache_hit) {
+        CUdeviceptr src_ptr = ctx->slots[src_slot].device_ptr;
+        qargs[0] = &src_ptr;
+        qargs[1] = &ctx->scratch_x;
+        qargs[2] = &cols_i;
+        if (!minicpmo_gpu_cuda_check(
+                ctx,
+                ctx->cuda_launch_kernel(
+                    ctx->q8_1_quantize_fn,
+                    (unsigned int) (in_dim / MINICPMO_GPU_QK_K),
+                    1,
+                    1,
+                    MINICPMO_GPU_ATTENTION_THREADS,
+                    1,
+                    1,
+                    0,
+                    NULL,
+                    qargs,
+                    NULL),
+                "launch_group_q8_1_quantize",
+                error,
+                error_cap)) {
+            result = 0;
+            goto grouped_cleanup;
+        }
+        ctx->q8_1_cache_valid = 1;
+        ctx->q8_1_cache_slot = src_slot;
+        ctx->q8_1_cache_cols = in_dim;
+        ctx->stats.q8_1_x_bytes += (uint64_t) x_q8_bytes;
+    }
+    if (!minicpmo_gpu_launch_quant_matvec_multi_to(ctx, uploads, count, ctx->scratch_x, dst_ptrs, out_dims, in_dim, error, error_cap)) {
+        result = 0;
+        goto grouped_cleanup;
+    }
+    ctx->stats.native_quant_matvec_count += (uint64_t) count;
+    for (i = 0; i < count; ++i) {
+        minicpmo_gpu_mark_slot_written(ctx, dst_slots[i]);
+    }
+
+grouped_cleanup:
+    for (i = 0; i < count; ++i) {
+        if (release_after_use[i] && uploads[i] != NULL && uploads[i]->device_ptr != 0) {
+            minicpmo_gpu_release_upload(ctx, uploads[i]);
+        }
+    }
+    return result;
+}
+
+static int minicpmo_gpu_context_slot_matvec_multi(
+    void *handle,
+    size_t count,
+    unsigned int *dst_slots,
+    const char **tensor_names,
+    const void **host_ptrs,
+    int *dtypes,
+    size_t *out_dims,
+    unsigned int src_slot,
+    size_t in_dim,
+    char *error,
+    size_t error_cap) {
+    minicpmo_gpu_context *ctx = (minicpmo_gpu_context *) handle;
+    int native_result;
+    if (ctx == NULL) {
+        minicpmo_gpu_copy_error(error, error_cap, "error: null gpu grouped slot matvec context");
+        return 0;
+    }
+    if (count < 2u || count > 3u) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: invalid grouped gpu slot matvec count");
+        return 0;
+    }
+    if (dst_slots == NULL || tensor_names == NULL || host_ptrs == NULL || dtypes == NULL || out_dims == NULL) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: invalid grouped gpu slot matvec arguments");
+        return 0;
+    }
+    if ((dtypes[0] == 10 || dtypes[0] == 12) && minicpmo_gpu_native_kmatvec_requested(dtypes[0])) {
+        char native_error[512];
+        native_error[0] = '\0';
+        native_result = minicpmo_gpu_context_slot_matvec_multi_native(ctx, count, dst_slots, tensor_names, host_ptrs, dtypes, out_dims, src_slot, in_dim, native_error, sizeof(native_error));
+        if (native_result == 1) {
+            return 1;
+        }
+        if (native_result == 0) {
+            minicpmo_gpu_copy_error(error, error_cap, native_error);
+            minicpmo_gpu_copy_error(ctx->last_error, sizeof(ctx->last_error), native_error);
+            return 0;
+        }
+        if (ctx->debug && native_error[0] != '\0') {
+            fprintf(stderr, "minicpmo-gpu: grouped native quant unavailable falling_back=slot_matvec reason=%s\n", native_error);
+        }
+    }
+    return minicpmo_gpu_context_slot_matvec_multi_fallback(handle, count, dst_slots, tensor_names, host_ptrs, dtypes, out_dims, src_slot, in_dim, error, error_cap);
+}
+
+int minicpmo_gpu_context_slot_matvec2(
+    void *handle,
+    unsigned int dst_slot0,
+    const char *tensor_name0,
+    const void *host_ptr0,
+    int dtype0,
+    size_t out_dim0,
+    unsigned int dst_slot1,
+    const char *tensor_name1,
+    const void *host_ptr1,
+    int dtype1,
+    size_t out_dim1,
+    unsigned int src_slot,
+    size_t in_dim,
+    char *error,
+    size_t error_cap) {
+    unsigned int dst_slots[3] = {dst_slot0, dst_slot1, 0};
+    const char *tensor_names[3] = {tensor_name0, tensor_name1, NULL};
+    const void *host_ptrs[3] = {host_ptr0, host_ptr1, NULL};
+    int dtypes[3] = {dtype0, dtype1, 0};
+    size_t out_dims[3] = {out_dim0, out_dim1, 0};
+    return minicpmo_gpu_context_slot_matvec_multi(handle, 2u, dst_slots, tensor_names, host_ptrs, dtypes, out_dims, src_slot, in_dim, error, error_cap);
+}
+
+int minicpmo_gpu_context_slot_matvec3(
+    void *handle,
+    unsigned int dst_slot0,
+    const char *tensor_name0,
+    const void *host_ptr0,
+    int dtype0,
+    size_t out_dim0,
+    unsigned int dst_slot1,
+    const char *tensor_name1,
+    const void *host_ptr1,
+    int dtype1,
+    size_t out_dim1,
+    unsigned int dst_slot2,
+    const char *tensor_name2,
+    const void *host_ptr2,
+    int dtype2,
+    size_t out_dim2,
+    unsigned int src_slot,
+    size_t in_dim,
+    char *error,
+    size_t error_cap) {
+    unsigned int dst_slots[3] = {dst_slot0, dst_slot1, dst_slot2};
+    const char *tensor_names[3] = {tensor_name0, tensor_name1, tensor_name2};
+    const void *host_ptrs[3] = {host_ptr0, host_ptr1, host_ptr2};
+    int dtypes[3] = {dtype0, dtype1, dtype2};
+    size_t out_dims[3] = {out_dim0, out_dim1, out_dim2};
+    return minicpmo_gpu_context_slot_matvec_multi(handle, 3u, dst_slots, tensor_names, host_ptrs, dtypes, out_dims, src_slot, in_dim, error, error_cap);
 }
 
 int minicpmo_gpu_context_slot_rms_norm(

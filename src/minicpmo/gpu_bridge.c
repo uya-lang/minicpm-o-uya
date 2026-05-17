@@ -34,6 +34,8 @@ typedef int (*minicpmo_gpu_context_attention_fn)(void *, const float *, const fl
 typedef int (*minicpmo_gpu_context_slot_upload_f32_fn)(void *, unsigned int, const float *, size_t, char *, size_t);
 typedef int (*minicpmo_gpu_context_slot_download_f32_fn)(void *, unsigned int, float *, size_t, char *, size_t);
 typedef int (*minicpmo_gpu_context_slot_matvec_fn)(void *, unsigned int, const char *, const void *, int, unsigned int, size_t, size_t, char *, size_t);
+typedef int (*minicpmo_gpu_context_slot_matvec2_fn)(void *, unsigned int, const char *, const void *, int, size_t, unsigned int, const char *, const void *, int, size_t, unsigned int, size_t, char *, size_t);
+typedef int (*minicpmo_gpu_context_slot_matvec3_fn)(void *, unsigned int, const char *, const void *, int, size_t, unsigned int, const char *, const void *, int, size_t, unsigned int, const char *, const void *, int, size_t, unsigned int, size_t, char *, size_t);
 typedef int (*minicpmo_gpu_context_slot_rms_norm_fn)(void *, unsigned int, unsigned int, const void *, size_t, float, char *, size_t);
 typedef int (*minicpmo_gpu_context_slot_head_norm_fn)(void *, unsigned int, const void *, size_t, size_t, char *, size_t);
 typedef int (*minicpmo_gpu_context_slot_rope_fn)(void *, unsigned int, size_t, size_t, size_t, float, float, char *, size_t);
@@ -54,6 +56,8 @@ typedef struct minicpmo_gpu_helper_api {
     minicpmo_gpu_context_slot_upload_f32_fn slot_upload_f32;
     minicpmo_gpu_context_slot_download_f32_fn slot_download_f32;
     minicpmo_gpu_context_slot_matvec_fn slot_matvec;
+    minicpmo_gpu_context_slot_matvec2_fn slot_matvec2;
+    minicpmo_gpu_context_slot_matvec3_fn slot_matvec3;
     minicpmo_gpu_context_slot_rms_norm_fn slot_rms_norm;
     minicpmo_gpu_context_slot_head_norm_fn slot_head_norm;
     minicpmo_gpu_context_slot_rope_fn slot_rope;
@@ -75,6 +79,8 @@ int minicpmo_gpu_context_attention(void *handle, const float *q, const float *k,
 int minicpmo_gpu_context_slot_upload_f32(void *handle, unsigned int slot, const float *src, size_t len, char *error, size_t error_cap);
 int minicpmo_gpu_context_slot_download_f32(void *handle, unsigned int slot, float *dst, size_t len, char *error, size_t error_cap);
 int minicpmo_gpu_context_slot_matvec(void *handle, unsigned int dst_slot, const char *tensor_name, const void *host_ptr, int dtype, unsigned int src_slot, size_t in_dim, size_t out_dim, char *error, size_t error_cap);
+int minicpmo_gpu_context_slot_matvec2(void *handle, unsigned int dst_slot0, const char *tensor_name0, const void *host_ptr0, int dtype0, size_t out_dim0, unsigned int dst_slot1, const char *tensor_name1, const void *host_ptr1, int dtype1, size_t out_dim1, unsigned int src_slot, size_t in_dim, char *error, size_t error_cap);
+int minicpmo_gpu_context_slot_matvec3(void *handle, unsigned int dst_slot0, const char *tensor_name0, const void *host_ptr0, int dtype0, size_t out_dim0, unsigned int dst_slot1, const char *tensor_name1, const void *host_ptr1, int dtype1, size_t out_dim1, unsigned int dst_slot2, const char *tensor_name2, const void *host_ptr2, int dtype2, size_t out_dim2, unsigned int src_slot, size_t in_dim, char *error, size_t error_cap);
 int minicpmo_gpu_context_slot_rms_norm(void *handle, unsigned int dst_slot, unsigned int src_slot, const void *weight_host_ptr, size_t n, float eps, char *error, size_t error_cap);
 int minicpmo_gpu_context_slot_head_norm(void *handle, unsigned int slot, const void *weight_host_ptr, size_t head_count, size_t head_dim, char *error, size_t error_cap);
 int minicpmo_gpu_context_slot_rope(void *handle, unsigned int slot, size_t head_count, size_t head_dim, size_t pos, float freq_base, float freq_scale, char *error, size_t error_cap);
@@ -147,6 +153,8 @@ static int minicpmo_gpu_bridge_open(char *error, size_t error_cap) {
     minicpmo_gpu_helper.slot_upload_f32 = (minicpmo_gpu_context_slot_upload_f32_fn) dlsym(lib, "minicpmo_gpu_context_slot_upload_f32");
     minicpmo_gpu_helper.slot_download_f32 = (minicpmo_gpu_context_slot_download_f32_fn) dlsym(lib, "minicpmo_gpu_context_slot_download_f32");
     minicpmo_gpu_helper.slot_matvec = (minicpmo_gpu_context_slot_matvec_fn) dlsym(lib, "minicpmo_gpu_context_slot_matvec");
+    minicpmo_gpu_helper.slot_matvec2 = (minicpmo_gpu_context_slot_matvec2_fn) dlsym(lib, "minicpmo_gpu_context_slot_matvec2");
+    minicpmo_gpu_helper.slot_matvec3 = (minicpmo_gpu_context_slot_matvec3_fn) dlsym(lib, "minicpmo_gpu_context_slot_matvec3");
     minicpmo_gpu_helper.slot_rms_norm = (minicpmo_gpu_context_slot_rms_norm_fn) dlsym(lib, "minicpmo_gpu_context_slot_rms_norm");
     minicpmo_gpu_helper.slot_head_norm = (minicpmo_gpu_context_slot_head_norm_fn) dlsym(lib, "minicpmo_gpu_context_slot_head_norm");
     minicpmo_gpu_helper.slot_rope = (minicpmo_gpu_context_slot_rope_fn) dlsym(lib, "minicpmo_gpu_context_slot_rope");
@@ -157,7 +165,8 @@ static int minicpmo_gpu_bridge_open(char *error, size_t error_cap) {
     if (minicpmo_gpu_helper.create == NULL || minicpmo_gpu_helper.destroy == NULL || minicpmo_gpu_helper.smoke == NULL ||
         minicpmo_gpu_helper.upload_tensor == NULL || minicpmo_gpu_helper.matvec == NULL || minicpmo_gpu_helper.prepare_attention == NULL ||
         minicpmo_gpu_helper.attention == NULL || minicpmo_gpu_helper.slot_upload_f32 == NULL || minicpmo_gpu_helper.slot_download_f32 == NULL ||
-        minicpmo_gpu_helper.slot_matvec == NULL || minicpmo_gpu_helper.slot_rms_norm == NULL || minicpmo_gpu_helper.slot_head_norm == NULL ||
+        minicpmo_gpu_helper.slot_matvec == NULL || minicpmo_gpu_helper.slot_matvec2 == NULL || minicpmo_gpu_helper.slot_matvec3 == NULL ||
+        minicpmo_gpu_helper.slot_rms_norm == NULL || minicpmo_gpu_helper.slot_head_norm == NULL ||
         minicpmo_gpu_helper.slot_rope == NULL || minicpmo_gpu_helper.slot_add_inplace == NULL || minicpmo_gpu_helper.slot_silu_mul == NULL ||
         minicpmo_gpu_helper.attention_slots == NULL || minicpmo_gpu_helper.snapshot == NULL) {
         minicpmo_gpu_bridge_copy_error(error, error_cap, "error: gpu helper missing exported symbols");
@@ -236,6 +245,20 @@ int minicpmo_gpu_context_slot_matvec(void *handle, unsigned int dst_slot, const 
         return 0;
     }
     return minicpmo_gpu_helper.slot_matvec(handle, dst_slot, tensor_name, host_ptr, dtype, src_slot, in_dim, out_dim, error, error_cap);
+}
+
+int minicpmo_gpu_context_slot_matvec2(void *handle, unsigned int dst_slot0, const char *tensor_name0, const void *host_ptr0, int dtype0, size_t out_dim0, unsigned int dst_slot1, const char *tensor_name1, const void *host_ptr1, int dtype1, size_t out_dim1, unsigned int src_slot, size_t in_dim, char *error, size_t error_cap) {
+    if (!minicpmo_gpu_bridge_open(error, error_cap)) {
+        return 0;
+    }
+    return minicpmo_gpu_helper.slot_matvec2(handle, dst_slot0, tensor_name0, host_ptr0, dtype0, out_dim0, dst_slot1, tensor_name1, host_ptr1, dtype1, out_dim1, src_slot, in_dim, error, error_cap);
+}
+
+int minicpmo_gpu_context_slot_matvec3(void *handle, unsigned int dst_slot0, const char *tensor_name0, const void *host_ptr0, int dtype0, size_t out_dim0, unsigned int dst_slot1, const char *tensor_name1, const void *host_ptr1, int dtype1, size_t out_dim1, unsigned int dst_slot2, const char *tensor_name2, const void *host_ptr2, int dtype2, size_t out_dim2, unsigned int src_slot, size_t in_dim, char *error, size_t error_cap) {
+    if (!minicpmo_gpu_bridge_open(error, error_cap)) {
+        return 0;
+    }
+    return minicpmo_gpu_helper.slot_matvec3(handle, dst_slot0, tensor_name0, host_ptr0, dtype0, out_dim0, dst_slot1, tensor_name1, host_ptr1, dtype1, out_dim1, dst_slot2, tensor_name2, host_ptr2, dtype2, out_dim2, src_slot, in_dim, error, error_cap);
 }
 
 int minicpmo_gpu_context_slot_rms_norm(void *handle, unsigned int dst_slot, unsigned int src_slot, const void *weight_host_ptr, size_t n, float eps, char *error, size_t error_cap) {

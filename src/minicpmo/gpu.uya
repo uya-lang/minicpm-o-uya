@@ -41,6 +41,8 @@ extern "libc" fn minicpmo_gpu_context_attention(handle: &void, q: &const f32, k:
 extern "libc" fn minicpmo_gpu_context_slot_upload_f32(handle: &void, slot: u32, src: &const f32, len: usize, err_text: &byte, error_cap: usize) i32;
 extern "libc" fn minicpmo_gpu_context_slot_download_f32(handle: &void, slot: u32, dst: &f32, len: usize, err_text: &byte, error_cap: usize) i32;
 extern "libc" fn minicpmo_gpu_context_slot_matvec(handle: &void, dst_slot: u32, tensor_name: &const byte, host_ptr: &const byte, dtype: i32, src_slot: u32, in_dim: usize, out_dim: usize, err_text: &byte, error_cap: usize) i32;
+extern "libc" fn minicpmo_gpu_context_slot_matvec2(handle: &void, dst_slot0: u32, tensor_name0: &const byte, host_ptr0: &const byte, dtype0: i32, out_dim0: usize, dst_slot1: u32, tensor_name1: &const byte, host_ptr1: &const byte, dtype1: i32, out_dim1: usize, src_slot: u32, in_dim: usize, err_text: &byte, error_cap: usize) i32;
+extern "libc" fn minicpmo_gpu_context_slot_matvec3(handle: &void, dst_slot0: u32, tensor_name0: &const byte, host_ptr0: &const byte, dtype0: i32, out_dim0: usize, dst_slot1: u32, tensor_name1: &const byte, host_ptr1: &const byte, dtype1: i32, out_dim1: usize, dst_slot2: u32, tensor_name2: &const byte, host_ptr2: &const byte, dtype2: i32, out_dim2: usize, src_slot: u32, in_dim: usize, err_text: &byte, error_cap: usize) i32;
 extern "libc" fn minicpmo_gpu_context_slot_rms_norm(handle: &void, dst_slot: u32, src_slot: u32, weight_host_ptr: &const byte, n: usize, eps: f32, err_text: &byte, error_cap: usize) i32;
 extern "libc" fn minicpmo_gpu_context_slot_head_norm(handle: &void, slot: u32, weight_host_ptr: &const byte, head_count: usize, head_dim: usize, err_text: &byte, error_cap: usize) i32;
 extern "libc" fn minicpmo_gpu_context_slot_rope(handle: &void, slot: u32, head_count: usize, head_dim: usize, pos: usize, freq_base: f32, freq_scale: f32, err_text: &byte, error_cap: usize) i32;
@@ -205,6 +207,26 @@ export fn gpu_context_slot_matvec(ctx: &GpuContext, dst_slot: u32, view: &Tensor
     gpu_context_error_reset(ctx);
     if ctx.handle == null || view == null || view.data == null { return false; }
     if minicpmo_gpu_context_slot_matvec(ctx.handle, dst_slot, &view.name[0] as &const byte, view.data, view.dtype as i32, src_slot, in_dim, out_dim, &ctx.last_error[0], GPU_ERROR_CAP) == 0 {
+        return false;
+    }
+    gpu_context_refresh_stats(ctx);
+    return true;
+}
+
+export fn gpu_context_slot_matvec2(ctx: &GpuContext, dst_slot0: u32, view0: &TensorView, out_dim0: usize, dst_slot1: u32, view1: &TensorView, out_dim1: usize, src_slot: u32, in_dim: usize) bool {
+    gpu_context_error_reset(ctx);
+    if ctx.handle == null || view0 == null || view0.data == null || view1 == null || view1.data == null { return false; }
+    if minicpmo_gpu_context_slot_matvec2(ctx.handle, dst_slot0, &view0.name[0] as &const byte, view0.data, view0.dtype as i32, out_dim0, dst_slot1, &view1.name[0] as &const byte, view1.data, view1.dtype as i32, out_dim1, src_slot, in_dim, &ctx.last_error[0], GPU_ERROR_CAP) == 0 {
+        return false;
+    }
+    gpu_context_refresh_stats(ctx);
+    return true;
+}
+
+export fn gpu_context_slot_matvec3(ctx: &GpuContext, dst_slot0: u32, view0: &TensorView, out_dim0: usize, dst_slot1: u32, view1: &TensorView, out_dim1: usize, dst_slot2: u32, view2: &TensorView, out_dim2: usize, src_slot: u32, in_dim: usize) bool {
+    gpu_context_error_reset(ctx);
+    if ctx.handle == null || view0 == null || view0.data == null || view1 == null || view1.data == null || view2 == null || view2.data == null { return false; }
+    if minicpmo_gpu_context_slot_matvec3(ctx.handle, dst_slot0, &view0.name[0] as &const byte, view0.data, view0.dtype as i32, out_dim0, dst_slot1, &view1.name[0] as &const byte, view1.data, view1.dtype as i32, out_dim1, dst_slot2, &view2.name[0] as &const byte, view2.data, view2.dtype as i32, out_dim2, src_slot, in_dim, &ctx.last_error[0], GPU_ERROR_CAP) == 0 {
         return false;
     }
     gpu_context_refresh_stats(ctx);
