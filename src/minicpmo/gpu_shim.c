@@ -234,6 +234,9 @@ typedef struct minicpmo_gpu_context {
     size_t persistent_limit_bytes;
     size_t persistent_reserved_bytes;
     minicpmo_gpu_slot slots[MINICPMO_GPU_SLOT_COUNT];
+    int q8_1_cache_valid;
+    unsigned int q8_1_cache_slot;
+    size_t q8_1_cache_cols;
     uint64_t use_tick;
     minicpmo_gpu_stats stats;
     char last_error[512];
@@ -659,13 +662,15 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "    }\n"
     "}\n"
     "extern \"C\" __global__ void minicpmo_q4_k_matvec(const unsigned char *weights, const unsigned char *xq, float *dst, int rows, int cols) {\n"
-    "    int row = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;\n"
+    "    int row = (int) blockIdx.x;\n"
+    "    int tid = (int) threadIdx.x;\n"
     "    int blocks_per_row = cols / 256;\n"
     "    float sum = 0.0f;\n"
+    "    __shared__ float reduce_buf[128];\n"
     "    if (row >= rows) { return; }\n"
     "    {\n"
     "        unsigned long long row_offset = (unsigned long long) row * (unsigned long long) blocks_per_row * 144ull;\n"
-    "        for (int block = 0; block < blocks_per_row; ++block) {\n"
+    "        for (int block = tid; block < blocks_per_row; block += (int) blockDim.x) {\n"
     "            const unsigned char *base = weights + row_offset + (unsigned long long) block * 144ull;\n"
     "            const unsigned char *xq_base = xq + (unsigned long long) block * 288ull;\n"
     "            float d = minicpmo_half_to_float((unsigned short) (base[0] | ((unsigned short) base[1] << 8)));\n"
@@ -700,16 +705,24 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "            }\n"
     "        }\n"
     "    }\n"
-    "    dst[row] = sum;\n"
+    "    reduce_buf[tid] = sum;\n"
+    "    __syncthreads();\n"
+    "    for (int stride = (int) blockDim.x / 2; stride > 0; stride >>= 1) {\n"
+    "        if (tid < stride) { reduce_buf[tid] += reduce_buf[tid + stride]; }\n"
+    "        __syncthreads();\n"
+    "    }\n"
+    "    if (tid == 0) { dst[row] = reduce_buf[0]; }\n"
     "}\n"
     "extern \"C\" __global__ void minicpmo_q6_k_matvec(const unsigned char *weights, const unsigned char *xq, float *dst, int rows, int cols) {\n"
-    "    int row = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;\n"
+    "    int row = (int) blockIdx.x;\n"
+    "    int tid = (int) threadIdx.x;\n"
     "    int blocks_per_row = cols / 256;\n"
     "    float sum = 0.0f;\n"
+    "    __shared__ float reduce_buf[128];\n"
     "    if (row >= rows) { return; }\n"
     "    {\n"
     "        unsigned long long row_offset = (unsigned long long) row * (unsigned long long) blocks_per_row * 210ull;\n"
-    "        for (int block = 0; block < blocks_per_row; ++block) {\n"
+    "        for (int block = tid; block < blocks_per_row; block += (int) blockDim.x) {\n"
     "            const unsigned char *base = weights + row_offset + (unsigned long long) block * 210ull;\n"
     "            const unsigned char *xq_base = xq + (unsigned long long) block * 288ull;\n"
     "            const unsigned char *ql = base;\n"
@@ -736,7 +749,13 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "            }\n"
     "        }\n"
     "    }\n"
-    "    dst[row] = sum;\n"
+    "    reduce_buf[tid] = sum;\n"
+    "    __syncthreads();\n"
+    "    for (int stride = (int) blockDim.x / 2; stride > 0; stride >>= 1) {\n"
+    "        if (tid < stride) { reduce_buf[tid] += reduce_buf[tid + stride]; }\n"
+    "        __syncthreads();\n"
+    "    }\n"
+    "    if (tid == 0) { dst[row] = reduce_buf[0]; }\n"
     "}\n"
     "extern \"C\" __global__ void minicpmo_qwen3_attention_decode(const float *q, const float *k_cache, const float *v_cache, float *dst, int layer, int pos, int head_count, int kv_head_count, int head_dim, int context_capacity, float scale) {\n"
     "    int h = (int) blockIdx.x;\n"
@@ -997,7 +1016,7 @@ static int minicpmo_gpu_launch_quant_matvec_to(
             ctx,
             ctx->cuda_launch_kernel(
                 fn,
-                (unsigned int) ((out_dim + (MINICPMO_GPU_QUANT_THREADS - 1u)) / MINICPMO_GPU_QUANT_THREADS),
+                (unsigned int) out_dim,
                 1,
                 1,
                 MINICPMO_GPU_QUANT_THREADS,
@@ -1009,8 +1028,7 @@ static int minicpmo_gpu_launch_quant_matvec_to(
                 NULL),
             "launch_quant_matvec",
             error,
-            error_cap) ||
-        !minicpmo_gpu_cuda_check(ctx, ctx->cuda_ctx_synchronize(), "quant_matvec_sync", error, error_cap)) {
+            error_cap)) {
         return 0;
     }
     return 1;
@@ -1285,6 +1303,24 @@ static void minicpmo_gpu_mark_upload_used(minicpmo_gpu_context *ctx, minicpmo_gp
     }
     ctx->use_tick += 1u;
     upload->last_use_tick = ctx->use_tick;
+}
+
+static void minicpmo_gpu_invalidate_q8_1_cache(minicpmo_gpu_context *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->q8_1_cache_valid = 0;
+    ctx->q8_1_cache_slot = 0;
+    ctx->q8_1_cache_cols = 0;
+}
+
+static void minicpmo_gpu_mark_slot_written(minicpmo_gpu_context *ctx, unsigned int slot) {
+    if (ctx == NULL) {
+        return;
+    }
+    if (ctx->q8_1_cache_valid && ctx->q8_1_cache_slot == slot) {
+        minicpmo_gpu_invalidate_q8_1_cache(ctx);
+    }
 }
 
 static int minicpmo_gpu_evict_until_fit(
@@ -1637,6 +1673,9 @@ static int minicpmo_gpu_ensure_scratch(
     size_t error_cap) {
     if (required <= *capacity) {
         return 1;
+    }
+    if (ptr == &ctx->scratch_x) {
+        minicpmo_gpu_invalidate_q8_1_cache(ctx);
     }
     if (*ptr != 0) {
         if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_mem_free(*ptr), "free scratch", error, error_cap)) {
@@ -2015,6 +2054,8 @@ int minicpmo_gpu_context_upload_tensor(
     size_t error_cap) {
     minicpmo_gpu_context *ctx = (minicpmo_gpu_context *) handle;
     minicpmo_gpu_upload *existing;
+    minicpmo_gpu_upload *entry;
+    int release_after_use = 0;
     if (ctx == NULL) {
         minicpmo_gpu_copy_error(error, error_cap, "error: null gpu upload context");
         return 0;
@@ -2027,36 +2068,49 @@ int minicpmo_gpu_context_upload_tensor(
     if (existing != NULL) {
         existing->rows = rows;
         existing->cols = cols;
+        if (!minicpmo_gpu_ensure_upload_device(ctx, existing, name, &release_after_use, error, error_cap)) {
+            return 0;
+        }
+        if (release_after_use && existing->device_ptr != 0) {
+            minicpmo_gpu_release_upload(ctx, existing);
+        }
         return 1;
     }
     if (ctx->upload_count >= MINICPMO_GPU_MAX_UPLOADS) {
         minicpmo_gpu_set_error(ctx, error, error_cap, "error: gpu upload registry exhausted");
         return 0;
     }
-    ctx->uploads[ctx->upload_count].host_ptr = host_ptr;
-    ctx->uploads[ctx->upload_count].staged_host_ptr = NULL;
-    ctx->uploads[ctx->upload_count].device_ptr = 0;
-    ctx->uploads[ctx->upload_count].bytes = bytes;
-    ctx->uploads[ctx->upload_count].rows = rows;
-    ctx->uploads[ctx->upload_count].cols = cols;
-    ctx->uploads[ctx->upload_count].staged_bytes = 0;
-    ctx->uploads[ctx->upload_count].estimated_device_bytes = minicpmo_gpu_estimate_device_bytes(dtype, rows, cols);
-    ctx->uploads[ctx->upload_count].dtype = dtype;
-    ctx->uploads[ctx->upload_count].upload_dtype = -1;
-    ctx->uploads[ctx->upload_count].staged_owned = 0;
-    ctx->uploads[ctx->upload_count].ever_uploaded = 0;
-    ctx->uploads[ctx->upload_count].persistent_decided = 0;
-    ctx->uploads[ctx->upload_count].persistent = 0;
-    ctx->uploads[ctx->upload_count].resident = 0;
-    ctx->uploads[ctx->upload_count].last_use_tick = 0;
+    entry = &ctx->uploads[ctx->upload_count];
+    entry->host_ptr = host_ptr;
+    entry->staged_host_ptr = NULL;
+    entry->device_ptr = 0;
+    entry->bytes = bytes;
+    entry->rows = rows;
+    entry->cols = cols;
+    entry->staged_bytes = 0;
+    entry->estimated_device_bytes = minicpmo_gpu_estimate_device_bytes(dtype, rows, cols);
+    entry->dtype = dtype;
+    entry->upload_dtype = -1;
+    entry->staged_owned = 0;
+    entry->ever_uploaded = 0;
+    entry->persistent_decided = 0;
+    entry->persistent = 0;
+    entry->resident = 0;
+    entry->last_use_tick = 0;
     if (name != NULL) {
-        snprintf(ctx->uploads[ctx->upload_count].name, sizeof(ctx->uploads[ctx->upload_count].name), "%s", name);
+        snprintf(entry->name, sizeof(entry->name), "%s", name);
     } else {
-        ctx->uploads[ctx->upload_count].name[0] = '\0';
+        entry->name[0] = '\0';
     }
     ++ctx->upload_count;
+    if (!minicpmo_gpu_ensure_upload_device(ctx, entry, name, &release_after_use, error, error_cap)) {
+        return 0;
+    }
+    if (release_after_use && entry->device_ptr != 0) {
+        minicpmo_gpu_release_upload(ctx, entry);
+    }
     if (ctx->debug) {
-        fprintf(stderr, "minicpmo-gpu: track tensor=%s bytes=%zu dtype=%d rows=%zu cols=%zu persistent=%d persistent_reserved=%zu count=%zu\n", name != NULL ? name : "(null)", bytes, dtype, rows, cols, ctx->uploads[ctx->upload_count - 1].persistent, ctx->persistent_reserved_bytes, ctx->upload_count);
+        fprintf(stderr, "minicpmo-gpu: track tensor=%s bytes=%zu dtype=%d rows=%zu cols=%zu persistent=%d resident=%d persistent_reserved=%zu count=%zu\n", name != NULL ? name : "(null)", bytes, dtype, rows, cols, entry->persistent, entry->resident, ctx->persistent_reserved_bytes, ctx->upload_count);
     }
     return 1;
 }
@@ -2142,6 +2196,7 @@ int minicpmo_gpu_context_matvec(
     ctx->stats.scratch_x_bytes = (uint64_t) ctx->scratch_x_bytes;
     ctx->stats.scratch_y_bytes = (uint64_t) ctx->scratch_y_bytes;
     if (upload->upload_dtype == 0) {
+        minicpmo_gpu_invalidate_q8_1_cache(ctx);
         if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_memcpy_hto_d(ctx->scratch_x, x, x_bytes), "matvec_copy_x_h2d", error, error_cap)) {
             ok = 0;
             goto matvec_cleanup;
@@ -2170,6 +2225,7 @@ int minicpmo_gpu_context_matvec(
         }
     } else if (upload->upload_dtype == 10 || upload->upload_dtype == 12) {
         unsigned char x_q8_host[x_q8_bytes];
+        minicpmo_gpu_invalidate_q8_1_cache(ctx);
         if (!minicpmo_gpu_q8_1_quantize_row(x_q8_host, x, in_dim)) {
             minicpmo_gpu_set_error(ctx, error, error_cap, "error: native quant matvec Q8_1 quantize failed");
             ok = 0;
@@ -2189,6 +2245,7 @@ int minicpmo_gpu_context_matvec(
     } else {
         size_t i;
         uint16_t x_half_host[in_dim];
+        minicpmo_gpu_invalidate_q8_1_cache(ctx);
         for (i = 0; i < in_dim; ++i) {
             x_half_host[i] = minicpmo_gpu_f32_to_f16(x[i]);
         }
@@ -2273,6 +2330,7 @@ int minicpmo_gpu_context_slot_upload_f32(
     if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_memcpy_hto_d(ctx->slots[slot].device_ptr, src, bytes), "slot_upload_h2d", error, error_cap)) {
         return 0;
     }
+    minicpmo_gpu_mark_slot_written(ctx, slot);
     ctx->stats.host_to_device_bytes += (uint64_t) bytes;
     return 1;
 }
@@ -2394,6 +2452,7 @@ int minicpmo_gpu_context_slot_matvec(
     } else if (upload->upload_dtype == 10 || upload->upload_dtype == 12) {
         int cols_i = (int) in_dim;
         void *qargs[3];
+        int cache_hit = 0;
         if (!minicpmo_gpu_prepare_quant_kernels(ctx, error, error_cap) || ctx->q8_1_quantize_fn == NULL) {
             ok = 0;
             goto slot_matvec_cleanup;
@@ -2409,31 +2468,44 @@ int minicpmo_gpu_context_slot_matvec(
             goto slot_matvec_cleanup;
         }
         ctx->stats.scratch_x_bytes = (uint64_t) ctx->scratch_x_bytes;
-        qargs[0] = &src_ptr;
-        qargs[1] = &ctx->scratch_x;
-        qargs[2] = &cols_i;
-        if (!minicpmo_gpu_cuda_check(
-                ctx,
-                ctx->cuda_launch_kernel(
-                    ctx->q8_1_quantize_fn,
-                    (unsigned int) (in_dim / MINICPMO_GPU_QK_K),
-                    1,
-                    1,
-                    MINICPMO_GPU_ATTENTION_THREADS,
-                    1,
-                    1,
-                    0,
-                    NULL,
-                    qargs,
-                    NULL),
-                "launch_q8_1_quantize",
-                error,
-                error_cap) ||
-            !minicpmo_gpu_launch_quant_matvec_to(ctx, upload, ctx->scratch_x, dst_ptr, out_dim, in_dim, error, error_cap)) {
+        cache_hit = ctx->q8_1_cache_valid &&
+            ctx->q8_1_cache_slot == src_slot &&
+            ctx->q8_1_cache_cols == in_dim &&
+            ctx->scratch_x != 0 &&
+            ctx->scratch_x_bytes >= x_q8_bytes;
+        if (!cache_hit) {
+            qargs[0] = &src_ptr;
+            qargs[1] = &ctx->scratch_x;
+            qargs[2] = &cols_i;
+            if (!minicpmo_gpu_cuda_check(
+                    ctx,
+                    ctx->cuda_launch_kernel(
+                        ctx->q8_1_quantize_fn,
+                        (unsigned int) (in_dim / MINICPMO_GPU_QK_K),
+                        1,
+                        1,
+                        MINICPMO_GPU_ATTENTION_THREADS,
+                        1,
+                        1,
+                        0,
+                        NULL,
+                        qargs,
+                        NULL),
+                    "launch_q8_1_quantize",
+                    error,
+                    error_cap)) {
+                ok = 0;
+                goto slot_matvec_cleanup;
+            }
+            ctx->q8_1_cache_valid = 1;
+            ctx->q8_1_cache_slot = src_slot;
+            ctx->q8_1_cache_cols = in_dim;
+            ctx->stats.q8_1_x_bytes += (uint64_t) x_q8_bytes;
+        }
+        if (!minicpmo_gpu_launch_quant_matvec_to(ctx, upload, ctx->scratch_x, dst_ptr, out_dim, in_dim, error, error_cap)) {
             ok = 0;
             goto slot_matvec_cleanup;
         }
-        ctx->stats.q8_1_x_bytes += (uint64_t) x_q8_bytes;
         used_native_quant = 1;
     } else {
         int n_i = (int) in_dim;
@@ -2454,6 +2526,7 @@ int minicpmo_gpu_context_slot_matvec(
             ok = 0;
             goto slot_matvec_cleanup;
         }
+        minicpmo_gpu_invalidate_q8_1_cache(ctx);
         ctx->stats.scratch_x_bytes = (uint64_t) ctx->scratch_x_bytes;
         hargs[0] = &src_ptr;
         hargs[1] = &ctx->scratch_x;
@@ -2514,6 +2587,9 @@ int minicpmo_gpu_context_slot_matvec(
         ctx->stats.staged_quant_matvec_count += 1u;
     }
 slot_matvec_cleanup:
+    if (ok) {
+        minicpmo_gpu_mark_slot_written(ctx, dst_slot);
+    }
     if (release_after_use && upload->device_ptr != 0) {
         minicpmo_gpu_release_upload(ctx, upload);
     }
@@ -2597,6 +2673,7 @@ int minicpmo_gpu_context_slot_rms_norm(
         }
         return 0;
     }
+    minicpmo_gpu_mark_slot_written(ctx, dst_slot);
     if (release_after_use && upload->device_ptr != 0) {
         minicpmo_gpu_release_upload(ctx, upload);
     }
@@ -2676,6 +2753,7 @@ int minicpmo_gpu_context_slot_head_norm(
         }
         return 0;
     }
+    minicpmo_gpu_mark_slot_written(ctx, slot);
     if (release_after_use && upload->device_ptr != 0) {
         minicpmo_gpu_release_upload(ctx, upload);
     }
@@ -2718,23 +2796,27 @@ int minicpmo_gpu_context_slot_rope(
     args[3] = &pos_i;
     args[4] = &freq_base;
     args[5] = &freq_scale;
-    return minicpmo_gpu_cuda_check(
-        ctx,
-        ctx->cuda_launch_kernel(
-            ctx->rope_fn,
-            (unsigned int) head_count,
-            1,
-            1,
-            MINICPMO_GPU_VECTOR_THREADS,
-            1,
-            1,
-            0,
-            NULL,
-            args,
-            NULL),
-        "launch_rope",
-        error,
-        error_cap);
+    if (!minicpmo_gpu_cuda_check(
+            ctx,
+            ctx->cuda_launch_kernel(
+                ctx->rope_fn,
+                (unsigned int) head_count,
+                1,
+                1,
+                MINICPMO_GPU_VECTOR_THREADS,
+                1,
+                1,
+                0,
+                NULL,
+                args,
+                NULL),
+            "launch_rope",
+            error,
+            error_cap)) {
+        return 0;
+    }
+    minicpmo_gpu_mark_slot_written(ctx, slot);
+    return 1;
 }
 
 int minicpmo_gpu_context_slot_add_inplace(
@@ -2765,23 +2847,27 @@ int minicpmo_gpu_context_slot_add_inplace(
     args[0] = &ctx->slots[dst_slot].device_ptr;
     args[1] = &ctx->slots[src_slot].device_ptr;
     args[2] = &n_i;
-    return minicpmo_gpu_cuda_check(
-        ctx,
-        ctx->cuda_launch_kernel(
-            ctx->add_inplace_fn,
-            (unsigned int) ((len + (MINICPMO_GPU_VECTOR_THREADS - 1u)) / MINICPMO_GPU_VECTOR_THREADS),
-            1,
-            1,
-            MINICPMO_GPU_VECTOR_THREADS,
-            1,
-            1,
-            0,
-            NULL,
-            args,
-            NULL),
-        "launch_add_inplace",
-        error,
-        error_cap);
+    if (!minicpmo_gpu_cuda_check(
+            ctx,
+            ctx->cuda_launch_kernel(
+                ctx->add_inplace_fn,
+                (unsigned int) ((len + (MINICPMO_GPU_VECTOR_THREADS - 1u)) / MINICPMO_GPU_VECTOR_THREADS),
+                1,
+                1,
+                MINICPMO_GPU_VECTOR_THREADS,
+                1,
+                1,
+                0,
+                NULL,
+                args,
+                NULL),
+            "launch_add_inplace",
+            error,
+            error_cap)) {
+        return 0;
+    }
+    minicpmo_gpu_mark_slot_written(ctx, dst_slot);
+    return 1;
 }
 
 int minicpmo_gpu_context_slot_silu_mul(
@@ -2817,23 +2903,27 @@ int minicpmo_gpu_context_slot_silu_mul(
     args[1] = &ctx->slots[gate_slot].device_ptr;
     args[2] = &ctx->slots[up_slot].device_ptr;
     args[3] = &n_i;
-    return minicpmo_gpu_cuda_check(
-        ctx,
-        ctx->cuda_launch_kernel(
-            ctx->silu_mul_fn,
-            (unsigned int) ((len + (MINICPMO_GPU_VECTOR_THREADS - 1u)) / MINICPMO_GPU_VECTOR_THREADS),
-            1,
-            1,
-            MINICPMO_GPU_VECTOR_THREADS,
-            1,
-            1,
-            0,
-            NULL,
-            args,
-            NULL),
-        "launch_silu_mul",
-        error,
-        error_cap);
+    if (!minicpmo_gpu_cuda_check(
+            ctx,
+            ctx->cuda_launch_kernel(
+                ctx->silu_mul_fn,
+                (unsigned int) ((len + (MINICPMO_GPU_VECTOR_THREADS - 1u)) / MINICPMO_GPU_VECTOR_THREADS),
+                1,
+                1,
+                MINICPMO_GPU_VECTOR_THREADS,
+                1,
+                1,
+                0,
+                NULL,
+                args,
+                NULL),
+            "launch_silu_mul",
+            error,
+            error_cap)) {
+        return 0;
+    }
+    minicpmo_gpu_mark_slot_written(ctx, dst_slot);
+    return 1;
 }
 
 int minicpmo_gpu_context_attention_slots(
@@ -2941,6 +3031,7 @@ int minicpmo_gpu_context_attention_slots(
             error_cap)) {
         return 0;
     }
+    minicpmo_gpu_mark_slot_written(ctx, dst_slot);
     ctx->stats.attention_kernel_calls += 1u;
     return 1;
 }

@@ -2167,10 +2167,6 @@ fn qwen3_runtime_backend_open(weights: &Qwen3Weights, runtime: &Qwen3Runtime) bo
         gpu_context_close(&runtime.gpu);
         return false;
     }
-    if !qwen3_runtime_gpu_upload_weights(weights, runtime) {
-        gpu_context_close(&runtime.gpu);
-        return false;
-    }
     return true;
 }
 
@@ -2610,6 +2606,12 @@ export fn qwen3_open_runtime(path: &const byte, config: &Qwen3Config, table: &Te
         return false;
     }
     if !qwen3_runtime_alloc(config, runtime) {
+        qwen3_runtime_free(runtime);
+        tokenizer_free(tok);
+        tensor_weight_table_detach_mmap(table);
+        return false;
+    }
+    if !qwen3_runtime_gpu_upload_weights(weights, runtime) {
         qwen3_runtime_free(runtime);
         tokenizer_free(tok);
         tensor_weight_table_detach_mmap(table);
