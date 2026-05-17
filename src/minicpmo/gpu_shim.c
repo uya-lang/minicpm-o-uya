@@ -30,15 +30,15 @@ enum {
     CUDA_R_16BF = 14,
     CUBLAS_GEMM_DEFAULT = -1,
     CUBLAS_COMPUTE_32F = 68,
+    MINICPMO_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75,
+    MINICPMO_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76,
     MINICPMO_GPU_MAX_UPLOADS = 512,
     NVRTC_SUCCESS = 0,
     MINICPMO_GPU_QK_K = 256,
     MINICPMO_GPU_QK8_1 = 32,
     MINICPMO_GPU_Q8_1_BLOCKS_PER_SUPER = MINICPMO_GPU_QK_K / MINICPMO_GPU_QK8_1,
-    MINICPMO_GPU_Q8_1_D_BITS_BYTES = MINICPMO_GPU_Q8_1_BLOCKS_PER_SUPER * (int) sizeof(uint16_t),
-    MINICPMO_GPU_Q8_1_S_BITS_BYTES = MINICPMO_GPU_Q8_1_BLOCKS_PER_SUPER * (int) sizeof(uint16_t),
-    MINICPMO_GPU_Q8_1_QS_BYTES = MINICPMO_GPU_QK_K * (int) sizeof(int8_t),
-    MINICPMO_GPU_Q8_1_SUPER_BYTES = MINICPMO_GPU_Q8_1_D_BITS_BYTES + MINICPMO_GPU_Q8_1_S_BITS_BYTES + MINICPMO_GPU_Q8_1_QS_BYTES,
+    MINICPMO_GPU_Q8_1_BLOCK_BYTES = (2 * (int) sizeof(uint16_t)) + (MINICPMO_GPU_QK8_1 * (int) sizeof(int8_t)),
+    MINICPMO_GPU_Q8_1_SUPER_BYTES = MINICPMO_GPU_Q8_1_BLOCKS_PER_SUPER * MINICPMO_GPU_Q8_1_BLOCK_BYTES,
     MINICPMO_GPU_QUANT_THREADS = 128,
     MINICPMO_GPU_ATTENTION_THREADS = 256,
     MINICPMO_GPU_VECTOR_THREADS = 256,
@@ -48,6 +48,7 @@ enum {
 typedef CUresult (*minicpmo_cuda_init_fn)(unsigned int flags);
 typedef CUresult (*minicpmo_cuda_device_get_count_fn)(int *count);
 typedef CUresult (*minicpmo_cuda_device_get_fn)(CUdevice *device, int ordinal);
+typedef CUresult (*minicpmo_cuda_device_get_attribute_fn)(int *pi, int attrib, CUdevice dev);
 typedef CUresult (*minicpmo_cuda_ctx_create_fn)(CUcontext *pctx, unsigned int flags, CUdevice dev);
 typedef CUresult (*minicpmo_cuda_ctx_destroy_fn)(CUcontext ctx);
 typedef CUresult (*minicpmo_cuda_mem_alloc_fn)(CUdeviceptr *dptr, size_t bytesize);
@@ -173,6 +174,7 @@ typedef struct minicpmo_gpu_context {
     minicpmo_cuda_init_fn cuda_init;
     minicpmo_cuda_device_get_count_fn cuda_device_get_count;
     minicpmo_cuda_device_get_fn cuda_device_get;
+    minicpmo_cuda_device_get_attribute_fn cuda_device_get_attribute;
     minicpmo_cuda_ctx_create_fn cuda_ctx_create;
     minicpmo_cuda_ctx_destroy_fn cuda_ctx_destroy;
     minicpmo_cuda_mem_alloc_fn cuda_mem_alloc;
@@ -216,6 +218,8 @@ typedef struct minicpmo_gpu_context {
     unsigned int device_index;
     CUdevice cuda_device;
     CUcontext cuda_context;
+    int compute_capability_major;
+    int compute_capability_minor;
     int debug;
     int quant_kernels_attempted;
     int quant_kernels_ready;
@@ -300,11 +304,21 @@ static int minicpmo_gpu_env_flag_enabled(const char *name, int fallback) {
     return 1;
 }
 
-static int minicpmo_gpu_native_kmatvec_requested(int dtype) {
+static int minicpmo_gpu_device_supports_dp4a(const minicpmo_gpu_context *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->compute_capability_major > 6 || (ctx->compute_capability_major == 6 && ctx->compute_capability_minor >= 1);
+}
+
+static int minicpmo_gpu_native_kmatvec_requested(const minicpmo_gpu_context *ctx, int dtype) {
     if (dtype != 10 && dtype != 12) {
         return 0;
     }
-    return minicpmo_gpu_env_flag_enabled("MINICPMO_GPU_EXPERIMENTAL_NATIVE_KMATVEC", 1);
+    if (!minicpmo_gpu_env_flag_enabled("MINICPMO_GPU_EXPERIMENTAL_NATIVE_KMATVEC", 1)) {
+        return 0;
+    }
+    return minicpmo_gpu_device_supports_dp4a(ctx);
 }
 
 static size_t minicpmo_gpu_q8_1_super_bytes_for_cols(size_t cols) {
@@ -362,15 +376,16 @@ static int minicpmo_gpu_q8_1_quantize_row(unsigned char *dst, const float *src, 
     }
     for (super = 0; super < n / MINICPMO_GPU_QK_K; ++super) {
         unsigned char *super_dst = dst + super * MINICPMO_GPU_Q8_1_SUPER_BYTES;
-        uint16_t *d_bits = (uint16_t *) super_dst;
-        uint16_t *s_bits = (uint16_t *) (super_dst + MINICPMO_GPU_Q8_1_D_BITS_BYTES);
-        int8_t *qs = (int8_t *) (super_dst + MINICPMO_GPU_Q8_1_D_BITS_BYTES + MINICPMO_GPU_Q8_1_S_BITS_BYTES);
         size_t block;
         for (block = 0; block < MINICPMO_GPU_Q8_1_BLOCKS_PER_SUPER; ++block) {
+            unsigned char *block_dst = super_dst + block * MINICPMO_GPU_Q8_1_BLOCK_BYTES;
+            uint16_t *d_bits = (uint16_t *) block_dst;
+            uint16_t *s_bits = (uint16_t *) (block_dst + sizeof(uint16_t));
+            int8_t *qs = (int8_t *) (block_dst + 2u * sizeof(uint16_t));
             minicpmo_gpu_q8_1_quantize_block(
-                &d_bits[block],
-                &s_bits[block],
-                &qs[block * MINICPMO_GPU_QK8_1],
+                d_bits,
+                s_bits,
+                qs,
                 &src[super * MINICPMO_GPU_QK_K + block * MINICPMO_GPU_QK8_1]);
         }
     }
@@ -468,6 +483,12 @@ static int minicpmo_gpu_cublas_check(minicpmo_gpu_context *ctx, cublasStatus_t c
     return 0;
 }
 
+/*
+ * Portions of the native quantized CUDA matvec kernels below are adapted from
+ * llama.cpp ggml-cuda (MIT License, Copyright (c) 2023-2026 The ggml authors),
+ * primarily ggml/src/ggml-cuda/mmvq.cu and vecdotq.cuh. The surrounding
+ * driver/NVRTC bridge remains project-local glue.
+ */
 static const char *minicpmo_gpu_quant_kernel_source =
     "extern \"C\" __device__ __forceinline__ float minicpmo_half_to_float(unsigned short bits) {\n"
     "    unsigned int sign = ((unsigned int) bits >> 15) & 1u;\n"
@@ -491,6 +512,42 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "    out.u = out_bits;\n"
     "    return out.f;\n"
     "}\n"
+    "extern \"C\" __device__ __forceinline__ unsigned short minicpmo_u16_at(const unsigned char *ptr) {\n"
+    "    return (unsigned short) ((unsigned short) ptr[0] | ((unsigned short) ptr[1] << 8));\n"
+    "}\n"
+    "extern \"C\" __device__ __forceinline__ int minicpmo_i32_at(const void *ptr, int i32) {\n"
+    "    const unsigned char *p = ((const unsigned char *) ptr) + 4 * i32;\n"
+    "    unsigned int v = ((unsigned int) p[0]) | (((unsigned int) p[1]) << 8) | (((unsigned int) p[2]) << 16) | (((unsigned int) p[3]) << 24);\n"
+    "    return (int) v;\n"
+    "}\n"
+    "extern \"C\" __device__ __forceinline__ int minicpmo_i32_at_b2(const void *ptr, int i32) {\n"
+    "    const unsigned char *p = ((const unsigned char *) ptr) + 4 * i32;\n"
+    "    unsigned int lo = ((unsigned int) p[0]) | (((unsigned int) p[1]) << 8);\n"
+    "    unsigned int hi = ((unsigned int) p[2]) | (((unsigned int) p[3]) << 8);\n"
+    "    return (int) (lo | (hi << 16));\n"
+    "}\n"
+    "extern \"C\" __device__ __forceinline__ int minicpmo_i8x4_dot(int a, int b, int c) {\n"
+    "#if __CUDA_ARCH__ >= 610\n"
+    "    int r;\n"
+    "    asm(\"dp4a.s32.s32 %0, %1, %2, %3;\" : \"=r\"(r) : \"r\"(a), \"r\"(b), \"r\"(c));\n"
+    "    return r;\n"
+    "#else\n"
+    "    const signed char *aa = (const signed char *) &a;\n"
+    "    const signed char *bb = (const signed char *) &b;\n"
+    "    return c + (int) aa[0] * (int) bb[0] + (int) aa[1] * (int) bb[1] + (int) aa[2] * (int) bb[2] + (int) aa[3] * (int) bb[3];\n"
+    "#endif\n"
+    "}\n"
+    "extern \"C\" __device__ __forceinline__ int minicpmo_vsubss4_i32(int a, int b) {\n"
+    "    unsigned int out = 0u;\n"
+    "    for (int i = 0; i < 4; ++i) {\n"
+    "        int av = (int) ((a >> (8 * i)) & 255);\n"
+    "        int bv = (int) ((b >> (8 * i)) & 255);\n"
+    "        int sv = av - bv;\n"
+    "        signed char sc = (signed char) sv;\n"
+    "        out |= ((unsigned int) ((unsigned char) sc)) << (8 * i);\n"
+    "    }\n"
+    "    return (int) out;\n"
+    "}\n"
     "extern \"C\" __device__ __forceinline__ unsigned int minicpmo_q4_k_scale_at(int j, const unsigned char *scales) {\n"
     "    if (j < 4) { return (unsigned int) (scales[j] & 63u); }\n"
     "    return (unsigned int) ((scales[j + 4] & 15u) | ((scales[j - 4] >> 6) << 4));\n"
@@ -500,8 +557,8 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "    return (unsigned int) ((scales[j + 4] >> 4) | ((scales[j] >> 6) << 4));\n"
     "}\n"
     "extern \"C\" __device__ __forceinline__ float minicpmo_q8_1_d_at(const unsigned char *xq_super, int block) {\n"
-    "    const unsigned short *d_bits = (const unsigned short *) xq_super;\n"
-    "    return minicpmo_half_to_float(d_bits[block]);\n"
+    "    const unsigned char *xq_block = xq_super + block * 36;\n"
+    "    return minicpmo_half_to_float(minicpmo_u16_at(xq_block));\n"
     "}\n"
     "extern \"C\" __device__ __forceinline__ unsigned short minicpmo_float_to_half(float value) {\n"
     "    union { float f; unsigned int u; } in;\n"
@@ -541,13 +598,14 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "    int idx = super * 256 + tid;\n"
     "    int lane = tid & 31;\n"
     "    int group = tid >> 5;\n"
-    "    float x = src[idx];\n"
-    "    unsigned char *dst_super = dst + (unsigned long long) super * 288ull;\n"
+    "    float x = 0.0f;\n"
+    "    unsigned char *dst_block = dst + (unsigned long long) super * 288ull + (unsigned long long) group * 36ull;\n"
     "    __shared__ float xv[256];\n"
     "    __shared__ float av[256];\n"
     "    __shared__ float sv[256];\n"
     "    __shared__ float d_shared[8];\n"
     "    if (idx >= cols) { return; }\n"
+    "    x = src[idx];\n"
     "    xv[tid] = x;\n"
     "    av[tid] = x < 0.0f ? -x : x;\n"
     "    sv[tid] = x;\n"
@@ -563,8 +621,8 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "    if (lane == 0) {\n"
     "        float d = av[tid] > 0.0f ? av[tid] / 127.0f : 0.0f;\n"
     "        d_shared[group] = d;\n"
-    "        ((unsigned short *) dst_super)[group] = minicpmo_float_to_half(d);\n"
-    "        ((unsigned short *) (dst_super + 16))[group] = minicpmo_float_to_half(sv[tid]);\n"
+    "        ((unsigned short *) dst_block)[0] = minicpmo_float_to_half(d);\n"
+    "        ((unsigned short *) (dst_block + 2))[0] = minicpmo_float_to_half(sv[tid]);\n"
     "    }\n"
     "    __syncthreads();\n"
     "    {\n"
@@ -576,7 +634,7 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "            if (q > 127) { q = 127; }\n"
     "            if (q < -128) { q = -128; }\n"
     "        }\n"
-    "        ((signed char *) (dst_super + 32))[tid] = (signed char) q;\n"
+    "        ((signed char *) (dst_block + 4))[lane] = (signed char) q;\n"
     "    }\n"
     "}\n"
     "extern \"C\" __global__ void minicpmo_f32_to_f16(const float *src, unsigned short *dst, int n) {\n"
@@ -663,44 +721,78 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "        vec[base + tid] = vec[base + tid] * inv_shared * minicpmo_vec_weight_at(weight, weight_dtype, tid);\n"
     "    }\n"
     "}\n"
+    "extern \"C\" __device__ __forceinline__ float minicpmo_q4_k_vecdot_llama(const unsigned char *row_base, const unsigned char *xq, int kbx, int iqs) {\n"
+    "    const unsigned char *bq4 = row_base + (unsigned long long) kbx * 144ull;\n"
+    "    const unsigned char *xq_super = xq + (unsigned long long) kbx * 288ull;\n"
+    "    const unsigned char *qs = bq4 + 16;\n"
+    "    int v0;\n"
+    "    int v1;\n"
+    "    int u0;\n"
+    "    int u1;\n"
+    "    int u2;\n"
+    "    int u3;\n"
+    "    float d8_0;\n"
+    "    float d8_1;\n"
+    "    unsigned short aux0;\n"
+    "    unsigned short aux1;\n"
+    "    unsigned char sc0;\n"
+    "    unsigned char sc1;\n"
+    "    unsigned char m0;\n"
+    "    unsigned char m1;\n"
+    "    const int bq8_offset = 2 * ((iqs / 2) / 4);\n"
+    "    const int q4_offset = 16 * bq8_offset + 4 * ((iqs / 2) % 4);\n"
+    "    const int j = bq8_offset / 2;\n"
+    "    const unsigned char *scales = bq4 + 4;\n"
+    "    if (j < 2) {\n"
+    "        aux0 = (unsigned short) (minicpmo_u16_at(scales + 2 * (j + 0)) & 0x3f3fu);\n"
+    "        aux1 = (unsigned short) (minicpmo_u16_at(scales + 2 * (j + 2)) & 0x3f3fu);\n"
+    "    } else {\n"
+    "        aux0 = (unsigned short) (((minicpmo_u16_at(scales + 2 * (j + 2)) >> 0) & 0x0f0fu) | ((minicpmo_u16_at(scales + 2 * (j - 2)) & 0xc0c0u) >> 2));\n"
+    "        aux1 = (unsigned short) (((minicpmo_u16_at(scales + 2 * (j + 2)) >> 4) & 0x0f0fu) | ((minicpmo_u16_at(scales + 2 * (j - 0)) & 0xc0c0u) >> 2));\n"
+    "    }\n"
+    "    sc0 = (unsigned char) (aux0 & 255u);\n"
+    "    sc1 = (unsigned char) (aux0 >> 8);\n"
+    "    m0 = (unsigned char) (aux1 & 255u);\n"
+    "    m1 = (unsigned char) (aux1 >> 8);\n"
+    "    v0 = minicpmo_i32_at(qs + q4_offset, 0);\n"
+    "    v1 = minicpmo_i32_at(qs + q4_offset + 16, 0);\n"
+    "    {\n"
+    "        const unsigned char *bq8 = xq_super + bq8_offset * 36;\n"
+    "        const unsigned char *q8 = bq8 + 4 + 4 * ((iqs / 2) % 4);\n"
+    "        d8_0 = minicpmo_half_to_float(minicpmo_u16_at(bq8));\n"
+    "        u0 = minicpmo_i32_at(q8, 0);\n"
+    "        u1 = minicpmo_i32_at(q8 + 16, 0);\n"
+    "    }\n"
+    "    {\n"
+    "        const unsigned char *bq8 = xq_super + (bq8_offset + 1) * 36;\n"
+    "        const unsigned char *q8 = bq8 + 4 + 4 * ((iqs / 2) % 4);\n"
+    "        d8_1 = minicpmo_half_to_float(minicpmo_u16_at(bq8));\n"
+    "        u2 = minicpmo_i32_at(q8, 0);\n"
+    "        u3 = minicpmo_i32_at(q8 + 16, 0);\n"
+    "    }\n"
+    "    {\n"
+    "        const int v00 = (v0 >> 0) & 0x0f0f0f0f;\n"
+    "        const int v10 = (v1 >> 0) & 0x0f0f0f0f;\n"
+    "        const int v01 = (v0 >> 4) & 0x0f0f0f0f;\n"
+    "        const int v11 = (v1 >> 4) & 0x0f0f0f0f;\n"
+    "        const int dot_d0 = minicpmo_i8x4_dot(v10, u1, minicpmo_i8x4_dot(v00, u0, 0));\n"
+    "        const int dot_m0 = minicpmo_i8x4_dot(0x01010101, u1, minicpmo_i8x4_dot(0x01010101, u0, 0));\n"
+    "        const int dot_d1 = minicpmo_i8x4_dot(v11, u3, minicpmo_i8x4_dot(v01, u2, 0));\n"
+    "        const int dot_m1 = minicpmo_i8x4_dot(0x01010101, u3, minicpmo_i8x4_dot(0x01010101, u2, 0));\n"
+    "        const float d = minicpmo_half_to_float(minicpmo_u16_at(bq4));\n"
+    "        const float dmin = minicpmo_half_to_float(minicpmo_u16_at(bq4 + 2));\n"
+    "        return d * (d8_0 * (float) dot_d0 * (float) sc0 + d8_1 * (float) dot_d1 * (float) sc1) - dmin * (d8_0 * (float) dot_m0 * (float) m0 + d8_1 * (float) dot_m1 * (float) m1);\n"
+    "    }\n"
+    "}\n"
     "extern \"C\" __device__ __forceinline__ float minicpmo_q4_k_dot_row(const unsigned char *weights, const unsigned char *xq, int row, int cols) {\n"
     "    int tid = (int) threadIdx.x;\n"
     "    int blocks_per_row = cols / 256;\n"
+    "    int iqs = 2 * (tid % 16);\n"
+    "    int kbx = tid / 16;\n"
     "    float sum = 0.0f;\n"
-    "    unsigned long long row_offset = (unsigned long long) row * (unsigned long long) blocks_per_row * 144ull;\n"
-    "    for (int block = tid; block < blocks_per_row; block += (int) blockDim.x) {\n"
-    "        const unsigned char *base = weights + row_offset + (unsigned long long) block * 144ull;\n"
-    "        const unsigned char *xq_base = xq + (unsigned long long) block * 288ull;\n"
-    "        float d = minicpmo_half_to_float((unsigned short) (base[0] | ((unsigned short) base[1] << 8)));\n"
-    "        float dmin = minicpmo_half_to_float((unsigned short) (base[2] | ((unsigned short) base[3] << 8)));\n"
-    "        const unsigned char *scales = base + 4;\n"
-    "        const unsigned char *qs = base + 16;\n"
-    "        const signed char *xqs = (const signed char *) (xq_base + 32);\n"
-    "        for (int group = 0; group < 4; ++group) {\n"
-    "            int qbase = group * 32;\n"
-    "            int q8_base0 = group * 64;\n"
-    "            int q8_base1 = q8_base0 + 32;\n"
-    "            float wd0 = d * (float) minicpmo_q4_k_scale_at(group * 2 + 0, scales);\n"
-    "            float wm0 = dmin * (float) minicpmo_q4_k_min_at(group * 2 + 0, scales);\n"
-    "            float wd1 = d * (float) minicpmo_q4_k_scale_at(group * 2 + 1, scales);\n"
-    "            float wm1 = dmin * (float) minicpmo_q4_k_min_at(group * 2 + 1, scales);\n"
-    "            float xd0 = minicpmo_q8_1_d_at(xq_base, group * 2 + 0);\n"
-    "            float xd1 = minicpmo_q8_1_d_at(xq_base, group * 2 + 1);\n"
-    "            int dot0 = 0;\n"
-    "            int dot1 = 0;\n"
-    "            int sum0 = 0;\n"
-    "            int sum1 = 0;\n"
-    "            for (int l = 0; l < 32; ++l) {\n"
-    "                int xv0 = (int) xqs[q8_base0 + l];\n"
-    "                int xv1 = (int) xqs[q8_base1 + l];\n"
-    "                dot0 += (int) (qs[qbase + l] & 15u) * xv0;\n"
-    "                dot1 += (int) (qs[qbase + l] >> 4) * xv1;\n"
-    "                sum0 += xv0;\n"
-    "                sum1 += xv1;\n"
-    "            }\n"
-    "            sum += xd0 * (wd0 * (float) dot0 - wm0 * (float) sum0);\n"
-    "            sum += xd1 * (wd1 * (float) dot1 - wm1 * (float) sum1);\n"
-    "        }\n"
+    "    const unsigned char *row_base = weights + (unsigned long long) row * (unsigned long long) blocks_per_row * 144ull;\n"
+    "    for (; kbx < blocks_per_row; kbx += 8) {\n"
+    "        sum += minicpmo_q4_k_vecdot_llama(row_base, xq, kbx, iqs);\n"
     "    }\n"
     "    return sum;\n"
     "}\n"
@@ -729,48 +821,9 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "extern \"C\" __global__ void minicpmo_q4_k_matvec(const unsigned char *weights, const unsigned char *xq, float *dst, int rows, int cols) {\n"
     "    int row = (int) blockIdx.x;\n"
     "    int tid = (int) threadIdx.x;\n"
-    "    int blocks_per_row = cols / 256;\n"
-    "    float sum = 0.0f;\n"
     "    __shared__ float reduce_buf[128];\n"
     "    if (row >= rows) { return; }\n"
-    "    {\n"
-    "        unsigned long long row_offset = (unsigned long long) row * (unsigned long long) blocks_per_row * 144ull;\n"
-    "        for (int block = tid; block < blocks_per_row; block += (int) blockDim.x) {\n"
-    "            const unsigned char *base = weights + row_offset + (unsigned long long) block * 144ull;\n"
-    "            const unsigned char *xq_base = xq + (unsigned long long) block * 288ull;\n"
-    "            float d = minicpmo_half_to_float((unsigned short) (base[0] | ((unsigned short) base[1] << 8)));\n"
-    "            float dmin = minicpmo_half_to_float((unsigned short) (base[2] | ((unsigned short) base[3] << 8)));\n"
-    "            const unsigned char *scales = base + 4;\n"
-    "            const unsigned char *qs = base + 16;\n"
-    "            const signed char *xqs = (const signed char *) (xq_base + 32);\n"
-    "            for (int group = 0; group < 4; ++group) {\n"
-    "                int qbase = group * 32;\n"
-    "                int q8_base0 = group * 64;\n"
-    "                int q8_base1 = q8_base0 + 32;\n"
-    "                float wd0 = d * (float) minicpmo_q4_k_scale_at(group * 2 + 0, scales);\n"
-    "                float wm0 = dmin * (float) minicpmo_q4_k_min_at(group * 2 + 0, scales);\n"
-    "                float wd1 = d * (float) minicpmo_q4_k_scale_at(group * 2 + 1, scales);\n"
-    "                float wm1 = dmin * (float) minicpmo_q4_k_min_at(group * 2 + 1, scales);\n"
-    "                float xd0 = minicpmo_q8_1_d_at(xq_base, group * 2 + 0);\n"
-    "                float xd1 = minicpmo_q8_1_d_at(xq_base, group * 2 + 1);\n"
-    "                int dot0 = 0;\n"
-    "                int dot1 = 0;\n"
-    "                int sum0 = 0;\n"
-    "                int sum1 = 0;\n"
-    "                for (int l = 0; l < 32; ++l) {\n"
-    "                    int xv0 = (int) xqs[q8_base0 + l];\n"
-    "                    int xv1 = (int) xqs[q8_base1 + l];\n"
-    "                    dot0 += (int) (qs[qbase + l] & 15u) * xv0;\n"
-    "                    dot1 += (int) (qs[qbase + l] >> 4) * xv1;\n"
-    "                    sum0 += xv0;\n"
-    "                    sum1 += xv1;\n"
-    "                }\n"
-    "                sum += xd0 * (wd0 * (float) dot0 - wm0 * (float) sum0);\n"
-    "                sum += xd1 * (wd1 * (float) dot1 - wm1 * (float) sum1);\n"
-    "            }\n"
-    "        }\n"
-    "    }\n"
-    "    reduce_buf[tid] = sum;\n"
+    "    reduce_buf[tid] = minicpmo_q4_k_dot_row(weights, xq, row, cols);\n"
     "    __syncthreads();\n"
     "    for (int stride = (int) blockDim.x / 2; stride > 0; stride >>= 1) {\n"
     "        if (tid < stride) { reduce_buf[tid] += reduce_buf[tid + stride]; }\n"
@@ -778,36 +831,38 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "    }\n"
     "    if (tid == 0) { dst[row] = reduce_buf[0]; }\n"
     "}\n"
+    "extern \"C\" __device__ __forceinline__ float minicpmo_q6_k_vecdot_llama(const unsigned char *row_base, const unsigned char *xq, int kbx, int iqs) {\n"
+    "    const unsigned char *bq6 = row_base + (unsigned long long) kbx * 210ull;\n"
+    "    const unsigned char *xq_super = xq + (unsigned long long) kbx * 288ull;\n"
+    "    const int bq8_offset = 4 * (iqs / 16) + ((iqs % 16) / 8);\n"
+    "    const int scale_offset = 8 * (iqs / 16) + ((iqs % 16) / 4);\n"
+    "    const int vh_shift = 2 * ((iqs % 16) / 8);\n"
+    "    const int vl = minicpmo_i32_at_b2(bq6, iqs);\n"
+    "    const int vh = minicpmo_i32_at_b2(bq6 + 128, 8 * (iqs / 16) + (iqs % 8)) >> vh_shift;\n"
+    "    const signed char *scales = (const signed char *) (bq6 + 192 + scale_offset);\n"
+    "    const float d = minicpmo_half_to_float(minicpmo_u16_at(bq6 + 208));\n"
+    "    float sumf = 0.0f;\n"
+    "    for (int i = 0; i < 2; ++i) {\n"
+    "        const unsigned char *bq8 = xq_super + (bq8_offset + 2 * i) * 36;\n"
+    "        const int u = minicpmo_i32_at(bq8 + 4, iqs % 8);\n"
+    "        const float d8 = minicpmo_half_to_float(minicpmo_u16_at(bq8));\n"
+    "        const int sc = (int) scales[4 * i];\n"
+    "        const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;\n"
+    "        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;\n"
+    "        const int vi = minicpmo_vsubss4_i32(vil | vih, 0x20202020);\n"
+    "        sumf += d8 * ((float) minicpmo_i8x4_dot(vi, u, 0) * (float) sc);\n"
+    "    }\n"
+    "    return d * sumf;\n"
+    "}\n"
     "extern \"C\" __device__ __forceinline__ float minicpmo_q6_k_dot_row(const unsigned char *weights, const unsigned char *xq, int row, int cols) {\n"
     "    int tid = (int) threadIdx.x;\n"
     "    int blocks_per_row = cols / 256;\n"
+    "    int iqs = tid % 32;\n"
+    "    int kbx = tid / 32;\n"
     "    float sum = 0.0f;\n"
-    "    unsigned long long row_offset = (unsigned long long) row * (unsigned long long) blocks_per_row * 210ull;\n"
-    "    for (int block = tid; block < blocks_per_row; block += (int) blockDim.x) {\n"
-    "        const unsigned char *base = weights + row_offset + (unsigned long long) block * 210ull;\n"
-    "        const unsigned char *xq_base = xq + (unsigned long long) block * 288ull;\n"
-    "        const unsigned char *ql = base;\n"
-    "        const unsigned char *qh = base + 128;\n"
-    "        const signed char *sc = (const signed char *) (base + 192);\n"
-    "        float d = minicpmo_half_to_float((unsigned short) (base[208] | ((unsigned short) base[209] << 8)));\n"
-    "        const signed char *xqs = (const signed char *) (xq_base + 32);\n"
-    "        for (int n = 0; n < 256; n += 128) {\n"
-    "            float xd0 = minicpmo_q8_1_d_at(xq_base, n / 32 + 0);\n"
-    "            float xd1 = minicpmo_q8_1_d_at(xq_base, n / 32 + 1);\n"
-    "            float xd2 = minicpmo_q8_1_d_at(xq_base, n / 32 + 2);\n"
-    "            float xd3 = minicpmo_q8_1_d_at(xq_base, n / 32 + 3);\n"
-    "            for (int l = 0; l < 32; ++l) {\n"
-    "                int isv = l / 16;\n"
-    "                int q1 = ((int) (ql[n / 2 + l] & 15u) | (((int) ((qh[n / 4 + l] >> 0) & 3u)) << 4)) - 32;\n"
-    "                int q2 = ((int) (ql[n / 2 + l + 32] & 15u) | (((int) ((qh[n / 4 + l] >> 2) & 3u)) << 4)) - 32;\n"
-    "                int q3 = ((int) (ql[n / 2 + l] >> 4) | (((int) ((qh[n / 4 + l] >> 4) & 3u)) << 4)) - 32;\n"
-    "                int q4 = ((int) (ql[n / 2 + l + 32] >> 4) | (((int) ((qh[n / 4 + l] >> 6) & 3u)) << 4)) - 32;\n"
-    "                sum += xd0 * ((float) xqs[n + l]) * d * (float) sc[n / 16 + isv + 0] * (float) q1;\n"
-    "                sum += xd1 * ((float) xqs[n + 32 + l]) * d * (float) sc[n / 16 + isv + 2] * (float) q2;\n"
-    "                sum += xd2 * ((float) xqs[n + 64 + l]) * d * (float) sc[n / 16 + isv + 4] * (float) q3;\n"
-    "                sum += xd3 * ((float) xqs[n + 96 + l]) * d * (float) sc[n / 16 + isv + 6] * (float) q4;\n"
-    "            }\n"
-    "        }\n"
+    "    const unsigned char *row_base = weights + (unsigned long long) row * (unsigned long long) blocks_per_row * 210ull;\n"
+    "    for (; kbx < blocks_per_row; kbx += 4) {\n"
+    "        sum += minicpmo_q6_k_vecdot_llama(row_base, xq, kbx, iqs);\n"
     "    }\n"
     "    return sum;\n"
     "}\n"
@@ -836,40 +891,9 @@ static const char *minicpmo_gpu_quant_kernel_source =
     "extern \"C\" __global__ void minicpmo_q6_k_matvec(const unsigned char *weights, const unsigned char *xq, float *dst, int rows, int cols) {\n"
     "    int row = (int) blockIdx.x;\n"
     "    int tid = (int) threadIdx.x;\n"
-    "    int blocks_per_row = cols / 256;\n"
-    "    float sum = 0.0f;\n"
     "    __shared__ float reduce_buf[128];\n"
     "    if (row >= rows) { return; }\n"
-    "    {\n"
-    "        unsigned long long row_offset = (unsigned long long) row * (unsigned long long) blocks_per_row * 210ull;\n"
-    "        for (int block = tid; block < blocks_per_row; block += (int) blockDim.x) {\n"
-    "            const unsigned char *base = weights + row_offset + (unsigned long long) block * 210ull;\n"
-    "            const unsigned char *xq_base = xq + (unsigned long long) block * 288ull;\n"
-    "            const unsigned char *ql = base;\n"
-    "            const unsigned char *qh = base + 128;\n"
-    "            const signed char *sc = (const signed char *) (base + 192);\n"
-    "            float d = minicpmo_half_to_float((unsigned short) (base[208] | ((unsigned short) base[209] << 8)));\n"
-    "            const signed char *xqs = (const signed char *) (xq_base + 32);\n"
-    "            for (int n = 0; n < 256; n += 128) {\n"
-    "                float xd0 = minicpmo_q8_1_d_at(xq_base, n / 32 + 0);\n"
-    "                float xd1 = minicpmo_q8_1_d_at(xq_base, n / 32 + 1);\n"
-    "                float xd2 = minicpmo_q8_1_d_at(xq_base, n / 32 + 2);\n"
-    "                float xd3 = minicpmo_q8_1_d_at(xq_base, n / 32 + 3);\n"
-    "                for (int l = 0; l < 32; ++l) {\n"
-    "                    int isv = l / 16;\n"
-    "                    int q1 = ((int) (ql[n / 2 + l] & 15u) | (((int) ((qh[n / 4 + l] >> 0) & 3u)) << 4)) - 32;\n"
-    "                    int q2 = ((int) (ql[n / 2 + l + 32] & 15u) | (((int) ((qh[n / 4 + l] >> 2) & 3u)) << 4)) - 32;\n"
-    "                    int q3 = ((int) (ql[n / 2 + l] >> 4) | (((int) ((qh[n / 4 + l] >> 4) & 3u)) << 4)) - 32;\n"
-    "                    int q4 = ((int) (ql[n / 2 + l + 32] >> 4) | (((int) ((qh[n / 4 + l] >> 6) & 3u)) << 4)) - 32;\n"
-    "                    sum += xd0 * ((float) xqs[n + l]) * d * (float) sc[n / 16 + isv + 0] * (float) q1;\n"
-    "                    sum += xd1 * ((float) xqs[n + 32 + l]) * d * (float) sc[n / 16 + isv + 2] * (float) q2;\n"
-    "                    sum += xd2 * ((float) xqs[n + 64 + l]) * d * (float) sc[n / 16 + isv + 4] * (float) q3;\n"
-    "                    sum += xd3 * ((float) xqs[n + 96 + l]) * d * (float) sc[n / 16 + isv + 6] * (float) q4;\n"
-    "                }\n"
-    "            }\n"
-    "        }\n"
-    "    }\n"
-    "    reduce_buf[tid] = sum;\n"
+    "    reduce_buf[tid] = minicpmo_q6_k_dot_row(weights, xq, row, cols);\n"
     "    __syncthreads();\n"
     "    for (int stride = (int) blockDim.x / 2; stride > 0; stride >>= 1) {\n"
     "        if (tid < stride) { reduce_buf[tid] += reduce_buf[tid + stride]; }\n"
@@ -972,6 +996,23 @@ static void minicpmo_gpu_nvrtc_log(
     free(log);
 }
 
+static void minicpmo_gpu_nvrtc_arch_option(const minicpmo_gpu_context *ctx, char *dst, size_t dst_cap) {
+    int major = ctx != NULL ? ctx->compute_capability_major : 0;
+    int minor = ctx != NULL ? ctx->compute_capability_minor : 0;
+    if (dst == NULL || dst_cap == 0) {
+        return;
+    }
+    if (major > 6 || (major == 6 && minor >= 1)) {
+        snprintf(dst, dst_cap, "--gpu-architecture=compute_61");
+        return;
+    }
+    if (major >= 5) {
+        snprintf(dst, dst_cap, "--gpu-architecture=compute_%d%d", major, minor);
+        return;
+    }
+    snprintf(dst, dst_cap, "--gpu-architecture=compute_50");
+}
+
 static int minicpmo_gpu_prepare_quant_runtime(minicpmo_gpu_context *ctx, char *error, size_t error_cap) {
     static const char *const nvrtc_names[] = {
         "libnvrtc.so.12",
@@ -1022,8 +1063,9 @@ static int minicpmo_gpu_prepare_quant_kernels(minicpmo_gpu_context *ctx, char *e
     nvrtcProgram program = NULL;
     char *ptx = NULL;
     size_t ptx_size = 0;
+    char arch_option[64];
     const char *options[] = {
-        "--gpu-architecture=compute_52",
+        arch_option,
         "--std=c++11",
         "--fmad=false",
     };
@@ -1042,6 +1084,7 @@ static int minicpmo_gpu_prepare_quant_kernels(minicpmo_gpu_context *ctx, char *e
     if (!minicpmo_gpu_prepare_quant_runtime(ctx, error, error_cap)) {
         return 0;
     }
+    minicpmo_gpu_nvrtc_arch_option(ctx, arch_option, sizeof(arch_option));
     if (!minicpmo_gpu_nvrtc_check(ctx, ctx->nvrtc_create_program(&program, minicpmo_gpu_quant_kernel_source, "minicpmo_quant_kernels.cu", 0, NULL, NULL), "create_program", error, error_cap)) {
         return 0;
     }
@@ -1067,8 +1110,48 @@ static int minicpmo_gpu_prepare_quant_kernels(minicpmo_gpu_context *ctx, char *e
         return 0;
     }
     ctx->nvrtc_destroy_program(&program);
-    if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_load_data_ex(&ctx->quant_module, ptx, 0, NULL, NULL), "module_load_data_ex", error, error_cap) ||
-        !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->q4_k_matvec_fn, ctx->quant_module, "minicpmo_q4_k_matvec"), "module_get_function_q4_k", error, error_cap) ||
+    {
+        enum {
+            MINICPMO_CU_JIT_INFO_LOG_BUFFER = 3,
+            MINICPMO_CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4,
+            MINICPMO_CU_JIT_ERROR_LOG_BUFFER = 5,
+            MINICPMO_CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6,
+            MINICPMO_CU_JIT_LOG_VERBOSE = 12,
+        };
+        int jit_options[5];
+        void *jit_values[5];
+        char jit_info[4096];
+        char jit_error[4096];
+        CUresult load_result;
+        jit_info[0] = '\0';
+        jit_error[0] = '\0';
+        jit_options[0] = MINICPMO_CU_JIT_INFO_LOG_BUFFER;
+        jit_options[1] = MINICPMO_CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES;
+        jit_options[2] = MINICPMO_CU_JIT_ERROR_LOG_BUFFER;
+        jit_options[3] = MINICPMO_CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES;
+        jit_options[4] = MINICPMO_CU_JIT_LOG_VERBOSE;
+        jit_values[0] = jit_info;
+        jit_values[1] = (void *) (uintptr_t) sizeof(jit_info);
+        jit_values[2] = jit_error;
+        jit_values[3] = (void *) (uintptr_t) sizeof(jit_error);
+        jit_values[4] = (void *) (uintptr_t) 1u;
+        load_result = ctx->cuda_module_load_data_ex(&ctx->quant_module, ptx, 5, jit_options, jit_values);
+        if (load_result != CUDA_SUCCESS) {
+            char message[512];
+            const char *detail = "unknown";
+            if (ctx->cuda_get_error_string != NULL) {
+                ctx->cuda_get_error_string(load_result, &detail);
+            }
+            snprintf(message, sizeof(message), "error: cuda module_load_data_ex failed code=%d detail=%s jit_error=%s", load_result, detail != NULL ? detail : "unknown", jit_error[0] != '\0' ? jit_error : "(empty)");
+            minicpmo_gpu_set_error(ctx, error, error_cap, message);
+            free(ptx);
+            return 0;
+        }
+        if (ctx->debug && jit_info[0] != '\0') {
+            fprintf(stderr, "minicpmo-gpu: jit info: %s\n", jit_info);
+        }
+    }
+    if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->q4_k_matvec_fn, ctx->quant_module, "minicpmo_q4_k_matvec"), "module_get_function_q4_k", error, error_cap) ||
         !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->q6_k_matvec_fn, ctx->quant_module, "minicpmo_q6_k_matvec"), "module_get_function_q6_k", error, error_cap) ||
         !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->q4_k_matvec_multi_fn, ctx->quant_module, "minicpmo_q4_k_matvec_multi"), "module_get_function_q4_k_multi", error, error_cap) ||
         !minicpmo_gpu_cuda_check(ctx, ctx->cuda_module_get_function(&ctx->q6_k_matvec_multi_fn, ctx->quant_module, "minicpmo_q6_k_matvec_multi"), "module_get_function_q6_k_multi", error, error_cap) ||
@@ -1634,7 +1717,7 @@ static int minicpmo_gpu_prepare_staging(minicpmo_gpu_context *ctx, minicpmo_gpu_
             minicpmo_gpu_set_error(ctx, error, error_cap, "error: gpu quant staging requires cols multiple of 256");
             return 0;
         }
-        if (minicpmo_gpu_native_kmatvec_requested(upload->dtype)) {
+        if (minicpmo_gpu_native_kmatvec_requested(ctx, upload->dtype)) {
             char native_error[512];
             if (minicpmo_gpu_prepare_quant_kernels(ctx, native_error, sizeof(native_error))) {
                 upload->staged_host_ptr = upload->host_ptr;
@@ -2071,6 +2154,7 @@ int minicpmo_gpu_context_create(unsigned int device_index, int debug, void **out
     if (!minicpmo_gpu_resolve_symbol(ctx, ctx->cuda_lib, "cuInit", (void **) &ctx->cuda_init, error, error_cap) ||
         !minicpmo_gpu_resolve_symbol(ctx, ctx->cuda_lib, "cuDeviceGetCount", (void **) &ctx->cuda_device_get_count, error, error_cap) ||
         !minicpmo_gpu_resolve_symbol(ctx, ctx->cuda_lib, "cuDeviceGet", (void **) &ctx->cuda_device_get, error, error_cap) ||
+        !minicpmo_gpu_resolve_symbol(ctx, ctx->cuda_lib, "cuDeviceGetAttribute", (void **) &ctx->cuda_device_get_attribute, error, error_cap) ||
         !minicpmo_gpu_resolve_symbol(ctx, ctx->cuda_lib, "cuCtxCreate_v2", (void **) &ctx->cuda_ctx_create, error, error_cap) ||
         !minicpmo_gpu_resolve_symbol(ctx, ctx->cuda_lib, "cuCtxDestroy_v2", (void **) &ctx->cuda_ctx_destroy, error, error_cap) ||
         !minicpmo_gpu_resolve_symbol(ctx, ctx->cuda_lib, "cuMemAlloc_v2", (void **) &ctx->cuda_mem_alloc, error, error_cap) ||
@@ -2112,6 +2196,11 @@ int minicpmo_gpu_context_create(unsigned int device_index, int debug, void **out
         minicpmo_gpu_context_destroy(ctx);
         return 0;
     }
+    if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_device_get_attribute(&ctx->compute_capability_major, MINICPMO_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, ctx->cuda_device), "device_get_attribute_major", error, error_cap) ||
+        !minicpmo_gpu_cuda_check(ctx, ctx->cuda_device_get_attribute(&ctx->compute_capability_minor, MINICPMO_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, ctx->cuda_device), "device_get_attribute_minor", error, error_cap)) {
+        minicpmo_gpu_context_destroy(ctx);
+        return 0;
+    }
     if (!minicpmo_gpu_cuda_check(ctx, ctx->cuda_ctx_create(&ctx->cuda_context, 0, ctx->cuda_device), "ctx_create", error, error_cap)) {
         minicpmo_gpu_context_destroy(ctx);
         return 0;
@@ -2150,7 +2239,11 @@ int minicpmo_gpu_context_create(unsigned int device_index, int debug, void **out
     end_us = minicpmo_gpu_now_us();
     ctx->stats.backend_init_us = end_us - start_us;
     if (ctx->debug) {
-        fprintf(stderr, "minicpmo-gpu: create device=%u init_us=%llu\n", device_index, (unsigned long long) ctx->stats.backend_init_us);
+        fprintf(stderr, "minicpmo-gpu: create device=%u cc=%d.%d init_us=%llu\n",
+            device_index,
+            ctx->compute_capability_major,
+            ctx->compute_capability_minor,
+            (unsigned long long) ctx->stats.backend_init_us);
     }
     *out_handle = ctx;
     minicpmo_gpu_copy_error(error, error_cap, "");
@@ -3016,7 +3109,7 @@ static int minicpmo_gpu_context_slot_matvec_multi(
         minicpmo_gpu_set_error(ctx, error, error_cap, "error: invalid grouped gpu slot matvec arguments");
         return 0;
     }
-    if ((dtypes[0] == 10 || dtypes[0] == 12) && minicpmo_gpu_native_kmatvec_requested(dtypes[0])) {
+    if ((dtypes[0] == 10 || dtypes[0] == 12) && minicpmo_gpu_native_kmatvec_requested(ctx, dtypes[0])) {
         char native_error[512];
         native_error[0] = '\0';
         native_result = minicpmo_gpu_context_slot_matvec_multi_native(ctx, count, dst_slots, tensor_names, host_ptrs, dtypes, out_dims, src_slot, in_dim, native_error, sizeof(native_error));
