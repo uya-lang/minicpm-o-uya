@@ -530,7 +530,8 @@ fn qwen3_validate_runtime_matvec_dtypes(weights: &Qwen3Weights) bool {
 
 fn qwen3_check_cuda_runtime_matvec_tensor(view: &TensorView, role: &const byte, layer: u32) bool {
     if gpu_dtype_matvec_supported(view.dtype) { return true; }
-    _ = printf("error: qwen3 runtime layer=%u tensor=%s role=%s dtype=%s backend=cuda supported_dtypes=F32|F16|BF16|Q4_K|Q6_K attention=cuda kv_cache=device no_cpu_fallback=true\n", layer, &view.name[0], role, tensor_dtype_name(view.dtype));
+    if view.dtype == TensorDType.Q6_K { return true; }
+    _ = printf("error: qwen3 runtime layer=%u tensor=%s role=%s dtype=%s backend=cuda supported_dtypes=F32|F16|BF16|Q4_K q6_k=cpu_fallback attention=cuda kv_cache=device\n", layer, &view.name[0], role, tensor_dtype_name(view.dtype));
     return false;
 }
 
@@ -1306,6 +1307,28 @@ fn qwen3_cpu_q8_1_enabled() bool {
     return qwen3_cpu_q8_1_flag;
 }
 
+fn qwen3_cuda_attention_enabled() bool {
+    const value: &const byte = getenv("MINICPMO_GPU_ATTENTION\0" as &const byte) as &const byte;
+    if value == null || value[0] == 0 {
+        return false;
+    }
+    if value[0] == 48 as byte && value[1] == 0 {
+        return false;
+    }
+    return true;
+}
+
+fn qwen3_cuda_device_forward_enabled() bool {
+    const value: &const byte = getenv("MINICPMO_GPU_DEVICE_FORWARD\0" as &const byte) as &const byte;
+    if value == null || value[0] == 0 {
+        return false;
+    }
+    if value[0] == 48 as byte && value[1] == 0 {
+        return false;
+    }
+    return true;
+}
+
 fn qwen3_matvec_pool_prepare_q8_1(pool: &Qwen3MatvecPool, x: &const f32, in_dim: usize, dtype: TensorDType) &void {
     if pool == null || x == null {
         return null;
@@ -1392,6 +1415,10 @@ fn qwen3_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usiz
 
 fn qwen3_runtime_matvec_view(runtime: &Qwen3Runtime, dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) bool {
     if runtime.device.backend == BackendKind.Cuda {
+        if matrix.dtype == TensorDType.Q6_K {
+            qwen3_matvec_view(dst, matrix, x, in_dim, out_dim);
+            return true;
+        }
         if !gpu_dtype_matvec_supported(matrix.dtype) {
             gpu_print_runtime_unsupported("qwen3 cuda matvec unsupported\0" as &const byte, matrix);
             return false;
@@ -1407,7 +1434,7 @@ fn qwen3_runtime_matvec_view(runtime: &Qwen3Runtime, dst: &f32, matrix: &TensorV
 }
 
 fn qwen3_runtime_attention_view(runtime: &Qwen3Runtime, dst: &f32, q: &const f32, k: &const f32, v: &const f32, layer: usize, pos: usize, head_count: usize, kv_head_count: usize, head_dim: usize) bool {
-    if runtime.device.backend == BackendKind.Cuda {
+    if runtime.device.backend == BackendKind.Cuda && qwen3_cuda_attention_enabled() {
         if !gpu_context_attention(&runtime.gpu, q, k, v, layer, pos, head_count, kv_head_count, head_dim, runtime.context_capacity, dst) {
             _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
             return false;
@@ -1801,7 +1828,7 @@ fn qwen3_forward_embedding_runtime(config: &Qwen3Config, weights: &Qwen3Weights,
         _ = printf("error: qwen3 forward pos=%zu exceeds runtime_context=%zu max_context=%zu\n", pos, runtime.context_capacity, QWEN3_FORWARD_MAX_CONTEXT);
         return false;
     }
-    if runtime.device.backend == BackendKind.Cuda {
+    if runtime.device.backend == BackendKind.Cuda && qwen3_cuda_device_forward_enabled() {
         return qwen3_forward_embedding_runtime_cuda(config, weights, runtime, embedding, pos, logits, compute_logits, hidden_out, hidden_out_len);
     }
     const hidden_n: usize = config.hidden_size as usize;
@@ -2120,30 +2147,38 @@ fn qwen3_runtime_context_capacity(config: &Qwen3Config) usize {
     return cap;
 }
 
+fn qwen3_runtime_gpu_upload_matvec_tensor(runtime: &Qwen3Runtime, view: &TensorView) bool {
+    if view.dtype == TensorDType.Q6_K {
+        return true;
+    }
+    if !gpu_context_upload_tensor(&runtime.gpu, view) {
+        _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
+        return false;
+    }
+    return true;
+}
+
 fn qwen3_runtime_gpu_upload_weights(weights: &Qwen3Weights, runtime: &Qwen3Runtime) bool {
     if runtime.device.backend != BackendKind.Cuda { return true; }
     if !gpu_context_upload_tensor(&runtime.gpu, weights.output_norm) {
         _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
         return false;
     }
-    if !gpu_context_upload_tensor(&runtime.gpu, weights.output) {
-        _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
-        return false;
-    }
+    if !qwen3_runtime_gpu_upload_matvec_tensor(runtime, weights.output) { return false; }
     var layer: u32 = 0;
     while layer < weights.layer_count {
         const lw: &Qwen3LayerWeights = &weights.layers[layer as usize];
         if !gpu_context_upload_tensor(&runtime.gpu, lw.attn_norm) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_upload_tensor(&runtime.gpu, lw.q_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_upload_tensor(&runtime.gpu, lw.k_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_upload_tensor(&runtime.gpu, lw.v_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_upload_tensor(&runtime.gpu, lw.o_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !qwen3_runtime_gpu_upload_matvec_tensor(runtime, lw.q_proj) { return false; }
+        if !qwen3_runtime_gpu_upload_matvec_tensor(runtime, lw.k_proj) { return false; }
+        if !qwen3_runtime_gpu_upload_matvec_tensor(runtime, lw.v_proj) { return false; }
+        if !qwen3_runtime_gpu_upload_matvec_tensor(runtime, lw.o_proj) { return false; }
         if lw.q_norm != null && !gpu_context_upload_tensor(&runtime.gpu, lw.q_norm) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if lw.k_norm != null && !gpu_context_upload_tensor(&runtime.gpu, lw.k_norm) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
         if !gpu_context_upload_tensor(&runtime.gpu, lw.ffn_norm) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_upload_tensor(&runtime.gpu, lw.gate_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_upload_tensor(&runtime.gpu, lw.up_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
-        if !gpu_context_upload_tensor(&runtime.gpu, lw.down_proj) { _ = printf("%s\n", gpu_context_last_error(&runtime.gpu)); return false; }
+        if !qwen3_runtime_gpu_upload_matvec_tensor(runtime, lw.gate_proj) { return false; }
+        if !qwen3_runtime_gpu_upload_matvec_tensor(runtime, lw.up_proj) { return false; }
+        if !qwen3_runtime_gpu_upload_matvec_tensor(runtime, lw.down_proj) { return false; }
         layer = layer + 1;
     }
     gpu_context_refresh_stats(&runtime.gpu);
@@ -2173,7 +2208,7 @@ fn qwen3_runtime_alloc(config: &Qwen3Config, runtime: &Qwen3Runtime) bool {
     const kv_dim: usize = (config.kv_head_count * config.head_dim) as usize;
     const context_capacity: usize = qwen3_runtime_context_capacity(config);
     const cache_count: usize = (config.layer_count as usize) * context_capacity * kv_dim;
-    const use_device_kv: bool = runtime.device.backend == BackendKind.Cuda;
+    const use_device_kv: bool = runtime.device.backend == BackendKind.Cuda && (qwen3_cuda_attention_enabled() || qwen3_cuda_device_forward_enabled());
     if use_device_kv {
         runtime.k_cache = null;
         runtime.v_cache = null;

@@ -312,7 +312,7 @@ static int minicpmo_gpu_device_supports_dp4a(const minicpmo_gpu_context *ctx) {
 }
 
 static int minicpmo_gpu_native_kmatvec_requested(const minicpmo_gpu_context *ctx, int dtype) {
-    if (dtype != 10 && dtype != 12) {
+    if (dtype != 10) {
         return 0;
     }
     if (!minicpmo_gpu_env_flag_enabled("MINICPMO_GPU_EXPERIMENTAL_NATIVE_KMATVEC", 1)) {
@@ -1712,7 +1712,7 @@ static int minicpmo_gpu_prepare_staging(minicpmo_gpu_context *ctx, minicpmo_gpu_
         minicpmo_gpu_finalize_upload_plan(ctx, upload);
         return 1;
     }
-    if (upload->dtype == 10 || upload->dtype == 12) {
+    if (upload->dtype == 10) {
         if ((upload->cols % 256u) != 0u) {
             minicpmo_gpu_set_error(ctx, error, error_cap, "error: gpu quant staging requires cols multiple of 256");
             return 0;
@@ -1740,7 +1740,7 @@ static int minicpmo_gpu_prepare_staging(minicpmo_gpu_context *ctx, minicpmo_gpu_
                 minicpmo_gpu_set_error(ctx, error, error_cap, "error: gpu host staging allocation failed");
                 return 0;
             }
-            if (upload->dtype == 10) {
+            {
                 const uint8_t *data = (const uint8_t *) upload->host_ptr;
                 const size_t qk = 256;
                 const size_t block_bytes = 144;
@@ -1797,42 +1797,6 @@ static int minicpmo_gpu_prepare_staging(minicpmo_gpu_context *ctx, minicpmo_gpu_
                         ++block;
                     }
                 }
-            } else {
-                const uint8_t *data = (const uint8_t *) upload->host_ptr;
-                const size_t qk = 256;
-                const size_t block_bytes = 210;
-                const size_t blocks_per_row = upload->cols / qk;
-                size_t row = 0;
-                for (row = 0; row < upload->rows; ++row) {
-                    size_t row_base = row * blocks_per_row * block_bytes;
-                    size_t block = 0;
-                    while (block < blocks_per_row) {
-                        size_t base = row_base + block * block_bytes;
-                        const uint8_t *ql = &data[base];
-                        const uint8_t *qh = &data[base + 128];
-                        const int8_t *sc = (const int8_t *) &data[base + 192];
-                        float d = minicpmo_gpu_f16_to_f32((uint16_t) (data[base + 208] | (data[base + 209] << 8)));
-                        size_t out_base = row * upload->cols + block * qk;
-                        size_t n = 0;
-                        while (n < 256) {
-                            size_t l = 0;
-                            while (l < 32) {
-                                size_t isv = l / 16;
-                                int q1 = ((int) (ql[n / 2 + l] & 15u) | (((int) ((qh[n / 4 + l] >> 0) & 3u)) << 4)) - 32;
-                                int q2 = ((int) (ql[n / 2 + l + 32] & 15u) | (((int) ((qh[n / 4 + l] >> 2) & 3u)) << 4)) - 32;
-                                int q3 = ((int) (ql[n / 2 + l] >> 4) | (((int) ((qh[n / 4 + l] >> 4) & 3u)) << 4)) - 32;
-                                int q4 = ((int) (ql[n / 2 + l + 32] >> 4) | (((int) ((qh[n / 4 + l] >> 6) & 3u)) << 4)) - 32;
-                                dst[out_base + n + l] = minicpmo_gpu_f32_to_f16(d * (float) sc[n / 16 + isv + 0] * (float) q1);
-                                dst[out_base + n + 32 + l] = minicpmo_gpu_f32_to_f16(d * (float) sc[n / 16 + isv + 2] * (float) q2);
-                                dst[out_base + n + 64 + l] = minicpmo_gpu_f32_to_f16(d * (float) sc[n / 16 + isv + 4] * (float) q3);
-                                dst[out_base + n + 96 + l] = minicpmo_gpu_f32_to_f16(d * (float) sc[n / 16 + isv + 6] * (float) q4);
-                                ++l;
-                            }
-                            n += 128;
-                        }
-                        ++block;
-                    }
-                }
             }
             upload->staged_host_ptr = dst;
             upload->staged_bytes = upload->rows * upload->cols * sizeof(uint16_t);
@@ -1841,6 +1805,10 @@ static int minicpmo_gpu_prepare_staging(minicpmo_gpu_context *ctx, minicpmo_gpu_
             minicpmo_gpu_finalize_upload_plan(ctx, upload);
             return 1;
         }
+    }
+    if (upload->dtype == 12) {
+        minicpmo_gpu_set_error(ctx, error, error_cap, "error: gpu Q6_K matvec disabled; use CPU fallback");
+        return 0;
     }
     if (upload->dtype == 20) {
         uint16_t *dst = (uint16_t *) malloc(upload->rows * upload->cols * sizeof(uint16_t));
@@ -1875,9 +1843,6 @@ static size_t minicpmo_gpu_estimate_device_bytes(int dtype, size_t rows, size_t 
         return rows * cols * sizeof(uint16_t);
     }
     if (dtype == 10) {
-        return rows * cols * sizeof(uint16_t);
-    }
-    if (dtype == 12) {
         return rows * cols * sizeof(uint16_t);
     }
     return 0;
