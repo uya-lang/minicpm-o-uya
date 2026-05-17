@@ -1,3 +1,5 @@
+@c_import("cpu_kernels.c", "", "");
+
 use libc.calloc;
 use libc.clock;
 use libc.CLOCKS_PER_SEC;
@@ -6,10 +8,15 @@ use libc.fgets;
 use libc.fflush;
 use libc.free;
 use libc.getenv;
+use libc.pthread_attr_destroy;
+use libc.pthread_attr_init;
+use libc.pthread_attr_setstacksize;
+use libc.pthread_attr_t;
 use libc.powf;
 use libc.pthread_create;
 use libc.pthread_join;
 use libc.pthread_t;
+use libc.pthread_yield;
 use libc.printf;
 use libc.sinf;
 use libc.stdin;
@@ -105,6 +112,10 @@ const QWEN3_CHAT_DEFAULT_MAX_NEW_TOKENS: u32 = 512;
 const QWEN3_GENERATED_TEXT_CAP: usize = 4096;
 const QWEN3_TOKENIZER_UNKNOWN_ID: u32 = 4294967295;
 const QWEN3_MAX_THREADS: usize = 64;
+const QWEN3_THREAD_STACK: usize = 262144;
+const QWEN3_MATVEC_TASK_NONE: i32 = 0;
+const QWEN3_MATVEC_TASK_STOP: i32 = 1;
+const QWEN3_MATVEC_TASK_RUN: i32 = 2;
 const QWEN3_BENCH_SEED_CAP: usize = 64;
 const QWEN3_BENCH_DEFAULT_PROMPT_TOKENS: u32 = 8;
 const QWEN3_BENCH_DEFAULT_GEN_TOKENS: u32 = 8;
@@ -123,6 +134,12 @@ const QWEN3_GPU_SLOT_DOWN: u32 = 10;
 const QWEN3_GPU_SLOT_LOGITS: u32 = 11;
 
 var qwen3_thread_count: usize = 1;
+var qwen3_matvec_pool_ptr: &void = null;
+var qwen3_matvec_pool_threads: usize = 0;
+
+extern "libc" fn __sync_fetch_and_add(ptr: &u64, val: u64) u64;
+extern "libc" fn __sync_synchronize() void;
+extern "libc" fn minicpmo_cpu_matvec_range(dst: &f32, data: &const byte, dtype: i32, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) i32;
 
 export enum BackendKind {
     Cpu,
@@ -160,13 +177,26 @@ struct Qwen3BenchConfig {
     backend: BackendKind,
 }
 
-struct Qwen3MatvecTask {
+struct Qwen3MatvecWorkerArg {
+    pool: &void,
+    worker_id: u64,
+}
+
+struct Qwen3MatvecPool {
+    threads: [pthread_t: 64],
+    worker_args: &Qwen3MatvecWorkerArg,
+    n_workers: u64,
+    participants: atomic u64,
+    initialized: bool,
+    stop: atomic i32,
+    task_kind: atomic i32,
+    task_seq: atomic u64,
+    done: atomic u64,
     dst: &f32,
     matrix: &TensorView,
     x: &const f32,
     in_dim: usize,
-    out_start: usize,
-    out_end: usize,
+    out_dim: usize,
     dtype: TensorDType,
 }
 
@@ -862,6 +892,7 @@ fn qwen3_q6_k_dot_row(matrix: &TensorView, row: usize, x: &const f32, in_dim: us
 
 fn qwen3_k_matvec_range(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) bool {
     if in_dim % (256 as usize) != 0 { return false; }
+    if minicpmo_cpu_matvec_range(dst, matrix.data, matrix.dtype as i32, x, in_dim, out_start, out_end) != 0 { return true; }
     var j: usize = out_start;
     while j < out_end {
         if matrix.dtype == TensorDType.Q4_K { dst[j] = qwen3_q4_k_dot_row(matrix, j, x, in_dim); }
@@ -1058,6 +1089,7 @@ export fn qwen3_set_thread_count(threads: u32) void {
 }
 
 fn qwen3_q8_0_matvec_range(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_start: usize, out_end: usize) void {
+    if minicpmo_cpu_matvec_range(dst, matrix.data, TensorDType.Q8_0 as i32, x, in_dim, out_start, out_end) != 0 { return; }
     const blocks_per_row: usize = in_dim / (32 as usize);
     const row_bytes: usize = blocks_per_row * (34 as usize);
     var j: usize = out_start;
@@ -1103,16 +1135,168 @@ fn qwen3_dense_matvec_range(dst: &f32, matrix: &TensorView, x: &const f32, in_di
     }
 }
 
-fn qwen3_matvec_worker(arg: &void) &void {
-    const task: &Qwen3MatvecTask = arg as &Qwen3MatvecTask;
-    if task.dtype == TensorDType.Q8_0 {
-        qwen3_q8_0_matvec_range(task.dst, task.matrix, task.x, task.in_dim, task.out_start, task.out_end);
-    } else if task.dtype == TensorDType.Q4_K || task.dtype == TensorDType.Q5_K || task.dtype == TensorDType.Q6_K {
-        _ = qwen3_k_matvec_range(task.dst, task.matrix, task.x, task.in_dim, task.out_start, task.out_end);
+fn qwen3_matvec_pool_pause() void {
+    _ = pthread_yield();
+}
+
+fn qwen3_matvec_pool_do_part(pool: &Qwen3MatvecPool, participant: u64) void {
+    const participants: u64 = pool.participants;
+    if participants == 0 || participant >= participants {
+        return;
+    }
+    const out_dim_u64: u64 = pool.out_dim as u64;
+    const start: usize = ((out_dim_u64 * participant) / participants) as usize;
+    const end: usize = ((out_dim_u64 * (participant + 1)) / participants) as usize;
+    if pool.dtype == TensorDType.Q8_0 {
+        qwen3_q8_0_matvec_range(pool.dst, pool.matrix, pool.x, pool.in_dim, start, end);
+    } else if pool.dtype == TensorDType.Q4_K || pool.dtype == TensorDType.Q5_K || pool.dtype == TensorDType.Q6_K {
+        _ = qwen3_k_matvec_range(pool.dst, pool.matrix, pool.x, pool.in_dim, start, end);
     } else {
-        qwen3_dense_matvec_range(task.dst, task.matrix, task.x, task.in_dim, task.out_start, task.out_end);
+        qwen3_dense_matvec_range(pool.dst, pool.matrix, pool.x, pool.in_dim, start, end);
+    }
+}
+
+fn qwen3_matvec_pool_worker_main(arg: &void) &void {
+    const worker: &Qwen3MatvecWorkerArg = arg as &Qwen3MatvecWorkerArg;
+    const pool: &Qwen3MatvecPool = worker.pool as &Qwen3MatvecPool;
+    var seen: u64 = 0;
+    while true {
+        if pool.stop != 0 || pool.task_kind == QWEN3_MATVEC_TASK_STOP {
+            return null;
+        }
+        const seq_now: u64 = pool.task_seq;
+        if seq_now == seen {
+            qwen3_matvec_pool_pause();
+            continue;
+        }
+        const participant: u64 = worker.worker_id + 1;
+        const active: bool = participant < pool.participants && pool.task_kind == QWEN3_MATVEC_TASK_RUN;
+        if active {
+            qwen3_matvec_pool_do_part(pool, participant);
+        }
+        if pool.task_seq == seq_now && active {
+            _ = __sync_fetch_and_add((&pool.done) as &u64, 1);
+        }
+        seen = seq_now;
     }
     return null;
+}
+
+fn qwen3_matvec_pool_deinit(pool: &Qwen3MatvecPool) void {
+    if pool == null {
+        return;
+    }
+    if pool.initialized {
+        pool.stop = 1;
+        pool.task_kind = QWEN3_MATVEC_TASK_STOP;
+        _ = __sync_fetch_and_add((&pool.task_seq) as &u64, 1);
+        var i: u64 = 0;
+        while i < pool.n_workers {
+            _ = pthread_join(&pool.threads[i as usize], null as & &void);
+            i = i + 1;
+        }
+    }
+    if pool.worker_args != null {
+        free(pool.worker_args as &void);
+    }
+}
+
+fn qwen3_matvec_pool_init(thread_count: usize) &Qwen3MatvecPool {
+    if thread_count < 2 {
+        return null;
+    }
+    var count: usize = thread_count;
+    if count > QWEN3_MAX_THREADS { count = QWEN3_MAX_THREADS; }
+    const pool: &Qwen3MatvecPool = calloc(1, @size_of(Qwen3MatvecPool) as usize) as &Qwen3MatvecPool;
+    if pool == null {
+        return null;
+    }
+    pool.n_workers = (count - 1) as u64;
+    pool.participants = count as u64;
+    pool.task_kind = QWEN3_MATVEC_TASK_NONE;
+    pool.worker_args = calloc(pool.n_workers as usize, @size_of(Qwen3MatvecWorkerArg) as usize) as &Qwen3MatvecWorkerArg;
+    if pool.worker_args == null {
+        free(pool as &void);
+        return null;
+    }
+    var attr: pthread_attr_t = pthread_attr_t{};
+    _ = pthread_attr_init(&attr);
+    _ = pthread_attr_setstacksize(&attr, QWEN3_THREAD_STACK);
+    var created: u64 = 0;
+    var i: u64 = 0;
+    while i < pool.n_workers {
+        pool.worker_args[i as usize] = Qwen3MatvecWorkerArg{ pool: pool as &void, worker_id: i };
+        if pthread_create(&pool.threads[i as usize], &attr as &const pthread_attr_t, &qwen3_matvec_pool_worker_main as &void, &pool.worker_args[i as usize] as &void) != 0 {
+            pool.stop = 1;
+            _ = __sync_fetch_and_add((&pool.task_seq) as &u64, 1);
+            var j: u64 = 0;
+            while j < created {
+                _ = pthread_join(&pool.threads[j as usize], null as & &void);
+                j = j + 1;
+            }
+            _ = pthread_attr_destroy(&attr);
+            free(pool.worker_args as &void);
+            free(pool as &void);
+            return null;
+        }
+        created = created + 1;
+        i = i + 1;
+    }
+    _ = pthread_attr_destroy(&attr);
+    pool.initialized = true;
+    return pool;
+}
+
+fn qwen3_matvec_pool_get(thread_count: usize) &Qwen3MatvecPool {
+    if thread_count < 2 {
+        return null;
+    }
+    if qwen3_matvec_pool_ptr != null && qwen3_matvec_pool_threads == thread_count {
+        return qwen3_matvec_pool_ptr as &Qwen3MatvecPool;
+    }
+    if qwen3_matvec_pool_ptr != null {
+        const old_pool: &Qwen3MatvecPool = qwen3_matvec_pool_ptr as &Qwen3MatvecPool;
+        qwen3_matvec_pool_deinit(old_pool);
+        free(old_pool as &void);
+        qwen3_matvec_pool_ptr = null;
+        qwen3_matvec_pool_threads = 0;
+    }
+    const pool: &Qwen3MatvecPool = qwen3_matvec_pool_init(thread_count);
+    if pool == null {
+        return null;
+    }
+    qwen3_matvec_pool_ptr = pool as &void;
+    qwen3_matvec_pool_threads = thread_count;
+    return pool;
+}
+
+fn qwen3_matvec_pool_run(pool: &Qwen3MatvecPool, dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize, dtype: TensorDType, participants: u64) bool {
+    if pool == null || participants < 2 {
+        return false;
+    }
+    pool.dst = dst;
+    pool.matrix = matrix;
+    pool.x = x;
+    pool.in_dim = in_dim;
+    pool.out_dim = out_dim;
+    pool.dtype = dtype;
+    pool.participants = participants;
+    pool.done = 0;
+    pool.task_kind = QWEN3_MATVEC_TASK_RUN;
+    __sync_synchronize();
+    _ = __sync_fetch_and_add((&pool.task_seq) as &u64, 1);
+
+    qwen3_matvec_pool_do_part(pool, 0);
+
+    const done_target: u64 = participants - 1;
+    while true {
+        if pool.done >= done_target {
+            pool.task_kind = QWEN3_MATVEC_TASK_NONE;
+            return true;
+        }
+        qwen3_matvec_pool_pause();
+    }
+    return true;
 }
 
 fn qwen3_matvec_parallel(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize, dtype: TensorDType) bool {
@@ -1120,31 +1304,9 @@ fn qwen3_matvec_parallel(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: 
     if count < 2 || out_dim < (64 as usize) { return false; }
     if count > QWEN3_MAX_THREADS { count = QWEN3_MAX_THREADS; }
     if count > out_dim { count = out_dim; }
-    var tasks: [Qwen3MatvecTask: 64] = [];
-    var threads: [pthread_t: 64] = [];
-    var launched: [bool: 64] = [];
-    var j: usize = 0;
-    while j < count {
-        const start: usize = (out_dim * j) / count;
-        const end: usize = (out_dim * (j + (1 as usize))) / count;
-        tasks[j] = Qwen3MatvecTask{ dst: dst, matrix: matrix, x: x, in_dim: in_dim, out_start: start, out_end: end, dtype: dtype };
-        if pthread_create(&threads[j], null, &qwen3_matvec_worker as &void, &tasks[j] as &void) == 0 {
-            launched[j] = true;
-        } else {
-            _ = qwen3_matvec_worker(&tasks[j] as &void);
-            launched[j] = false;
-        }
-        j = j + 1;
-    }
-    j = 0;
-    while j < count {
-        if launched[j] {
-            var retval: &void = null;
-            _ = pthread_join(&threads[j], &retval);
-        }
-        j = j + 1;
-    }
-    return true;
+    const pool: &Qwen3MatvecPool = qwen3_matvec_pool_get(count);
+    if pool == null { return false; }
+    return qwen3_matvec_pool_run(pool, dst, matrix, x, in_dim, out_dim, dtype, count as u64);
 }
 
 fn qwen3_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) void {
