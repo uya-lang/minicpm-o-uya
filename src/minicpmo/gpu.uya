@@ -128,7 +128,7 @@ export fn gpu_context_smoke(ctx: &GpuContext) bool {
 }
 
 export fn gpu_dtype_matvec_supported(dtype: TensorDType) bool {
-    return dtype == TensorDType.F32 || dtype == TensorDType.F16 || dtype == TensorDType.BF16 || dtype == TensorDType.Q4_K;
+    return dtype == TensorDType.F32 || dtype == TensorDType.F16 || dtype == TensorDType.BF16 || dtype == TensorDType.Q4_K || dtype == TensorDType.Q6_K;
 }
 
 export fn gpu_context_upload_tensor(ctx: &GpuContext, view: &TensorView) bool {

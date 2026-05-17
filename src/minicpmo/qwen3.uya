@@ -530,8 +530,7 @@ fn qwen3_validate_runtime_matvec_dtypes(weights: &Qwen3Weights) bool {
 
 fn qwen3_check_cuda_runtime_matvec_tensor(view: &TensorView, role: &const byte, layer: u32) bool {
     if gpu_dtype_matvec_supported(view.dtype) { return true; }
-    if view.dtype == TensorDType.Q6_K { return true; }
-    _ = printf("error: qwen3 runtime layer=%u tensor=%s role=%s dtype=%s backend=cuda supported_dtypes=F32|F16|BF16|Q4_K q6_k=cpu_fallback attention=cuda kv_cache=device\n", layer, &view.name[0], role, tensor_dtype_name(view.dtype));
+    _ = printf("error: qwen3 runtime layer=%u tensor=%s role=%s dtype=%s backend=cuda supported_dtypes=F32|F16|BF16|Q4_K|Q6_K attention=cuda kv_cache=device no_cpu_fallback=true\n", layer, &view.name[0], role, tensor_dtype_name(view.dtype));
     return false;
 }
 
@@ -1310,7 +1309,7 @@ fn qwen3_cpu_q8_1_enabled() bool {
 fn qwen3_cuda_attention_enabled() bool {
     const value: &const byte = getenv("MINICPMO_GPU_ATTENTION\0" as &const byte) as &const byte;
     if value == null || value[0] == 0 {
-        return false;
+        return true;
     }
     if value[0] == 48 as byte && value[1] == 0 {
         return false;
@@ -1321,7 +1320,7 @@ fn qwen3_cuda_attention_enabled() bool {
 fn qwen3_cuda_device_forward_enabled() bool {
     const value: &const byte = getenv("MINICPMO_GPU_DEVICE_FORWARD\0" as &const byte) as &const byte;
     if value == null || value[0] == 0 {
-        return false;
+        return true;
     }
     if value[0] == 48 as byte && value[1] == 0 {
         return false;
@@ -1415,10 +1414,6 @@ fn qwen3_matvec_view(dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usiz
 
 fn qwen3_runtime_matvec_view(runtime: &Qwen3Runtime, dst: &f32, matrix: &TensorView, x: &const f32, in_dim: usize, out_dim: usize) bool {
     if runtime.device.backend == BackendKind.Cuda {
-        if matrix.dtype == TensorDType.Q6_K {
-            qwen3_matvec_view(dst, matrix, x, in_dim, out_dim);
-            return true;
-        }
         if !gpu_dtype_matvec_supported(matrix.dtype) {
             gpu_print_runtime_unsupported("qwen3 cuda matvec unsupported\0" as &const byte, matrix);
             return false;
@@ -2148,9 +2143,6 @@ fn qwen3_runtime_context_capacity(config: &Qwen3Config) usize {
 }
 
 fn qwen3_runtime_gpu_upload_matvec_tensor(runtime: &Qwen3Runtime, view: &TensorView) bool {
-    if view.dtype == TensorDType.Q6_K {
-        return true;
-    }
     if !gpu_context_upload_tensor(&runtime.gpu, view) {
         _ = printf("%s\n", gpu_context_last_error(&runtime.gpu));
         return false;
